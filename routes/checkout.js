@@ -3,7 +3,7 @@ module.exports = async function checkoutRoutes(ctx) {
   if (req.method === "GET" && url.pathname === "/checkout") {
     if (!cart.items.length) return app.redirect(res, "/cart?notice=Your+cart+is+empty."), true;
     if (!app.requireAuth(session, res, "/checkout")) return true;
-    app.send(res, 200, app.checkoutPage(session, cart));
+    app.send(res, 200, app.checkoutPage(session, cart, url));
     return true;
   }
   if (req.method === "GET" && url.pathname.startsWith("/invoice/")) {
@@ -18,7 +18,7 @@ module.exports = async function checkoutRoutes(ctx) {
     return true;
   }
   if (req.method !== "POST") return false;
-  if (["/payment/create", "/payment/verify", "/checkout"].includes(url.pathname) && !app.validCsrf(data, session)) {
+  if (["/payment/create", "/payment/verify", "/payment/failed", "/checkout"].includes(url.pathname) && !app.validCsrf(data, session)) {
     return app.send(res, 403, "Invalid form token", "text/plain"), true;
   }
   if (url.pathname === "/payment/create") {
@@ -36,10 +36,21 @@ module.exports = async function checkoutRoutes(ctx) {
     const signature = app.crypto.createHmac("sha256", app.RAZORPAY_KEY_SECRET).update(`${data.razorpay_order_id}|${data.razorpay_payment_id}`).digest("hex");
     const receivedSignature = data.razorpay_signature || "";
     if (receivedSignature.length !== signature.length || !app.crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(receivedSignature))) {
-      return app.redirect(res, `/checkout?notice=${encodeURIComponent("Payment verification failed. No order was created.")}`), true;
+      app.releaseSessionReservations(session.id);
+      return app.redirect(res, `/cart?notice=${encodeURIComponent("Payment verification failed. Your reservation was released and no order was created.")}`), true;
     }
-    const orderNumber = app.createLocalOrder(session, app.cartData(session.id), data, "razorpay", data.razorpay_payment_id);
-    app.redirect(res, `/account?notice=${encodeURIComponent(`Payment received. Order ${orderNumber} placed successfully.`)}`);
+    try {
+      const orderNumber = app.createLocalOrder(session, app.cartData(session.id), data, "razorpay", data.razorpay_payment_id);
+      app.redirect(res, `/account?notice=${encodeURIComponent(`Payment received. Order ${orderNumber} placed successfully.`)}`);
+    } catch (error) {
+      app.redirect(res, `/checkout?notice=${encodeURIComponent(error.message)}`);
+    }
+    return true;
+  }
+  if (url.pathname === "/payment/failed") {
+    if (!app.requireAuth(session, res, "/checkout")) return true;
+    app.releaseSessionReservations(session.id);
+    app.sendJson(res, 200, { ok: true });
     return true;
   }
   if (url.pathname === "/checkout") {
@@ -47,8 +58,12 @@ module.exports = async function checkoutRoutes(ctx) {
     const freshCart = app.cartData(session.id);
     if (!freshCart.items.length) return app.redirect(res, "/cart"), true;
     if (data.payment_method !== "cod") return app.redirect(res, `/checkout?notice=${encodeURIComponent("Please complete the secure online payment window.")}`), true;
-    const orderNumber = app.createLocalOrder(session, freshCart, data, "cod");
-    app.redirect(res, `/account?notice=${encodeURIComponent(`Order ${orderNumber} placed successfully.`)}`);
+    try {
+      const orderNumber = app.createLocalOrder(session, freshCart, data, "cod");
+      app.redirect(res, `/account?notice=${encodeURIComponent(`Order ${orderNumber} placed successfully.`)}`);
+    } catch (error) {
+      app.redirect(res, `/cart?notice=${encodeURIComponent(error.message)}`);
+    }
     return true;
   }
   return false;

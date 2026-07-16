@@ -1,10 +1,12 @@
-const http = require("node:http");
+﻿const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
 const { URL } = require("node:url");
 const { categories, products: catalogProducts } = require("./catalog");
+const PDFDocument = require("pdfkit");
+const { createEmailService, orderEmailTemplate } = require("./services/email");
 const routes = [
   require("./routes/static"),
   require("./routes/auth"),
@@ -14,9 +16,6 @@ const routes = [
   require("./routes/admin"),
   require("./routes/account")
 ];
-let nodemailer = null;
-try { nodemailer = require("nodemailer"); } catch { nodemailer = null; }
-
 if (fs.existsSync(path.join(__dirname, ".env"))) process.loadEnvFile(path.join(__dirname, ".env"));
 
 const PORT = Number(process.env.PORT || 3000);
@@ -30,6 +29,7 @@ const SMTP_HOST = process.env.SMTP_HOST || "";
 const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_USER = process.env.SMTP_USER || "";
 const SMTP_PASS = process.env.SMTP_PASS || "";
+const SMTP_SECURE = process.env.SMTP_SECURE === "true" || SMTP_PORT === 465;
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || (process.env.NODE_ENV === "production" ? "" : "admin@printoasis.example")).trim().toLowerCase();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || (process.env.NODE_ENV === "production" ? "" : "PrintOasisAdmin123!");
 const ROOT = __dirname;
@@ -41,13 +41,16 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(PRODUCT_IMAGE_DIR, { recursive: true });
 fs.mkdirSync(EMAIL_LOG_DIR, { recursive: true });
+const emailService = createEmailService({ host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE, user: SMTP_USER, pass: SMTP_PASS, from: EMAIL_FROM });
 const db = new DatabaseSync(path.join(DATA_DIR, "store.db"));
 db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
-const ORDER_STATUSES = ["Pending", "Printing", "Packed", "Shipped", "Delivered"];
+const ORDER_STATUSES = ["Pending", "Printing", "Packed", "Shipped", "Delivered", "Cancelled"];
 const ALLOWED_ARTWORK_EXTENSIONS = new Set([".pdf", ".png", ".ai", ".psd"]);
 const ALLOWED_IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_PRODUCT_IMAGE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_SEEDED_STOCK = 1000;
+let lastSessionCleanupAt = 0;
 
 function requestOrigin(req) {
   if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
@@ -93,6 +96,10 @@ function initDb() {
       image_stored_name TEXT,
       image_mime TEXT,
       image_size INTEGER,
+      stock INTEGER NOT NULL DEFAULT 1000,
+      reserved INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'active',
+      featured INTEGER NOT NULL DEFAULT 0,
       active INTEGER NOT NULL DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS cart_items (
@@ -130,6 +137,11 @@ function initDb() {
       payment_method TEXT NOT NULL,
       payment_id TEXT,
       tracking_number TEXT,
+      courier_name TEXT,
+      tracking_url TEXT,
+      estimated_delivery TEXT,
+      shipped_at TEXT,
+      inventory_restocked INTEGER NOT NULL DEFAULT 0,
       status_updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(user_id) REFERENCES users(id)
@@ -137,11 +149,13 @@ function initDb() {
     CREATE TABLE IF NOT EXISTS order_items (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       order_id INTEGER NOT NULL,
+      product_id INTEGER,
       product_name TEXT NOT NULL,
       quantity INTEGER NOT NULL,
       unit_price INTEGER NOT NULL,
       configuration TEXT NOT NULL,
-      FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
+      FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
+      FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE SET NULL
     );
     CREATE TABLE IF NOT EXISTS order_status_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,6 +182,12 @@ function initDb() {
       type TEXT NOT NULL,
       value INTEGER NOT NULL,
       min_total INTEGER NOT NULL DEFAULT 0,
+      minimum_order INTEGER NOT NULL DEFAULT 0,
+      maximum_discount INTEGER,
+      expiry_date TEXT,
+      usage_limit INTEGER,
+      times_used INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       active INTEGER NOT NULL DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS reviews (
@@ -178,6 +198,7 @@ function initDb() {
       rating INTEGER NOT NULL,
       comment TEXT NOT NULL,
       approved INTEGER NOT NULL DEFAULT 1,
+      verified_purchase INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
@@ -187,16 +208,46 @@ function initDb() {
       user_id INTEGER NOT NULL,
       product_id INTEGER NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      saved_price INTEGER,
       UNIQUE(user_id, product_id),
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
     );
+    CREATE TABLE IF NOT EXISTS addresses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      label TEXT NOT NULL DEFAULT 'Address',
+      recipient_name TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      address TEXT NOT NULL,
+      city TEXT NOT NULL,
+      postal_code TEXT NOT NULL,
+      is_default INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
   `);
+  const earlyOrderColumns = db.prepare("PRAGMA table_info(orders)").all().map(column => column.name);
+  for (const [name, ddl] of [
+    ["courier_name", "ALTER TABLE orders ADD COLUMN courier_name TEXT"],
+    ["tracking_url", "ALTER TABLE orders ADD COLUMN tracking_url TEXT"],
+    ["estimated_delivery", "ALTER TABLE orders ADD COLUMN estimated_delivery TEXT"],
+    ["shipped_at", "ALTER TABLE orders ADD COLUMN shipped_at TEXT"]
+  ]) if (!earlyOrderColumns.includes(name)) db.exec(ddl);
+
+  const reviewColumns = db.prepare("PRAGMA table_info(reviews)").all().map(column => column.name);
+  if (!reviewColumns.includes("updated_at")) db.exec("ALTER TABLE reviews ADD COLUMN updated_at TEXT");
+  if (!reviewColumns.includes("verified_purchase")) db.exec("ALTER TABLE reviews ADD COLUMN verified_purchase INTEGER NOT NULL DEFAULT 0");
   const columns = db.prepare("PRAGMA table_info(users)").all().map(column => column.name);
   if (!columns.includes("google_sub")) db.exec("ALTER TABLE users ADD COLUMN google_sub TEXT");
   if (!columns.includes("is_admin")) db.exec("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0");
+  const productColumns = db.prepare("PRAGMA table_info(products)").all().map(c => c.name);
+
+  if (!productColumns.includes("stock")) db.exec(`ALTER TABLE products ADD COLUMN stock INTEGER NOT NULL DEFAULT ${DEFAULT_SEEDED_STOCK}`);
+  if (!productColumns.includes("reserved")) db.exec("ALTER TABLE products ADD COLUMN reserved INTEGER NOT NULL DEFAULT 0");
+  if (!productColumns.includes("status")) db.exec("ALTER TABLE products ADD COLUMN status TEXT NOT NULL DEFAULT 'active'");
+  if (!productColumns.includes("featured")) db.exec("ALTER TABLE products ADD COLUMN featured INTEGER NOT NULL DEFAULT 0");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL");
-  const productColumns = db.prepare("PRAGMA table_info(products)").all().map(column => column.name);
   if (!productColumns.includes("active")) db.exec("ALTER TABLE products ADD COLUMN active INTEGER NOT NULL DEFAULT 1");
   for (const [name, ddl] of [
     ["image_original_name", "ALTER TABLE products ADD COLUMN image_original_name TEXT"],
@@ -204,6 +255,13 @@ function initDb() {
     ["image_mime", "ALTER TABLE products ADD COLUMN image_mime TEXT"],
     ["image_size", "ALTER TABLE products ADD COLUMN image_size INTEGER"]
   ]) if (!productColumns.includes(name)) db.exec(ddl);
+  db.exec("UPDATE products SET reserved = 0 WHERE reserved IS NULL OR reserved < 0");
+  db.exec("UPDATE products SET status = CASE WHEN active = 0 THEN 'hidden' ELSE 'active' END WHERE status IS NULL OR status = ''");
+  db.exec("UPDATE products SET status = 'hidden' WHERE active = 0 AND status != 'hidden'");
+  db.exec("UPDATE products SET featured = 0 WHERE featured IS NULL");
+  for (const product of catalogProducts) {
+    db.prepare("UPDATE products SET stock = ? WHERE slug = ? AND stock <= 0 AND reserved = 0").run(DEFAULT_SEEDED_STOCK, product[0]);
+  }
   const cartColumns = db.prepare("PRAGMA table_info(cart_items)").all().map(column => column.name);
   for (const [name, ddl] of [
     ["artwork_original_name", "ALTER TABLE cart_items ADD COLUMN artwork_original_name TEXT"],
@@ -219,11 +277,35 @@ function initDb() {
     ["shipping_fee", "ALTER TABLE orders ADD COLUMN shipping_fee INTEGER NOT NULL DEFAULT 0"],
     ["discount", "ALTER TABLE orders ADD COLUMN discount INTEGER NOT NULL DEFAULT 0"],
     ["coupon_code", "ALTER TABLE orders ADD COLUMN coupon_code TEXT"],
-    ["gst_number", "ALTER TABLE orders ADD COLUMN gst_number TEXT"]
+    ["gst_number", "ALTER TABLE orders ADD COLUMN gst_number TEXT"],
+    ["inventory_restocked", "ALTER TABLE orders ADD COLUMN inventory_restocked INTEGER NOT NULL DEFAULT 0"]
   ]) if (!orderColumns.includes(name)) db.exec(ddl);
+  const orderItemColumns = db.prepare("PRAGMA table_info(order_items)").all().map(column => column.name);
+  if (!orderItemColumns.includes("product_id")) db.exec("ALTER TABLE order_items ADD COLUMN product_id INTEGER");
+  const couponColumns = db.prepare("PRAGMA table_info(coupons)").all().map(column => column.name);
+  for (const [name, ddl] of [
+    ["minimum_order", "ALTER TABLE coupons ADD COLUMN minimum_order INTEGER NOT NULL DEFAULT 0"],
+    ["maximum_discount", "ALTER TABLE coupons ADD COLUMN maximum_discount INTEGER"],
+    ["expiry_date", "ALTER TABLE coupons ADD COLUMN expiry_date TEXT"],
+    ["usage_limit", "ALTER TABLE coupons ADD COLUMN usage_limit INTEGER"],
+    ["times_used", "ALTER TABLE coupons ADD COLUMN times_used INTEGER NOT NULL DEFAULT 0"],
+    ["created_at", "ALTER TABLE coupons ADD COLUMN created_at TEXT"]
+  ]) if (!couponColumns.includes(name)) db.exec(ddl);
+  db.exec("UPDATE coupons SET minimum_order = min_total WHERE minimum_order = 0 AND min_total > 0");
+  db.exec("UPDATE coupons SET times_used = 0 WHERE times_used IS NULL OR times_used < 0");
+  const wishlistColumns = db.prepare("PRAGMA table_info(wishlist_items)").all().map(column => column.name);
+  if (!wishlistColumns.includes("saved_price")) db.exec("ALTER TABLE wishlist_items ADD COLUMN saved_price INTEGER");
+  db.exec("UPDATE wishlist_items SET saved_price = (SELECT price FROM products WHERE products.id = wishlist_items.product_id) WHERE saved_price IS NULL");
+  db.exec(`UPDATE reviews
+    SET verified_purchase = 1
+    WHERE user_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM order_items oi
+      JOIN orders o ON o.id = oi.order_id
+      WHERE oi.product_id = reviews.product_id AND o.user_id = reviews.user_id AND o.status = 'Delivered'
+    )`);
   db.exec("UPDATE orders SET status_updated_at = COALESCE(status_updated_at, created_at, CURRENT_TIMESTAMP)");
-  db.prepare("INSERT OR IGNORE INTO coupons (code,type,value,min_total,active) VALUES (?,?,?,?,?)").run("WELCOME10", "percent", 10, 499, 1);
-  db.prepare("INSERT OR IGNORE INTO coupons (code,type,value,min_total,active) VALUES (?,?,?,?,?)").run("PRINT100", "fixed", 100, 999, 1);
+  db.prepare("INSERT OR IGNORE INTO coupons (code,type,value,min_total,minimum_order,active) VALUES (?,?,?,?,?,?)").run("WELCOME10", "percent", 10, 499, 499, 1);
+  db.prepare("INSERT OR IGNORE INTO coupons (code,type,value,min_total,minimum_order,active) VALUES (?,?,?,?,?,?)").run("PRINT100", "fixed", 100, 999, 999, 1);
   if (ADMIN_EMAIL && ADMIN_PASSWORD) {
     const existingAdmin = db.prepare("SELECT id FROM users WHERE email = ?").get(ADMIN_EMAIL);
     if (existingAdmin) {
@@ -272,18 +354,97 @@ function shippingFee(subtotal, postalCode = "") {
   return /^(11|40|41|56|57|60|70)/.test(pin) ? 99 : 149;
 }
 
-function couponFor(code, subtotal) {
+function couponValidation(code, subtotal) {
   const normalized = String(code || "").trim().toUpperCase();
-  if (!normalized) return null;
-  const coupon = db.prepare("SELECT * FROM coupons WHERE code = ? AND active = 1").get(normalized);
-  return coupon && subtotal >= coupon.min_total ? coupon : null;
+  if (!normalized) return { coupon: null, error: "" };
+  const coupon = db.prepare("SELECT * FROM coupons WHERE code = ?").get(normalized);
+  if (!coupon) return { coupon: null, error: "Coupon code is invalid." };
+  if (!coupon.active) return { coupon: null, error: "This coupon is not active." };
+  if (coupon.expiry_date && coupon.expiry_date < new Date().toISOString().slice(0, 10)) return { coupon: null, error: "This coupon has expired." };
+  if (coupon.usage_limit !== null && Number(coupon.times_used) >= Number(coupon.usage_limit)) return { coupon: null, error: "This coupon has reached its usage limit." };
+  const minimumOrder = Number(coupon.minimum_order || coupon.min_total || 0);
+  if (subtotal < minimumOrder) return { coupon: null, error: `This coupon requires an order of at least ${money(minimumOrder)}.` };
+  return { coupon, error: "" };
+}
+
+function couponFor(code, subtotal) {
+  return couponValidation(code, subtotal).coupon;
 }
 
 function cartTotals(cart, postalCode = "", couponCode = "") {
-  const coupon = couponFor(couponCode, cart.subtotal);
-  const discount = coupon ? Math.min(cart.subtotal, coupon.type === "percent" ? Math.round(cart.subtotal * coupon.value / 100) : coupon.value) : 0;
+  const couponResult = couponValidation(couponCode, cart.subtotal);
+  const coupon = couponResult.coupon;
+  const rawDiscount = coupon ? coupon.type === "percent" ? Math.round(cart.subtotal * coupon.value / 100) : coupon.value : 0;
+  const discount = coupon ? Math.min(cart.subtotal, rawDiscount, Number(coupon.maximum_discount) || Infinity) : 0;
   const delivery = shippingFee(cart.subtotal - discount, postalCode);
-  return { subtotal: cart.subtotal, discount, delivery, total: Math.max(0, cart.subtotal - discount + delivery), coupon };
+  return { subtotal: cart.subtotal, discount, delivery, total: Math.max(0, cart.subtotal - discount + delivery), coupon, couponError: couponResult.error };
+}
+
+function visibleProductCondition(alias = "") {
+  const prefix = alias ? `${alias}.` : "";
+  return `${prefix}active = 1 AND COALESCE(${prefix}status, 'active') != 'hidden'`;
+}
+
+function productAvailable(product) {
+  return Number(product?.stock || 0) - Number(product?.reserved || 0);
+}
+
+function sellableQuantity(product) {
+  return Math.max(0, productAvailable(product));
+}
+
+function hasDeliveredPurchase(userId, productId) {
+  return Boolean(db.prepare(`
+    SELECT 1
+    FROM order_items oi
+    JOIN orders o ON o.id = oi.order_id
+    WHERE o.user_id = ? AND oi.product_id = ? AND o.status = 'Delivered'
+    LIMIT 1
+  `).get(userId, productId));
+}
+
+function defaultAddress(userId) {
+  return db.prepare("SELECT * FROM addresses WHERE user_id = ? ORDER BY is_default DESC, id DESC LIMIT 1").get(userId);
+}
+
+function addCartItem(sessionId, product, quantity, configuration) {
+  const requested = Math.max(1, Math.floor(Number(quantity) || product.min_qty));
+  const available = productAvailable(product);
+  if (available <= 0) throw new Error(`${product.name} is out of stock.`);
+  if (requested > available) throw new Error(`Only ${sellableQuantity(product)} items available for ${product.name}.`);
+  db.prepare(`INSERT INTO cart_items (session_id,product_id,quantity,size,material,print_option,artwork_note,artwork_original_name,artwork_stored_name,artwork_mime,artwork_size,unit_price) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(sessionId, product.id, requested, configuration.size, configuration.material, configuration.printOption, configuration.artworkNote || null, configuration.artworkOriginalName || null, configuration.artworkStoredName || null, configuration.artworkMime || null, configuration.artworkSize || null, product.price / product.min_qty);
+  db.prepare("UPDATE products SET reserved = reserved + ? WHERE id = ?").run(requested, product.id);
+  return requested;
+}
+
+function releaseReservedQuantity(productId, quantity) {
+  const amount = Math.max(0, Number(quantity) || 0);
+  if (!amount) return;
+  db.prepare("UPDATE products SET reserved = CASE WHEN reserved - ? < 0 THEN 0 ELSE reserved - ? END WHERE id = ?")
+    .run(amount, amount, productId);
+}
+
+function cleanupExpiredSessions(now = Date.now()) {
+  if (now - lastSessionCleanupAt < 60000) return;
+  lastSessionCleanupAt = now;
+  const expired = db.prepare("SELECT id FROM sessions WHERE expires_at <= ?").all(now);
+  for (const row of expired) releaseSessionReservations(row.id);
+  db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(now);
+}
+
+function releaseSessionReservations(sessionId) {
+  const rows = db.prepare("SELECT product_id, SUM(quantity) quantity FROM cart_items WHERE session_id = ? GROUP BY product_id").all(sessionId);
+  if (!rows.length) return;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const row of rows) releaseReservedQuantity(row.product_id, row.quantity);
+    db.prepare("DELETE FROM cart_items WHERE session_id = ?").run(sessionId);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
@@ -296,6 +457,7 @@ function verifyPassword(password, stored) {
 }
 
 function getSession(req, res) {
+  cleanupExpiredSessions();
   const cookies = parseCookies(req);
   let session = cookies.sid && db.prepare("SELECT * FROM sessions WHERE id = ? AND expires_at > ?").get(cookies.sid, Date.now());
   if (!session) {
@@ -314,10 +476,65 @@ function getSession(req, res) {
 function isAdmin(session) {
   return Boolean(session.user && session.user.is_admin);
 }
+function generateInvoice(orderId) {
+    const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(orderId);
+    if (!order) return;
+
+    const items = db.prepare(
+        "SELECT * FROM order_items WHERE order_id = ?"
+    ).all(orderId);
+
+    const invoiceDir = path.join(__dirname, "invoices");
+    if (!fs.existsSync(invoiceDir)) {
+        fs.mkdirSync(invoiceDir, { recursive: true });
+    }
+
+    const filePath = path.join(invoiceDir, `invoice-${order.order_number}.pdf`);
+
+    const doc = new PDFDocument({ margin: 50 });
+
+    doc.pipe(fs.createWriteStream(filePath));
+
+    doc.fontSize(24).text("PrintOasis", { align: "center" });
+    doc.moveDown();
+
+    doc.fontSize(18).text("INVOICE");
+    doc.moveDown();
+
+    doc.fontSize(12);
+    doc.text(`Invoice No: ${order.order_number}`);
+    doc.text(`Order ID: ${order.id}`);
+    doc.text(`Customer: ${order.customer_name}`);
+    doc.text(`Phone: ${order.phone}`);
+    doc.text(`City: ${order.city}`);
+    doc.text(`Status: ${order.status}`);
+    doc.text(`Payment: ${order.payment_method}`);
+    doc.moveDown();
+
+    doc.text("Items");
+    doc.moveDown(0.5);
+
+    items.forEach(item => {
+        doc.text(
+            `${item.product_name}  | Qty: ${item.quantity} | ₹${item.unit_price}`
+        );
+    });
+
+    doc.moveDown();
+
+    doc.text(`Subtotal: ₹${order.total - order.shipping_fee + order.discount}`);
+    doc.text(`Shipping: ₹${order.shipping_fee}`);
+    doc.text(`Discount: ₹${order.discount}`);
+    doc.font("Helvetica-Bold");
+    doc.text(`Grand Total: ₹${order.total}`);
+
+    doc.end();
+
+}
 
 function cartData(sessionId) {
   const items = db.prepare(`
-    SELECT ci.*, p.slug, p.name, p.color, p.category FROM cart_items ci
+    SELECT ci.*, p.slug, p.name, p.color, p.category, p.stock, p.reserved, p.status, p.active FROM cart_items ci
     JOIN products p ON p.id = ci.product_id WHERE ci.session_id = ? ORDER BY ci.id DESC
   `).all(sessionId);
   return {
@@ -466,7 +683,7 @@ function layout(title, content, session, cart, description = "Custom printing fo
     <footer>
       <div><a class="brand light" href="/"><span>PRINT</span>OASIS<i>.</i></a><p>Ideas, made tangible.</p></div>
       <div><h4>Shop</h4><a href="/products">All products</a><a href="/products?category=same-day">Same-day prints</a><a href="/products?category=business-cards">Business cards</a></div>
-      <div><h4>Support</h4><a href="/help">Help centre</a><a href="/account/orders">Track orders</a><a href="/contact">Contact us</a></div>
+      <div><h4>Support</h4><a href="/help">Help centre</a><a href="/faq">FAQ</a><a href="/account/orders">Track orders</a><a href="/contact">Contact us</a></div>
       <div><h4>For business</h4><a href="/business">Business solutions</a><a href="/contact">Bulk enquiries</a><a href="/products?category=packaging">Packaging</a></div>
       <p class="copyright">© ${new Date().getFullYear()} PrintOasis Print Services.</p>
     </footer>
@@ -485,16 +702,17 @@ function productArt(product, large = false) {
 }
 
 function productCard(product) {
+  const available = sellableQuantity(product);
   return `<article class="product-card">
     <a href="/product/${product.slug}">${productArt(product)}</a>
     <div class="product-meta"><span class="badge">${esc(product.badge)}</span><span>★ ${product.rating}</span></div>
     <h3><a href="/product/${product.slug}">${esc(product.name)}</a></h3>
-    <p>From <strong>${money(product.price)}</strong> / ${product.min_qty === 1 ? "piece" : `${product.min_qty} pcs`}</p>
+    <p>From <strong>${money(product.price)}</strong> / ${product.min_qty === 1 ? "piece" : `${product.min_qty} pcs`}${available <= 0 ? ` <span class="stock-note">Out of Stock</span>` : ""}</p>
   </article>`;
 }
 
 function homePage(session, cart) {
-  const featured = db.prepare("SELECT * FROM products WHERE active = 1 ORDER BY rating DESC LIMIT 8").all();
+  const featured = db.prepare(`SELECT * FROM products WHERE ${visibleProductCondition()} ORDER BY featured DESC, rating DESC LIMIT 8`).all();
   return layout("Online printing made brilliantly simple", `
     <section class="hero">
       <div class="hero-copy">
@@ -528,7 +746,7 @@ function homePage(session, cart) {
 function productsPage(url, session, cart) {
   const category = url.searchParams.get("category") || "";
   const q = url.searchParams.get("q") || "";
-  let sql = "SELECT * FROM products WHERE active = 1";
+ let sql = `SELECT * FROM products WHERE ${visibleProductCondition()}`;
   const args = [];
   if (category) { sql += " AND category = ?"; args.push(category); }
   if (q) { sql += " AND (name LIKE ? OR description LIKE ?)"; args.push(`%${q}%`, `%${q}%`); }
@@ -547,9 +765,25 @@ function productsPage(url, session, cart) {
 
 function productPage(product, session, cart) {
   const sizes = split(product.sizes), materials = split(product.materials), options = split(product.print_options);
+  const available = productAvailable(product);
+  const sellable = sellableQuantity(product);
+  const defaultQuantity = sellable > 0 ? Math.min(Math.max(1, product.min_qty), sellable) : 0;
   const reviews = db.prepare("SELECT * FROM reviews WHERE product_id = ? AND approved = 1 ORDER BY id DESC LIMIT 6").all(product.id);
-  const recommendations = db.prepare("SELECT * FROM products WHERE category = ? AND id != ? AND active = 1 ORDER BY rating DESC LIMIT 4").all(product.category, product.id);
+  const reviewSummary = db.prepare(`
+    SELECT
+      COUNT(*) AS count,
+      AVG(rating) AS avg,
+      SUM(CASE WHEN rating = 5 THEN 1 ELSE 0 END) AS rating_5_count,
+      SUM(CASE WHEN rating = 4 THEN 1 ELSE 0 END) AS rating_4_count,
+      SUM(CASE WHEN rating = 3 THEN 1 ELSE 0 END) AS rating_3_count,
+      SUM(CASE WHEN rating = 2 THEN 1 ELSE 0 END) AS rating_2_count,
+      SUM(CASE WHEN rating = 1 THEN 1 ELSE 0 END) AS rating_1_count
+    FROM reviews
+    WHERE product_id = ? AND approved = 1
+  `).get(product.id);
+  const recommendations = db.prepare(`SELECT * FROM products WHERE category = ? AND id != ? AND ${visibleProductCondition()} ORDER BY rating DESC LIMIT 4`).all(product.category, product.id);
   const wished = session.user ? db.prepare("SELECT id FROM wishlist_items WHERE user_id = ? AND product_id = ?").get(session.user.id, product.id) : null;
+  const canReview = session.user ? hasDeliveredPurchase(session.user.id, product.id) : false;
   return layout(product.name, `
     <section class="breadcrumbs"><a href="/">Home</a><span>/</span><a href="/products?category=${product.category}">${esc(categories.find(c => c[0] === product.category)?.[1] || "Products")}</a><span>/</span>${esc(product.name)}</section>
     <section class="product-detail">
@@ -557,26 +791,54 @@ function productPage(product, session, cart) {
       <div class="product-config">
         <span class="badge">${esc(product.badge)}</span><h1>${esc(product.name)}</h1><div class="rating">★★★★★ <span>${product.rating} · Quality assured</span></div><p class="lead">${esc(product.description)}</p>
         <ul class="feature-list"><li>Low minimum order of ${product.min_qty}</li><li>Rich, calibrated color</li><li>Tracked delivery across India</li></ul>
-        ${session.user ? `<form action="/wishlist/toggle" method="post" class="inline-action"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}"><button class="button ghost" type="submit">${wished ? "Remove from wishlist" : "Add to wishlist"}</button></form>` : `<a class="button ghost" href="/login?next=${encodeURIComponent(`/product/${product.slug}`)}">Login to save to wishlist</a>`}
+        ${session.user ? `<form action="/wishlist/toggle" method="post" class="inline-action"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}"><button class="button ghost wishlist-button" type="submit" aria-label="${wished ? "Remove from wishlist" : "Add to wishlist"}">${wished ? "♥ Saved" : "♡ Wishlist"}</button></form>` : `<a class="button ghost wishlist-button" href="/login?next=${encodeURIComponent(`/product/${product.slug}`)}">♡ Wishlist</a>`}
         <form action="/cart/add" method="post" class="config-form" enctype="multipart/form-data">
           <input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}">
           <label>Size<select name="size">${sizes.map(v => `<option>${esc(v)}</option>`).join("")}</select></label>
           <label>Material<select name="material">${materials.map(v => `<option>${esc(v)}</option>`).join("")}</select></label>
           <label>Print / finish<select name="print_option">${options.map(v => `<option>${esc(v)}</option>`).join("")}</select></label>
-          <label>Quantity<input type="number" name="quantity" min="${product.min_qty}" step="${product.min_qty === 1 ? 1 : product.min_qty}" value="${product.min_qty}" required></label>
+          <label>Quantity<input type="number" name="quantity" min="1" step="1" max="${sellable}" value="${defaultQuantity || 1}" ${sellable <= 0 ? "disabled" : "required"}></label>
           <label class="full">Artwork notes <textarea name="artwork_note" rows="3" placeholder="Design link, file name, colors or special instructions"></textarea></label>
           <label class="full">Upload artwork <input class="artwork-input" type="file" name="artwork_file" accept=".pdf,.png,.ai,.psd,application/pdf,image/png"><small class="input-help">Accepted: PDF, PNG, AI, PSD up to 25 MB.</small><span class="artwork-preview"></span></label>
-          <div class="price-box"><span>Starting total</span><strong data-unit-price="${product.price}">${money(product.price)}</strong><small>Inclusive of taxes · final price updates with quantity</small></div>
-          <button class="button primary full" type="submit">Add to cart</button>
+          <div class="price-box"><span>Starting total</span><strong data-unit-price="${product.price / product.min_qty}">${money(defaultQuantity ? defaultQuantity * product.price / product.min_qty : product.price)}</strong><small>${available <= 0 ? "Out of Stock" : `${sellable} available now`} · Inclusive of taxes</small></div>
+          ${available > 0
+  ? `<button class="button primary full" type="submit">Add to cart</button>`
+  : `<button class="button full" type="button" disabled>Out of Stock</button>`}
         </form>
       </div>
     </section>
     <section class="info-tabs section"><article><span>01</span><h3>Production-ready</h3><p>High-resolution print with automated and human quality checks.</p></article><article><span>02</span><h3>Need design help?</h3><p>Add notes to your order and our prepress team will contact you.</p></article><article><span>03</span><h3>Reliable delivery</h3><p>Estimated dispatch in 2–4 working days for standard products.</p></article></section>
-    <section class="section reviews-section">
+    <section class="section reviews-section" id="review">
       <div class="section-heading"><div><span class="eyebrow">CUSTOMER REVIEWS</span><h2>Print confidence from real orders</h2></div></div>
       <div class="review-layout">
-        <div class="reviews">${reviews.length ? reviews.map(r => `<article><b>${"★".repeat(r.rating)}${"☆".repeat(5 - r.rating)}</b><p>${esc(r.comment)}</p><small>${esc(r.name)} · ${new Date(r.created_at + "Z").toLocaleDateString("en-IN", { dateStyle: "medium" })}</small></article>`).join("") : `<div class="empty slim"><h3>No reviews yet</h3><p>Be the first to review this product.</p></div>`}</div>
-        ${session.user ? `<form class="review-form" method="post" action="/reviews/add"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}"><h3>Leave a review</h3><label>Rating<select name="rating"><option>5</option><option>4</option><option>3</option><option>2</option><option>1</option></select></label><label>Comment<textarea name="comment" rows="4" required minlength="8"></textarea></label><button class="button primary" type="submit">Submit review</button></form>` : `<div class="empty slim"><h3>Want to review?</h3><p>Login after ordering to share feedback.</p><a class="button primary" href="/login">Login</a></div>`}
+        ${reviewSummary.count > 0
+          ? `<div class="review-summary">
+               <span class="review-stars">${"★".repeat(Math.round(reviewSummary.avg))}${"☆".repeat(5 - Math.round(reviewSummary.avg))}</span>
+               <b>${reviewSummary.avg.toFixed(1)}</b>
+               <span class="review-count">${reviewSummary.count} review${reviewSummary.count === 1 ? "" : "s"}</span>
+               <div class="rating-breakdown" aria-label="Rating breakdown">
+                 ${[5, 4, 3, 2, 1].map(rating => `<span>${rating}★ <b>${Number(reviewSummary[`rating_${rating}_count`]) || 0}</b></span>`).join("")}
+               </div>
+             </div>`
+          : `<div class="review-summary"><span class="review-count">No reviews yet</span><div class="rating-breakdown" aria-label="Rating breakdown">${[5, 4, 3, 2, 1].map(rating => `<span>${rating}★ <b>0</b></span>`).join("")}</div></div>`}
+        <div class="reviews">${reviews.length ? reviews.map(r => `<article><b>${"★".repeat(r.rating)}${"☆".repeat(5 - r.rating)}</b><p>${esc(r.comment)}</p><small>${esc(r.name)} · ${new Date(r.created_at + "Z").toLocaleDateString("en-IN", { dateStyle: "medium" })}${r.verified_purchase ? ` · <span class="verified-purchase">Verified Purchase</span>` : ""}</small></article>`).join("") : `<div class="empty slim"><h3>No reviews yet</h3><p>Be the first to review this product.</p></div>`}</div>
+        ${
+!session.user
+? `<div class="empty slim">
+    <h3>Want to review?</h3>
+    <p>Login after ordering to share feedback.</p>
+    <a class="button primary" href="/login">Login</a>
+   </div>`
+
+: !canReview
+
+? `<div class="empty slim">
+    <h3>Verified purchase required</h3>
+    <p>You can leave a review only after purchasing this product and once the order has been delivered.</p>
+   </div>`
+
+: `<div class="empty slim"><h3>Share your experience</h3><p>Manage your review from the delivered order that contains this product.</p><a class="button primary" href="/account/orders">Open order history</a></div>`
+}
       </div>
     </section>
     ${recommendations.length ? `<section class="section tint"><div class="section-heading"><div><span class="eyebrow">SMART RECOMMENDATIONS</span><h2>Often ordered together</h2></div></div><div class="product-grid">${recommendations.map(productCard).join("")}</div></section>` : ""}
@@ -615,28 +877,34 @@ function cartPage(url, session, cart) {
     <section class="page-hero compact"><span class="eyebrow">YOUR ORDER</span><h1>Shopping cart</h1><p>Review your print specifications before checkout.</p></section>
     ${notice(url)}
     <section class="cart-layout section">
-      <div>${cart.items.length ? cart.items.map(item => `<article class="cart-item">${productArt(item)}<div class="cart-copy"><h3><a href="/product/${item.slug}">${esc(item.name)}</a></h3><p>${esc(item.size)} · ${esc(item.material)} · ${esc(item.print_option)}</p>${item.artwork_note ? `<small>Artwork note: ${esc(item.artwork_note)}</small>` : ""}${item.artwork_original_name ? `<small>Uploaded file: ${esc(item.artwork_original_name)}</small>` : ""}</div><form action="/cart/update" method="post"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="item_id" value="${item.id}"><label>Qty<input name="quantity" type="number" min="0" value="${item.quantity}"></label><button>Update</button></form><strong>${money(item.quantity * item.unit_price)}</strong></article>`).join("") : `<div class="empty"><h2>Your cart is waiting for a great idea.</h2><p>Choose a product and customize it to get started.</p><a class="button primary" href="/products">Explore products</a></div>`}</div>
+      <div>${cart.items.length ? cart.items.map(item => `<article class="cart-item">${productArt(item)}<div class="cart-copy"><h3><a href="/product/${item.slug}">${esc(item.name)}</a></h3><p>${esc(item.size)} · ${esc(item.material)} · ${esc(item.print_option)}</p>${item.artwork_note ? `<small>Artwork note: ${esc(item.artwork_note)}</small>` : ""}${item.artwork_original_name ? `<small>Uploaded file: ${esc(item.artwork_original_name)}</small>` : ""}</div><form action="/cart/update" method="post"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="item_id" value="${item.id}"><label>Qty<input name="quantity" type="number" min="0" max="${item.quantity + sellableQuantity(item)}" value="${item.quantity}"></label><small>${item.quantity + sellableQuantity(item)} max available</small><button>Update</button></form><strong>${money(item.quantity * item.unit_price)}</strong></article>`).join("") : `<div class="empty"><h2>Your cart is waiting for a great idea.</h2><p>Choose a product and customize it to get started.</p><a class="button primary" href="/products">Explore products</a></div>`}</div>
       ${cart.items.length ? `<aside class="order-summary"><h2>Order summary</h2><p><span>Subtotal</span><b>${money(totals.subtotal)}</b></p><p><span>Delivery estimate</span><b>${totals.delivery === 0 ? "FREE" : money(totals.delivery)}</b></p><p class="total"><span>Total</span><b>${money(totals.total)}</b></p><small>Taxes included. Exact shipping updates by PIN code at checkout.</small><a class="button primary" href="/checkout">Proceed to checkout</a><a href="/products">Continue shopping</a></aside>` : ""}
     </section>
   `, session, cart);
 }
 
-function checkoutPage(session, cart) {
+function checkoutPage(session, cart, url = new URL("/checkout", "http://localhost")) {
   const razorpayReady = Boolean(RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET);
-  const totals = cartTotals(cart);
+  const savedAddress = defaultAddress(session.user.id);
+  const couponCode = String(url.searchParams.get("coupon_code") || "").trim().toUpperCase();
+  const totals = cartTotals(cart, savedAddress?.postal_code || "", couponCode);
   return layout("Checkout", `
     <section class="page-hero compact"><span class="eyebrow">SECURE CHECKOUT</span><h1>Delivery & payment</h1><p>Your order and payment are verified securely before production.</p></section>
+    ${notice(url)}
     <section class="checkout-layout section">
       <form class="checkout-form" id="checkout-form" action="/checkout" method="post" data-razorpay-ready="${razorpayReady}" data-key-id="${esc(RAZORPAY_KEY_ID)}"><input type="hidden" name="csrf" value="${session.csrf}">
         <h2>Contact & delivery</h2>
-        <div class="form-grid"><label>Full name<input name="customer_name" value="${esc(session.user.name)}" required></label><label>Phone number<input name="phone" inputmode="tel" pattern="[0-9 +()-]{8,18}" required></label><label class="full">Address<textarea name="address" required rows="3"></textarea></label><label>City<input name="city" required></label><label>PIN code<input name="postal_code" inputmode="numeric" pattern="[0-9]{6}" required></label><label>GST number <small class="input-help">Optional, shown on invoice.</small><input name="gst_number" maxlength="20"></label><label>Coupon code <small class="input-help">Try WELCOME10 or PRINT100.</small><input name="coupon_code" maxlength="24"></label></div>
+        ${savedAddress ? `<p class="saved-address-note">Using your default address: ${esc(savedAddress.label)}. <a href="/account/addresses">Manage addresses</a></p>` : `<p class="saved-address-note">Save delivery addresses from <a href="/account/addresses">your account</a> to prefill checkout.</p>`}
+        <div class="form-grid"><label>Full name<input name="customer_name" value="${esc(savedAddress?.recipient_name || session.user.name)}" required></label><label>Phone number<input name="phone" value="${esc(savedAddress?.phone || "")}" inputmode="tel" pattern="[0-9 +()-]{8,18}" required></label><label class="full">Address<textarea name="address" required rows="3">${esc(savedAddress?.address || "")}</textarea></label><label>City<input name="city" value="${esc(savedAddress?.city || "")}" required></label><label>PIN code<input name="postal_code" value="${esc(savedAddress?.postal_code || "")}" inputmode="numeric" pattern="[0-9]{6}" required></label><label>GST number <small class="input-help">Optional, shown on invoice.</small><input name="gst_number" maxlength="20"></label><label>Coupon code <small class="input-help">Try WELCOME10 or PRINT100.</small><input name="coupon_code" value="${esc(couponCode)}" maxlength="24"></label></div>
+        <button class="button ghost coupon-apply" type="submit" formmethod="get" formaction="/checkout" formnovalidate>Apply coupon</button>
+        ${totals.couponError ? `<p class="form-error">${esc(totals.couponError)}</p>` : totals.coupon ? `<p class="form-success">${esc(totals.coupon.code)} applied. You save ${money(totals.discount)}.</p>` : ""}
         <div class="shipping-estimate" data-subtotal="${cart.subtotal}">Enter PIN code for exact shipping.</div>
         <h2>Payment</h2>
         ${razorpayReady ? `<label class="payment-option"><input type="radio" name="payment_method" value="razorpay" checked><span><b>Pay securely online</b><small>UPI, cards, netbanking and supported wallets via Razorpay.</small></span></label>` : `<div class="integration-note">Online payment activates after Razorpay keys are added. Cash on delivery remains available.</div>`}
         <label class="payment-option"><input type="radio" name="payment_method" value="cod" ${razorpayReady ? "" : "checked"}><span><b>Cash on delivery</b><small>Available for eligible orders.</small></span></label>
         <button class="button primary" type="submit">Place order · ${money(totals.total)}</button>
       </form>
-      <aside class="order-summary"><h2>Your prints</h2>${cart.items.map(i => `<p><span>${esc(i.name)} × ${i.quantity}</span><b>${money(i.quantity * i.unit_price)}</b></p>`).join("")}<p><span>Delivery estimate</span><b>${totals.delivery === 0 ? "FREE" : money(totals.delivery)}</b></p><p class="total"><span>Total</span><b>${money(totals.total)}</b></p></aside>
+      <aside class="order-summary"><h2>Your prints</h2>${cart.items.map(i => `<p><span>${esc(i.name)} × ${i.quantity}</span><b>${money(i.quantity * i.unit_price)}</b></p>`).join("")}${totals.discount ? `<p><span>Coupon discount</span><b>−${money(totals.discount)}</b></p>` : ""}<p><span>Delivery estimate</span><b>${totals.delivery === 0 ? "FREE" : money(totals.delivery)}</b></p><p class="total"><span>Total</span><b>${money(totals.total)}</b></p></aside>
     </section>
     ${razorpayReady ? `<script src="https://checkout.razorpay.com/v1/checkout.js"></script>` : ""}
   `, session, cart);
@@ -647,32 +915,152 @@ function accountPage(url, session, cart) {
   return layout("My account", `
     <section class="account-head"><div><span class="eyebrow">MY PRINTOASIS</span><h1>Hello, ${esc(session.user.name)}.</h1><p>${esc(session.user.email)}</p></div><form action="/logout" method="post"><input type="hidden" name="csrf" value="${session.csrf}"><button class="button ghost">Log out</button></form></section>
     ${notice(url)}
-    <section class="account-layout section"><aside><a class="active" href="/account">Overview</a><a href="/account/orders">Orders</a><a href="/products">Start a new order</a></aside><div><div class="account-cards"><article><span>Orders</span><b>${orders.length}</b><a href="/account/orders">View history →</a></article><article><span>Saved email</span><b class="small">${esc(session.user.email)}</b><a href="/contact">Need help? →</a></article></div><h2>Recent orders</h2>${orderList(orders.slice(0, 3))}</div></section>
+    <section class="account-layout section"><aside><a class="active" href="/account">Overview</a><a href="/account/orders">Orders</a><a href="/account/addresses">Addresses</a><a href="/account/password">Security</a><a href="/products">Start a new order</a></aside><div><div class="account-cards"><article><span>Orders</span><b>${orders.length}</b><a href="/account/orders">View history →</a></article><article><span>Saved email</span><b class="small">${esc(session.user.email)}</b><a href="/account/addresses">Manage addresses →</a></article></div><h2>Recent orders</h2>${orderList(orders.slice(0, 3), session)}</div></section>
   `, session, cart);
 }
 
-function orderList(orders) {
-  if (!orders.length) return `<div class="empty slim"><h3>No orders yet</h3><p>Your completed purchases will appear here.</p><a class="button primary" href="/products">Shop products</a></div>`;
-  return `<div class="orders">${orders.map(o => `<article><div><span>${esc(o.order_number)}</span><small>${new Date(o.created_at + "Z").toLocaleDateString("en-IN", { dateStyle: "medium" })}</small></div><b class="status ${statusClass(o.status)}">${esc(o.status)}</b><strong>${money(o.total)}</strong><a class="button ghost" href="/invoice/${encodeURIComponent(o.order_number)}">GST invoice</a></article>`).join("")}</div>`;
+function addressesPage(url, session, cart) {
+  const editId = Number(url.searchParams.get("edit") || 0);
+  const addresses = db.prepare("SELECT * FROM addresses WHERE user_id = ? ORDER BY is_default DESC, id DESC").all(session.user.id);
+  const editing = editId ? addresses.find(address => address.id === editId) : null;
+  const address = editing || { id: "", label: "Home", recipient_name: session.user.name, phone: "", address: "", city: "", postal_code: "", is_default: !addresses.length };
+  return layout("Saved addresses", `
+    <section class="page-hero compact"><span class="eyebrow">MY ACCOUNT</span><h1>Saved addresses</h1><p>Keep delivery details ready for a faster checkout.</p></section>
+    ${notice(url)}
+    <section class="account-layout section"><aside><a href="/account">Overview</a><a href="/account/orders">Orders</a><a class="active" href="/account/addresses">Addresses</a><a href="/account/password">Security</a><a href="/products">Start a new order</a></aside><div><form class="account-form" method="post" action="/account/addresses/save"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="id" value="${address.id}"><h2>${editing ? "Edit address" : "Add address"}</h2><div class="form-grid"><label>Label<input name="label" value="${esc(address.label)}" maxlength="40" required></label><label>Recipient name<input name="recipient_name" value="${esc(address.recipient_name)}" required></label><label>Phone<input name="phone" value="${esc(address.phone)}" inputmode="tel" pattern="[0-9 +()-]{8,18}" required></label><label>PIN code<input name="postal_code" value="${esc(address.postal_code)}" inputmode="numeric" pattern="[0-9]{6}" required></label><label class="full">Address<textarea name="address" rows="3" required>${esc(address.address)}</textarea></label><label>City<input name="city" value="${esc(address.city)}" required></label><label class="check-row"><input type="checkbox" name="is_default" value="1" ${address.is_default ? "checked" : ""}>Use as default delivery address</label></div><button class="button primary" type="submit">${editing ? "Save address" : "Add address"}</button></form><div class="address-list">${addresses.length ? addresses.map(item => `<article><div><b>${esc(item.label)}${item.is_default ? " · Default" : ""}</b><p>${esc(item.recipient_name)} · ${esc(item.phone)}<br>${esc(item.address)}, ${esc(item.city)} ${esc(item.postal_code)}</p></div><nav><a class="button ghost" href="/account/addresses?edit=${item.id}">Edit</a>${item.is_default ? "" : `<form method="post" action="/account/addresses/default"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="id" value="${item.id}"><button class="button ghost">Set default</button></form>`}<form method="post" action="/account/addresses/delete" onsubmit="return confirm('Delete this saved address?');"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="id" value="${item.id}"><button class="button ghost">Delete</button></form></nav></article>`).join("") : `<div class="empty slim"><h3>No saved addresses yet</h3><p>Add one to prefill checkout.</p></div>`}</div></div></section>
+  `, session, cart);
 }
 
-function ordersPage(session, cart) {
-  const orders = db.prepare("SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC").all(session.user.id);
-  return layout("Order history", `<section class="page-hero compact"><span class="eyebrow">MY ACCOUNT</span><h1>Order history</h1><p>Track every order from production to delivery.</p></section><section class="section narrow">${orderList(orders)}</section>`, session, cart);
+function passwordPage(url, session, cart) {
+  return layout("Account security", `
+    <section class="page-hero compact"><span class="eyebrow">MY ACCOUNT</span><h1>Account security</h1><p>Keep your PrintOasis account protected.</p></section>
+    ${notice(url)}
+    <section class="account-layout section"><aside><a href="/account">Overview</a><a href="/account/orders">Orders</a><a href="/account/addresses">Addresses</a><a class="active" href="/account/password">Security</a><a href="/products">Start a new order</a></aside><div><form class="account-form narrow-form" method="post" action="/account/password"><input type="hidden" name="csrf" value="${session.csrf}"><h2>Change password</h2><label>Current password<input name="current_password" type="password" autocomplete="current-password" required></label><label>New password<input name="new_password" type="password" autocomplete="new-password" minlength="8" required></label><label>Confirm new password<input name="confirm_password" type="password" autocomplete="new-password" minlength="8" required></label><button class="button primary" type="submit">Update password</button></form></div></section>
+  `, session, cart);
+}
+
+function orderList(orders, session) {
+  if (!orders.length)
+    return `<div class="empty slim">
+      <h3>No orders yet</h3>
+      <p>Your completed purchases will appear here.</p>
+      <a class="button primary" href="/products">Shop products</a>
+    </div>`;
+
+  return `<div class="orders">
+    ${orders.map(order => `
+      <article>
+        <span>${esc(order.order_number)}</span>
+        <b class="status ${statusClass(order.status)}">${esc(order.status)}</b>
+        <small>${money(order.total)} · ${new Date(order.created_at + "Z").toLocaleString("en-IN")}</small>
+        <a class="button ghost" href="/account/orders/${order.id}">View Details →</a>
+        ${session ? `<form method="post" action="/account/orders/reorder"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="order_id" value="${order.id}"><button class="button ghost" type="submit">Reorder</button></form>` : ""}
+      </article>
+    `).join("")}
+  </div>`;
+}
+
+function ordersPage(session, cart, url) {
+  const query = String(url.searchParams.get("q") || "").trim().slice(0, 80);
+  const status = ORDER_STATUSES.includes(url.searchParams.get("status")) ? url.searchParams.get("status") : "";
+  const where = ["o.user_id = ?"];
+  const params = [session.user.id];
+  if (status) { where.push("o.status = ?"); params.push(status); }
+  if (query) {
+    where.push("(o.order_number LIKE ? OR EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = o.id AND oi.product_name LIKE ?))");
+    params.push(`%${query}%`, `%${query}%`);
+  }
+  const orders = db.prepare(`SELECT o.* FROM orders o WHERE ${where.join(" AND ")} ORDER BY o.id DESC`).all(...params);
+
+  return layout(
+    "Order history",
+    `<section class="page-hero compact">
+        <span class="eyebrow">MY ACCOUNT</span>
+        <h1>Order history</h1>
+        <p>Track every order from production to delivery.</p>
+     </section>
+
+     <section class="section narrow">
+        <form class="order-filters" method="get" action="/account/orders"><input name="q" value="${esc(query)}" placeholder="Order ID or product name"><select name="status"><option value="">All statuses</option>${ORDER_STATUSES.map(item => `<option ${status === item ? "selected" : ""}>${item}</option>`).join("")}</select><button class="button ghost" type="submit">Filter orders</button></form>
+        ${notice(url)}
+        ${orderList(orders, session)}
+     </section>`,
+    session,
+    cart
+  );
+}
+
+function orderDetailsPage(order, session, cart) {
+  const items = db.prepare(`
+    SELECT oi.*, p.slug
+    FROM order_items oi
+    JOIN products p
+      ON p.id = oi.product_id
+    WHERE oi.order_id = ?
+  `).all(order.id);
+
+  for (const item of items) {
+    item.review = db.prepare(`
+      SELECT id, rating, comment
+      FROM reviews
+      WHERE user_id = ? AND product_id = ?
+      LIMIT 1
+    `).get(session.user.id, item.product_id);
+  }
+
+  return layout(
+    `Order ${order.order_number}`,
+    `<section class="page-hero compact">
+      <span class="eyebrow">MY ACCOUNT</span>
+      <h1>${esc(order.order_number)}</h1>
+      <p>${new Date(order.created_at + "Z").toLocaleDateString("en-IN", { dateStyle: "long" })}</p>
+    </section>
+
+    <section class="section narrow order-details">
+
+      <b class="status ${statusClass(order.status)}">${esc(order.status)}</b>
+
+      ${statusTimeline(order)}
+
+      ${order.courier_name ? `<p><strong>Courier:</strong> ${esc(order.courier_name)}</p>` : ""}
+      ${order.tracking_number ? `<p><strong>Tracking number:</strong> ${esc(order.tracking_number)}</p>` : ""}
+      ${order.estimated_delivery ? `<p><strong>Estimated delivery:</strong> ${new Date(order.estimated_delivery).toLocaleDateString("en-IN", { dateStyle: "medium" })}</p>` : ""}
+
+      <div class="order-actions">
+        ${order.tracking_url ? `<a class="button primary" href="${esc(order.tracking_url)}" target="_blank" rel="noopener">Track Package</a>` : ""}
+        <a class="button ghost" href="/invoice/${encodeURIComponent(order.order_number)}">View invoice</a>
+      </div>
+
+      <h2>Items in this order</h2>
+
+      <div class="order-review-actions">
+        ${items.map(item => `
+          <div class="review-item" id="review-${item.product_id}">
+            <span>${esc(item.product_name)} <small>Qty: ${item.quantity}</small></span>
+            ${order.status === "Delivered" ? `<form class="review-form order-review-form" method="post" action="/account/reviews/save"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="order_id" value="${order.id}"><input type="hidden" name="product_id" value="${item.product_id}"><label>Rating<select name="rating">${[5, 4, 3, 2, 1].map(rating => `<option value="${rating}" ${item.review?.rating === rating ? "selected" : ""}>${rating}</option>`).join("")}</select></label><label>Comment<textarea name="comment" rows="3" minlength="8" required>${esc(item.review?.comment || "")}</textarea></label><button class="button primary" type="submit">${item.review ? "Update review" : "Submit review"}</button></form>${item.review ? `<form method="post" action="/account/reviews/delete" onsubmit="return confirm('Delete this review?');"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="order_id" value="${order.id}"><input type="hidden" name="review_id" value="${item.review.id}"><button class="button ghost" type="submit">Delete review</button></form>` : ""}` : `<small>Reviews unlock after this order is delivered.</small>`}
+          </div>
+        `).join("")}
+      </div>
+
+    </section>`,
+    session,
+    cart
+  );
 }
 
 function infoPage(kind, session, cart) {
   const pages = {
     help: ["Help centre", "Everything you need for a smooth print run.", [["How should I prepare artwork?", "Use a print-ready PDF at 300 DPI with 3 mm bleed. Add any special instructions on the product page."], ["Can I order a small quantity?", "Yes. Many products start at one piece; business print minimums are shown on each product page."], ["How quickly will my order arrive?", "Standard products dispatch in 2–4 working days. Select products offer same-day production in supported cities."], ["Can you help with my design?", "Yes. Add a design reference or note to your cart and our prepress team can assist before production."]]],
     contact: ["Talk to our print team", "Questions, bulk requirements or a delightfully unusual idea?", [["Customer support", "support@printoasis.example · +91 80 4567 8900"], ["Working hours", "Monday–Saturday · 9:00 AM–7:00 PM IST"], ["Bulk enquiries", "business@printoasis.example"]]],
-    business: ["Print, managed for business", "One dependable partner for teams, locations and campaigns.", [["Brand consistency", "Central templates and controlled print specifications across every order."], ["Volume pricing", "Custom commercial rates for recurring and high-volume requirements."], ["Nationwide fulfilment", "Coordinate kits, stationery, signage and packaging across India."], ["Dedicated support", "A single account contact from quotation through delivery."]]]
+    business: ["Print, managed for business", "One dependable partner for teams, locations and campaigns.", [["Brand consistency", "Central templates and controlled print specifications across every order."], ["Volume pricing", "Custom commercial rates for recurring and high-volume requirements."], ["Nationwide fulfilment", "Coordinate kits, stationery, signage and packaging across India."], ["Dedicated support", "A single account contact from quotation through delivery."]]],
+    faq: ["Frequently asked questions", "Straight answers for every stage of your print order.", [["Ordering", "Choose a product, configure size and finish, upload artwork, then review your cart before checkout."], ["Shipping", "Orders move through Pending, Printing, Packed, Shipped and Delivered. Tracking details appear as soon as dispatch is confirmed."], ["Artwork", "Upload PDF, PNG, AI or PSD artwork up to 25 MB. Our prepress team checks files before production."], ["Returns", "Contact support promptly if an item arrives damaged or differs from the approved specification so our team can review it."], ["Payments", "Secure online payments are processed through Razorpay when configured. Eligible orders can use cash on delivery."], ["Bulk orders", "For recurring, multi-location or large-format work, contact the business team for a tailored quote and production plan."]]]
   };
   const [title, subtitle, items] = pages[kind];
   return layout(title, `<section class="page-hero"><span class="eyebrow">${kind === "business" ? "BUSINESS SOLUTIONS" : "SUPPORT"}</span><h1>${title}</h1><p>${subtitle}</p>${kind === "business" ? `<a class="button primary" href="/contact">Request a business quote</a>` : ""}</section><section class="info-grid section">${items.map(i => `<article><h2>${i[0]}</h2><p>${i[1]}</p></article>`).join("")}</section>`, session, cart);
 }
 
 function adminTabs(active) {
-  const tabs = [["/admin", "Dashboard"], ["/admin/products", "Products"], ["/admin/orders", "Orders"], ["/admin/notifications", "Notifications"]];
+  const tabs = [["/admin", "Dashboard"], ["/admin/products", "Products"], ["/admin/coupons", "Coupons"], ["/admin/orders", "Orders"], ["/admin/notifications", "Notifications"]];
   return `<aside>${tabs.map(([href, label]) => `<a class="${active === label ? "active" : ""}" href="${href}">${label}</a>`).join("")}</aside>`;
 }
 
@@ -685,9 +1073,9 @@ function adminPage(title, active, body, session, cart) {
 
 function adminDashboardPage(session, cart) {
   const stats = {
-    products: db.prepare("SELECT COUNT(*) count FROM products WHERE active = 1").get().count,
+    products: db.prepare(`SELECT COUNT(*) count FROM products WHERE ${visibleProductCondition()}`).get().count,
     orders: db.prepare("SELECT COUNT(*) count FROM orders").get().count,
-    pending: db.prepare("SELECT COUNT(*) count FROM orders WHERE status != 'Delivered'").get().count,
+    pending: db.prepare("SELECT COUNT(*) count FROM orders WHERE status NOT IN ('Delivered','Cancelled')").get().count,
     revenue: db.prepare("SELECT COALESCE(SUM(total),0) total FROM orders").get().total
   };
   const statusCounts = db.prepare("SELECT status, COUNT(*) count FROM orders GROUP BY status ORDER BY count DESC").all();
@@ -704,7 +1092,8 @@ function adminDashboardPage(session, cart) {
 }
 
 function productForm(product, session) {
-  const p = product || { id: "", slug: "", name: "", category: categories[0][0], price: 399, min_qty: 1, rating: 4.8, badge: "New", description: "", sizes: "", materials: "", print_options: "", color: "cobalt", active: 1 };
+  const p = product || { id: "", slug: "", name: "", category: categories[0][0], price: 399, min_qty: 1, rating: 4.8, badge: "New", description: "", sizes: "", materials: "", print_options: "", color: "cobalt", stock: 100, reserved: 0, status: "active", featured: 0, active: 1 };
+  const available = productAvailable(p);
   return `<form class="admin-form" method="post" action="/admin/products/save" enctype="multipart/form-data">
     <input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="id" value="${esc(p.id)}">
     <label>Product name<input name="name" value="${esc(p.name)}" required></label>
@@ -720,30 +1109,134 @@ function productForm(product, session) {
     <label>Sizes <small class="input-help">Separate with |</small><input name="sizes" value="${esc(p.sizes)}" required></label>
     <label>Materials <small class="input-help">Separate with |</small><input name="materials" value="${esc(p.materials)}" required></label>
     <label>Print options <small class="input-help">Separate with |</small><input name="print_options" value="${esc(p.print_options)}" required></label>
-    <label class="check-row"><input type="checkbox" name="active" value="1" ${p.active ? "checked" : ""}> Active in storefront</label>
+    <label>Physical stock<input type="number" name="stock" min="0" value="${p.stock ?? 0}" required></label>
+    <label>Reserved <input type="number" value="${p.reserved ?? 0}" readonly><small class="input-help">System-managed from carts and pending orders.</small></label>
+    <label>Available <input type="number" value="${available}" readonly><small class="input-help">Calculated as stock - reserved.</small></label>
+    <label>Status<select name="status"><option value="active" ${p.status !== "hidden" ? "selected" : ""}>Active</option><option value="hidden" ${p.status === "hidden" ? "selected" : ""}>Hidden</option></select></label>
+    <label class="check-row">
+    <input type="checkbox" name="featured" value="1" ${p.featured ? "checked" : ""}>
+    Featured product
+    </label>
     <button class="button primary full" type="submit">${product ? "Save product" : "Create product"}</button>
-  </form>`;
+    </form>`;
 }
 
 function adminProductsPage(url, session, cart) {
   const editId = Number(url.searchParams.get("edit") || 0);
   const editing = editId ? db.prepare("SELECT * FROM products WHERE id = ?").get(editId) : null;
-  const products = db.prepare("SELECT * FROM products ORDER BY active DESC, category, name").all();
+  const products = db.prepare("SELECT * FROM products ORDER BY status = 'hidden', category, name").all();
   return adminPage("Product manager", "Products", `
     <div class="section-heading compact-heading"><div><span class="eyebrow">CATALOG CRUD</span><h2>${editing ? `Edit ${esc(editing.name)}` : "Add product"}</h2></div></div>
     ${productForm(editing, session)}
-    <div class="admin-table"><h2>All products</h2>${products.map(p => `<article><div>${productArt(p)}<span><b>${esc(p.name)}</b><small>${esc(p.category)} · ${money(p.price)} · min ${p.min_qty} · ${p.active ? "active" : "hidden"}</small></span></div><nav><a class="button ghost" href="/admin/products?edit=${p.id}">Edit</a><form method="post" action="/admin/products/delete"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="id" value="${p.id}"><button class="button ghost" type="submit">Delete</button></form></nav></article>`).join("")}</div>
+    <div class="admin-table"><h2>All products</h2>${products.map(p => `<article><div>${productArt(p)}<span><b>${esc(p.name)}</b><small>${esc(p.category)} · ${money(p.price)} · min ${p.min_qty} · ${p.status === "hidden" ? "hidden" : "active"}</small><small>Stock ${p.stock ?? 0} · Reserved ${p.reserved ?? 0} · Available ${productAvailable(p)}</small></span></div><nav><a class="button ghost" href="/admin/products?edit=${p.id}">Edit</a><form method="post" action="/admin/products/delete"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="id" value="${p.id}"><button class="button ghost" type="submit">Delete</button></form></nav></article>`).join("")}</div>
+  `, session, cart);
+}
+
+function couponForm(coupon, session) {
+  const item = coupon || { code: "", type: "percent", value: 10, minimum_order: 0, maximum_discount: "", expiry_date: "", usage_limit: "", times_used: 0, active: 1 };
+  return `<form class="admin-form" method="post" action="/admin/coupons/save"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="original_code" value="${esc(coupon?.code || "")}"><label>Code<input name="code" value="${esc(item.code)}" maxlength="24" pattern="[A-Za-z0-9_-]+" required></label><label>Type<select name="type"><option value="percent" ${item.type === "percent" ? "selected" : ""}>Percentage</option><option value="fixed" ${item.type === "fixed" ? "selected" : ""}>Fixed amount</option></select></label><label>Value<input name="value" type="number" min="1" value="${item.value}" required></label><label>Minimum order<input name="minimum_order" type="number" min="0" value="${item.minimum_order || 0}" required></label><label>Maximum discount <small class="input-help">Optional cap for percentage coupons.</small><input name="maximum_discount" type="number" min="1" value="${esc(item.maximum_discount || "")}"></label><label>Expiry date <small class="input-help">Optional; valid through this date.</small><input name="expiry_date" type="date" value="${esc(item.expiry_date || "")}"></label><label>Usage limit <small class="input-help">Optional total limit.</small><input name="usage_limit" type="number" min="1" value="${esc(item.usage_limit || "")}"></label><label>Times used<input type="number" value="${item.times_used || 0}" readonly></label><label class="check-row"><input type="checkbox" name="active" value="1" ${item.active ? "checked" : ""}>Coupon is active</label><button class="button primary full" type="submit">${coupon ? "Save coupon" : "Create coupon"}</button></form>`;
+}
+
+function adminCouponsPage(url, session, cart) {
+  const editCode = String(url.searchParams.get("edit") || "").trim().toUpperCase();
+  const editing = editCode ? db.prepare("SELECT * FROM coupons WHERE code = ?").get(editCode) : null;
+  const coupons = db.prepare("SELECT * FROM coupons ORDER BY active DESC, created_at DESC, code").all();
+  return adminPage("Coupon manager", "Coupons", `
+    <div class="section-heading compact-heading"><div><span class="eyebrow">CHECKOUT PROMOTIONS</span><h2>${editing ? `Edit ${esc(editing.code)}` : "Create coupon"}</h2></div></div>
+    ${couponForm(editing, session)}
+    <div class="admin-table"><h2>All coupons</h2>${coupons.length ? coupons.map(coupon => `<article><div><span><b>${esc(coupon.code)}</b><small>${coupon.type === "percent" ? `${coupon.value}%` : money(coupon.value)} · Minimum ${money(coupon.minimum_order || coupon.min_total || 0)}${coupon.maximum_discount ? ` · Cap ${money(coupon.maximum_discount)}` : ""}</small><small>${coupon.active ? "Active" : "Disabled"} · Used ${coupon.times_used || 0}${coupon.usage_limit ? ` / ${coupon.usage_limit}` : ""}${coupon.expiry_date ? ` · Expires ${esc(coupon.expiry_date)}` : ""}</small></span></div><nav><a class="button ghost" href="/admin/coupons?edit=${encodeURIComponent(coupon.code)}">Edit</a><form method="post" action="/admin/coupons/toggle"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="code" value="${esc(coupon.code)}"><button class="button ghost">${coupon.active ? "Disable" : "Enable"}</button></form><form method="post" action="/admin/coupons/delete" onsubmit="return confirm('Delete this coupon?');"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="code" value="${esc(coupon.code)}"><button class="button ghost">Delete</button></form></nav></article>`).join("") : `<div class="empty slim"><h3>No coupons yet</h3><p>Create one to offer a checkout promotion.</p></div>`}</div>
   `, session, cart);
 }
 
 function adminOrderRows(orders, session, editable = true) {
-  if (!orders.length) return `<div class="empty slim"><h3>No orders yet</h3><p>Orders will appear here after checkout.</p></div>`;
-  return `<div class="admin-orders">${orders.map(o => `<article><div><b>${esc(o.order_number)}</b><small>${esc(o.customer_name)} · ${esc(o.email || "")} · ${money(o.total)}</small><small>${esc(o.city)} ${esc(o.postal_code)} · ${new Date(o.created_at + "Z").toLocaleString("en-IN")}</small></div><span class="status ${statusClass(o.status)}">${esc(o.status)}</span>${editable ? `<form method="post" action="/admin/orders/status"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="order_id" value="${o.id}"><select name="status">${ORDER_STATUSES.map(s => `<option ${o.status === s ? "selected" : ""}>${s}</option>`).join("")}</select><input name="tracking_number" placeholder="Tracking #" value="${esc(o.tracking_number || "")}"><input name="note" placeholder="Internal/customer note"><button class="button primary" type="submit">Update</button></form><a class="button ghost" href="/invoice/${encodeURIComponent(o.order_number)}">Invoice</a>` : ""}</article>`).join("")}</div>`;
+  if (!orders.length)
+    return `<div class="empty slim"><h3>No orders yet</h3><p>Orders will appear here after checkout.</p></div>`;
+
+  return `<div class="admin-orders">
+    ${orders.map(o => `
+      <article>
+        <div>
+          <b>${esc(o.order_number)}</b>
+
+          <small>
+            ${esc(o.customer_name)} · ${esc(o.email || "")} · ${money(o.total)}
+          </small>
+
+          <small>
+            ${esc(o.city)} ${esc(o.postal_code)} ·
+            ${new Date(o.created_at + "Z").toLocaleString("en-IN")}
+          </small>
+        </div>
+
+        <span class="status ${statusClass(o.status)}">
+          ${esc(o.status)}
+        </span>
+
+        ${
+          editable
+            ? `
+          <form method="post" action="/admin/orders/status">
+
+            <input type="hidden" name="csrf" value="${session.csrf}">
+            <input type="hidden" name="order_id" value="${o.id}">
+
+            <select name="status">
+              ${ORDER_STATUSES.map(s =>
+                `<option ${o.status === s ? "selected" : ""}>${s}</option>`
+              ).join("")}
+            </select>
+
+            <input
+              name="tracking_number"
+              placeholder="Tracking #"
+              value="${esc(o.tracking_number || "")}"
+            >
+
+            <input
+              name="courier_name"
+              placeholder="Courier Name"
+              value="${esc(o.courier_name || "")}"
+            >
+
+            <input
+              name="tracking_url"
+              placeholder="Tracking URL"
+              value="${esc(o.tracking_url || "")}"
+            >
+
+            <input
+              type="date"
+              name="estimated_delivery"
+              value="${esc(o.estimated_delivery || "")}"
+            >
+
+            <input
+              name="note"
+              placeholder="Internal/customer note"
+            >
+
+            <button class="button primary" type="submit">
+              Update
+            </button>
+
+          </form>
+
+          <a class="button ghost"
+             href="/invoice/${encodeURIComponent(o.order_number)}">
+             Invoice
+          </a>
+        `
+            : ""
+        }
+
+      </article>
+    `).join("")}
+  </div>`;
 }
 
 function adminOrdersPage(session, cart) {
   const orders = db.prepare("SELECT o.*, u.email FROM orders o JOIN users u ON u.id = o.user_id ORDER BY o.id DESC").all();
-  return adminPage("Order manager", "Orders", `<p class="lead">Update statuses through Pending, Printing, Packed, Shipped and Delivered. Each change writes a timeline event and queues a customer notification.</p>${adminOrderRows(orders, session, true)}`, session, cart);
+  return adminPage("Order manager", "Orders", `<p class="lead">Update statuses through Pending, Printing, Packed, Shipped, Delivered and Cancelled. Cancelled orders automatically restore deducted stock once.</p>${adminOrderRows(orders, session, true)}`, session, cart);
 }
 
 function adminNotificationsPage(session, cart) {
@@ -752,17 +1245,98 @@ function adminNotificationsPage(session, cart) {
 }
 
 function wishlistPage(session, cart) {
-  const products = db.prepare(`SELECT p.* FROM wishlist_items w JOIN products p ON p.id = w.product_id WHERE w.user_id = ? AND p.active = 1 ORDER BY w.id DESC`).all(session.user.id);
-  return layout("Wishlist", `<section class="page-hero compact"><span class="eyebrow">SAVED PRINTS</span><h1>Your wishlist</h1><p>Keep client favourites and repeat-order ideas close.</p></section><section class="section">${products.length ? `<div class="product-grid">${products.map(productCard).join("")}</div>` : `<div class="empty"><h2>No saved products yet</h2><p>Open a product and add it to your wishlist.</p><a class="button primary" href="/products">Browse products</a></div>`}</section>`, session, cart);
+  const products = db.prepare(`SELECT p.*, w.saved_price FROM wishlist_items w JOIN products p ON p.id = w.product_id WHERE w.user_id = ? AND ${visibleProductCondition("p")} ORDER BY w.id DESC`).all(session.user.id);
+  return layout("Wishlist", `<section class="page-hero compact"><span class="eyebrow">SAVED PRINTS</span><h1>Your wishlist</h1><p>Keep client favourites and repeat-order ideas close.</p></section><section class="section">${products.length ? `<div class="product-grid">${products.map(product => { const available = sellableQuantity(product); const priceNote = Number(product.price) < Number(product.saved_price) ? "Price dropped" : Number(product.price) > Number(product.saved_price) ? "Price increased" : "Price unchanged"; const stockNote = available <= 0 ? "Out of Stock" : available <= Math.max(5, product.min_qty) ? "Low Stock" : "In Stock"; return `<article class="wishlist-card">${productArt(product)}<h3><a href="/product/${esc(product.slug)}">${esc(product.name)}</a></h3><p>${money(product.price)} · ${esc(priceNote)} · ${esc(stockNote)}</p><div class="wishlist-actions"><form method="post" action="/wishlist/move-to-cart"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}"><button class="button primary" type="submit" ${available <= 0 ? "disabled" : ""}>Move to cart</button></form><form method="post" action="/wishlist/toggle"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}"><input type="hidden" name="next" value="/wishlist"><button class="button ghost" type="submit">Remove</button></form></div></article>`; }).join("")}</div>` : `<div class="empty"><h2>No saved products yet</h2><p>Open a product and add it to your wishlist.</p><a class="button primary" href="/products">Browse products</a></div>`}</section>`, session, cart);
 }
 
 function statusTimeline(order) {
+  if (order.status === "Cancelled") return `<div class="status-timeline"><span class="done">Pending</span><span class="done">Cancelled</span></div>`;
   const index = Math.max(0, ORDER_STATUSES.indexOf(order.status));
-  return `<div class="status-timeline">${ORDER_STATUSES.map((s, i) => `<span class="${i <= index ? "done" : ""}">${esc(s)}</span>`).join("")}</div>`;
+  return `<div class="status-timeline">${ORDER_STATUSES.filter(s => s !== "Cancelled").map((s, i) => `<span class="${i <= index ? "done" : ""}">${esc(s)}</span>`).join("")}</div>`;
 }
 
 function trackPage(url, session, cart, result = null) {
-  return layout("Track order", `<section class="page-hero compact"><span class="eyebrow">ORDER TRACKING</span><h1>Track your print order</h1><p>Enter your order number and phone number to see the current production stage.</p></section>${notice(url)}<section class="section narrow"><form class="track-form" method="post" action="/track"><input type="hidden" name="csrf" value="${session.csrf}"><label>Order number<input name="order_number" placeholder="PO-2026-123456" required></label><label>Phone number<input name="phone" required></label><button class="button primary" type="submit">Track order</button></form>${result ? `<div class="track-result"><h2>${esc(result.order_number)}</h2><b class="status ${statusClass(result.status)}">${esc(result.status)}</b>${statusTimeline(result)}<p>${result.tracking_number ? `Courier tracking: <b>${esc(result.tracking_number)}</b>` : "Tracking number will appear after dispatch."}</p></div>` : ""}</section>`, session, cart);
+  return layout(
+    "Track order",
+    `<section class="page-hero compact">
+      <span class="eyebrow">ORDER TRACKING</span>
+      <h1>Track your print order</h1>
+      <p>Enter your order number and phone number to see the current production stage.</p>
+    </section>
+
+    ${notice(url)}
+
+    <section class="section narrow">
+
+      <form class="track-form" method="post" action="/track">
+        <input type="hidden" name="csrf" value="${session.csrf}">
+
+        <label>
+          Order number
+          <input name="order_number" placeholder="PO-2026-123456" required>
+        </label>
+
+        <label>
+          Phone number
+          <input name="phone" required>
+        </label>
+
+        <button class="button primary" type="submit">
+          Track order
+        </button>
+      </form>
+
+      ${
+        result
+          ? `
+        <div class="track-result">
+
+          <h2>${esc(result.order_number)}</h2>
+
+          <b class="status ${statusClass(result.status)}">
+            ${esc(result.status)}
+          </b>
+
+          ${statusTimeline(result)}
+
+          ${["Shipped", "Delivered"].includes(result.status) ? `
+
+${result.courier_name
+  ? `<p><strong>Courier:</strong> ${esc(result.courier_name)}</p>`
+  : ""}
+
+${result.tracking_number
+  ? `<p><strong>Tracking Number:</strong> ${esc(result.tracking_number)}</p>`
+  : ""}
+
+${result.estimated_delivery
+  ? `<p><strong>Estimated Delivery:</strong> ${new Date(result.estimated_delivery).toLocaleDateString("en-IN", {
+      dateStyle: "medium"
+    })}</p>`
+  : ""}
+
+${result.tracking_url
+  ? `<p>
+      <a class="button primary"
+         href="${esc(result.tracking_url)}"
+         target="_blank"
+         rel="noopener">
+         Track Package
+      </a>
+     </p>`
+  : ""}
+
+` : ""}
+
+        </div>
+      `
+          : ""
+      }
+
+    </section>`,
+    session,
+    cart
+  );
 }
 
 function invoicePage(order, items, session, cart) {
@@ -791,33 +1365,28 @@ function orderWithUser(orderId) {
   return db.prepare("SELECT o.*, u.email FROM orders o JOIN users u ON u.id = o.user_id WHERE o.id = ?").get(orderId);
 }
 
-async function queueNotification(orderId, event, recipient, subject, body) {
-  const canSendSmtp = Boolean(nodemailer && SMTP_HOST);
+async function queueNotification(orderId, event, recipient, subject, body, html) {
+  const canSendSmtp = emailService.configured;
   const result = db.prepare("INSERT INTO notifications (order_id,event,recipient,subject,body,status) VALUES (?,?,?,?,?,?)")
     .run(orderId, event, recipient, subject, body, canSendSmtp || EMAIL_WEBHOOK_URL ? "queued" : "logged");
   const notificationId = Number(result.lastInsertRowid);
   fs.writeFileSync(path.join(EMAIL_LOG_DIR, `${Date.now()}-${notificationId}.txt`), `To: ${recipient}\nFrom: ${EMAIL_FROM}\nSubject: ${subject}\n\n${body}`);
   if (canSendSmtp) {
-    try {
-      const transporter = nodemailer.createTransport({
-        host: SMTP_HOST,
-        port: SMTP_PORT,
-        secure: SMTP_PORT === 465,
-        auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined
-      });
-      await transporter.sendMail({ from: EMAIL_FROM, to: recipient, subject, text: body });
+    const delivery = await emailService.send({ to: recipient, subject, text: body, html });
+    if (delivery.delivered) {
       db.prepare("UPDATE notifications SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = ?").run(notificationId);
-    } catch (error) {
-      db.prepare("UPDATE notifications SET status = ? WHERE id = ?").run(`failed:${error.message.slice(0, 80)}`, notificationId);
+    } else {
+      db.prepare("UPDATE notifications SET status = ? WHERE id = ?").run(`failed:${String(delivery.error || "SMTP delivery failed").slice(0, 80)}`, notificationId);
     }
     return;
   }
+  console.info(`Email logged for ${recipient}: SMTP is not configured.`);
   if (!EMAIL_WEBHOOK_URL) return;
   try {
     const response = await fetch(EMAIL_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ from: EMAIL_FROM, to: recipient, subject, text: body, event, orderId })
+      body: JSON.stringify({ from: EMAIL_FROM, to: recipient, subject, text: body, html, event, orderId })
     });
     db.prepare("UPDATE notifications SET status = ?, sent_at = CURRENT_TIMESTAMP WHERE id = ?").run(response.ok ? "sent" : `failed:${response.status}`, notificationId);
   } catch (error) {
@@ -828,39 +1397,61 @@ async function queueNotification(orderId, event, recipient, subject, body) {
 async function notifyOrder(orderId, event, note = "") {
   const order = orderWithUser(orderId);
   if (!order) return;
-  const subject = event === "order_confirmation" ? `PrintOasis order ${order.order_number} confirmed` : `PrintOasis order ${order.order_number}: ${order.status}`;
-  const body = [
-    `Hi ${order.customer_name},`,
-    "",
-    event === "order_confirmation" ? "Thanks for your order. We have received it and the print team will review your artwork before production." : `Your order status is now: ${order.status}.`,
-    note ? `Note: ${note}` : "",
-    order.tracking_number ? `Tracking number: ${order.tracking_number}` : "",
-    "",
-    `Order: ${order.order_number}`,
-    `Total: ${money(order.total)}`,
-    "Stages: Pending > Printing > Packed > Shipped > Delivered",
-    "",
-    "PrintOasis Print Services"
-  ].filter(Boolean).join("\n");
-  await queueNotification(order.id, event, order.email, subject, body);
+  const items = db.prepare("SELECT product_id, product_name, quantity FROM order_items WHERE order_id = ?").all(order.id);
+  const message = orderEmailTemplate({ event, order, items, note, baseUrl: PUBLIC_BASE_URL, money });
+  await queueNotification(order.id, event, order.email, message.subject, message.text, message.html);
 }
 
 function createLocalOrder(session, cart, data, paymentMethod, paymentId = null) {
+  if (!cart.items.length) throw new Error("Your cart is empty.");
   const totals = cartTotals(cart, data.postal_code, data.coupon_code);
+  if (data.coupon_code && totals.couponError) throw new Error(totals.couponError);
   const orderNumber = `PO-${new Date().getFullYear()}-${crypto.randomInt(100000, 999999)}`;
   let orderId = null;
-  db.exec("BEGIN");
+  db.exec("BEGIN IMMEDIATE");
   try {
+    const requestedByProduct = new Map();
+    for (const item of cart.items) requestedByProduct.set(item.product_id, (requestedByProduct.get(item.product_id) || 0) + item.quantity);
+    for (const [productId, quantity] of requestedByProduct.entries()) {
+      const product = db.prepare(`SELECT * FROM products WHERE id = ? AND ${visibleProductCondition()}`).get(productId);
+      if (!product) throw new Error("One of the products in your cart is no longer available.");
+      if (Number(product.stock || 0) < quantity) throw new Error(`Only ${Math.max(0, Number(product.stock || 0))} items available for ${product.name}.`);
+      if (Number(product.reserved || 0) < quantity) throw new Error(`Reservation expired for ${product.name}. Please add it to cart again.`);
+    }
     const result = db.prepare(`INSERT INTO orders (order_number,user_id,total,status,customer_name,phone,address,city,postal_code,shipping_fee,discount,coupon_code,gst_number,payment_method,payment_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(orderNumber, session.user.id, totals.total, "Pending", data.customer_name, data.phone, data.address, data.city, data.postal_code, totals.delivery, totals.discount, totals.coupon?.code || null, data.gst_number || null, paymentMethod, paymentId);
     orderId = Number(result.lastInsertRowid);
-    const insertItem = db.prepare("INSERT INTO order_items (order_id,product_name,quantity,unit_price,configuration) VALUES (?,?,?,?,?)");
-    for (const item of cart.items) insertItem.run(orderId, item.name, item.quantity, item.unit_price, `${item.size} · ${item.material} · ${item.print_option}${item.artwork_original_name ? ` · Artwork: ${item.artwork_original_name}` : ""}`);
+    const insertItem = db.prepare("INSERT INTO order_items (order_id,product_id,product_name,quantity,unit_price,configuration) VALUES (?,?,?,?,?,?)");
+    const deductInventory = db.prepare("UPDATE products SET stock = stock - ?, reserved = reserved - ? WHERE id = ?");
+    for (const item of cart.items) {
+      insertItem.run(orderId, item.product_id, item.name, item.quantity, item.unit_price, `${item.size} · ${item.material} · ${item.print_option}${item.artwork_original_name ? ` · Artwork: ${item.artwork_original_name}` : ""}`);
+      deductInventory.run(item.quantity, item.quantity, item.product_id);
+    }
+    if (totals.coupon) {
+      const usage = db.prepare(`UPDATE coupons SET times_used = times_used + 1 WHERE code = ? AND active = 1 AND (usage_limit IS NULL OR times_used < usage_limit) AND (expiry_date IS NULL OR expiry_date >= ?)`).run(totals.coupon.code, new Date().toISOString().slice(0, 10));
+      if (!usage.changes) throw new Error("This coupon is no longer available.");
+    }
     db.prepare("INSERT INTO order_status_events (order_id,status,note) VALUES (?,?,?)").run(orderId, "Pending", "Order confirmed and queued for artwork review.");
     db.prepare("DELETE FROM cart_items WHERE session_id = ?").run(session.id);
     db.exec("COMMIT");
     notifyOrder(orderId, "order_confirmation").catch(console.error);
     return orderNumber;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+}
+}
+
+function restoreOrderInventory(orderId) {
+  const order = db.prepare("SELECT id, inventory_restocked FROM orders WHERE id = ?").get(orderId);
+  if (!order || order.inventory_restocked) return false;
+  const items = db.prepare("SELECT product_id, quantity FROM order_items WHERE order_id = ? AND product_id IS NOT NULL").all(orderId);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const item of items) db.prepare("UPDATE products SET stock = stock + ? WHERE id = ?").run(item.quantity, item.product_id);
+    db.prepare("UPDATE orders SET inventory_restocked = 1 WHERE id = ?").run(orderId);
+    db.exec("COMMIT");
+    return true;
   } catch (error) {
     db.exec("ROLLBACK");
     throw error;
@@ -904,8 +1495,11 @@ const app = {
   ORDER_STATUSES,
   RAZORPAY_KEY_ID,
   RAZORPAY_KEY_SECRET,
+  addCartItem,
   accountPage,
+  addressesPage,
   adminDashboardPage,
+  adminCouponsPage,
   adminNotificationsPage,
   adminOrdersPage,
   adminProductsPage,
@@ -914,34 +1508,47 @@ const app = {
   cartPage,
   cartTotals,
   checkoutPage,
+  couponFor,
+  couponValidation,
   createLocalOrder,
   createRazorpayOrder,
   crypto,
   db,
+  defaultAddress,
   hashPassword,
+  hasDeliveredPurchase,
   homePage,
   infoPage,
   invoicePage,
   isAdmin,
   layout,
   notifyOrder,
+  orderDetailsPage,
+  orderWithUser,
   ordersPage,
+  passwordPage,
   parseCookies,
+  productAvailable,
   productPage,
   productsPage,
   redirect,
+  releaseReservedQuantity,
+  releaseSessionReservations,
   requestOrigin,
   requireAdmin,
   requireAuth,
+  restoreOrderInventory,
   saveArtwork,
   saveProductImage,
   send,
   sendJson,
+  sellableQuantity,
   serveProductImage,
   servePublic,
   slugify,
   trackPage,
   validCsrf,
+  visibleProductCondition,
   verifyPassword,
   wishlistPage
 };
@@ -959,253 +1566,11 @@ const server = http.createServer(async (req, res) => {
     }
     return send(res, 404, layout("Page not found", `<div class="empty section"><h1>That page missed the press.</h1><p>Let’s get you back to the print shop.</p><a class="button primary" href="/">Go home</a></div>`, routedSession, routedCart));
 
-    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-    if (url.pathname.startsWith("/public/")) {
-      const file = path.join(ROOT, url.pathname);
-      if (!file.startsWith(path.join(ROOT, "public")) || !fs.existsSync(file)) return send(res, 404, "Not found", "text/plain");
-      const ext = path.extname(file);
-      const types = { ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".png": "image/png", ".svg": "image/svg+xml" };
-      return send(res, 200, fs.readFileSync(file), types[ext] || "application/octet-stream");
-    }
-    if (url.pathname.startsWith("/uploads/product-images/")) {
-      const name = path.basename(decodeURIComponent(url.pathname.split("/").pop() || ""));
-      const file = path.join(PRODUCT_IMAGE_DIR, name);
-      if (!file.startsWith(PRODUCT_IMAGE_DIR) || !fs.existsSync(file)) return send(res, 404, "Not found", "text/plain");
-      const ext = path.extname(file).toLowerCase();
-      const types = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" };
-      return send(res, 200, fs.readFileSync(file), types[ext] || "application/octet-stream");
-    }
-    const session = getSession(req, res);
-    const cart = cartData(session.id);
-
-    if (req.method === "GET" && url.pathname === "/healthz") return send(res, 200, "ok", "text/plain; charset=utf-8");
-    if (req.method === "GET" && url.pathname === "/api/search-suggestions") {
-      const q = (url.searchParams.get("q") || "").trim();
-      const suggestions = q
-        ? db.prepare("SELECT name FROM products WHERE active = 1 AND (name LIKE ? OR description LIKE ?) ORDER BY rating DESC LIMIT 8").all(`%${q}%`, `%${q}%`).map(row => row.name)
-        : ["Business Cards", "Flyers", "Stickers", "Posters", "T-shirts", "Photo Mugs"];
-      return sendJson(res, 200, { suggestions });
-    }
-    if (req.method === "GET" && url.pathname === "/") return send(res, 200, homePage(session, cart));
-    if (req.method === "GET" && url.pathname === "/products") return send(res, 200, productsPage(url, session, cart));
-    if (req.method === "GET" && url.pathname.startsWith("/product/")) {
-      const product = db.prepare("SELECT * FROM products WHERE slug = ? AND active = 1").get(url.pathname.split("/").pop());
-      return product ? send(res, 200, productPage(product, session, cart)) : send(res, 404, layout("Not found", `<div class="empty section"><h1>Product not found</h1><a href="/products">Browse products</a></div>`, session, cart));
-    }
-    if (req.method === "GET" && url.pathname === "/login") return session.user ? redirect(res, "/account") : send(res, 200, authPage("login", url, session, cart, requestOrigin(req)));
-    if (req.method === "GET" && url.pathname === "/register") return session.user ? redirect(res, "/account") : send(res, 200, authPage("register", url, session, cart, requestOrigin(req)));
-    if (req.method === "GET" && url.pathname === "/cart") return send(res, 200, cartPage(url, session, cart));
-    if (req.method === "GET" && url.pathname === "/track") return send(res, 200, trackPage(url, session, cart));
-    if (req.method === "GET" && url.pathname === "/wishlist") {
-      if (!requireAuth(session, res, "/wishlist")) return;
-      return send(res, 200, wishlistPage(session, cart));
-    }
-    if (req.method === "GET" && url.pathname.startsWith("/invoice/")) {
-      if (!requireAuth(session, res, url.pathname)) return;
-      const orderNumber = decodeURIComponent(url.pathname.split("/").pop() || "");
-      const order = isAdmin(session)
-        ? db.prepare("SELECT * FROM orders WHERE order_number = ?").get(orderNumber)
-        : db.prepare("SELECT * FROM orders WHERE order_number = ? AND user_id = ?").get(orderNumber, session.user.id);
-      if (!order) return send(res, 404, layout("Invoice not found", `<div class="empty section"><h1>Invoice not found</h1><a href="/account/orders">Back to orders</a></div>`, session, cart));
-      const items = db.prepare("SELECT * FROM order_items WHERE order_id = ?").all(order.id);
-      return send(res, 200, invoicePage(order, items, session, cart));
-    }
-    if (req.method === "GET" && url.pathname === "/checkout") {
-      if (!cart.items.length) return redirect(res, "/cart?notice=Your+cart+is+empty.");
-      if (!requireAuth(session, res, "/checkout")) return;
-      return send(res, 200, checkoutPage(session, cart));
-    }
-    if (req.method === "GET" && (url.pathname === "/account" || url.pathname === "/account/orders")) {
-      if (!requireAuth(session, res, url.pathname)) return;
-      return send(res, 200, url.pathname.endsWith("orders") ? ordersPage(session, cart) : accountPage(url, session, cart));
-    }
-    if (req.method === "GET" && url.pathname === "/admin/login") return session.user && isAdmin(session) ? redirect(res, "/admin") : send(res, 200, authPage("login", new URL("/login?next=/admin", requestOrigin(req)), session, cart, requestOrigin(req)));
-    if (req.method === "GET" && url.pathname === "/admin") {
-      if (!requireAdmin(session, res)) return;
-      return send(res, 200, adminDashboardPage(session, cart));
-    }
-    if (req.method === "GET" && url.pathname === "/admin/products") {
-      if (!requireAdmin(session, res)) return;
-      return send(res, 200, adminProductsPage(url, session, cart));
-    }
-    if (req.method === "GET" && url.pathname === "/admin/orders") {
-      if (!requireAdmin(session, res)) return;
-      return send(res, 200, adminOrdersPage(session, cart));
-    }
-    if (req.method === "GET" && url.pathname === "/admin/notifications") {
-      if (!requireAdmin(session, res)) return;
-      return send(res, 200, adminNotificationsPage(session, cart));
-    }
-    if (req.method === "GET" && ["/help", "/contact", "/business"].includes(url.pathname)) return send(res, 200, infoPage(url.pathname.slice(1), session, cart));
-
-    if (req.method === "POST") {
-      const data = await requestData(req);
-      if (url.pathname === "/auth/google") {
-        const cookies = parseCookies(req);
-        if (!data.g_csrf_token || !cookies.g_csrf_token || data.g_csrf_token !== cookies.g_csrf_token || !GOOGLE_CLIENT_ID) {
-          return redirect(res, `/login?notice=${encodeURIComponent("Google sign-in could not be verified.")}`);
-        }
-        const verification = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(data.credential || "")}`);
-        const profile = await verification.json();
-        if (!verification.ok || profile.aud !== GOOGLE_CLIENT_ID || profile.email_verified !== "true") {
-          return redirect(res, `/login?notice=${encodeURIComponent("Google account verification failed.")}`);
-        }
-        let user = db.prepare("SELECT * FROM users WHERE google_sub = ? OR email = ?").get(profile.sub, profile.email.toLowerCase());
-        if (user) {
-          db.prepare("UPDATE users SET google_sub = COALESCE(google_sub, ?) WHERE id = ?").run(profile.sub, user.id);
-        } else {
-          const result = db.prepare("INSERT INTO users (name,email,password_hash,google_sub) VALUES (?,?,?,?)")
-            .run(profile.name || profile.email.split("@")[0], profile.email.toLowerCase(), hashPassword(crypto.randomBytes(32).toString("hex")), profile.sub);
-          user = { id: Number(result.lastInsertRowid) };
-        }
-        db.prepare("UPDATE sessions SET user_id = ? WHERE id = ?").run(user.id, session.id);
-        return redirect(res, "/account?notice=Signed+in+with+Google.");
-      }
-      if (!validCsrf(data, session)) return send(res, 403, "Invalid form token", "text/plain");
-      if (url.pathname === "/register") {
-        const name = (data.name || "").trim(), email = (data.email || "").trim().toLowerCase(), password = data.password || "";
-        if (name.length < 2 || !email.includes("@") || password.length < 8) return redirect(res, `/register?notice=${encodeURIComponent("Please enter valid details. Password must be at least 8 characters.")}`);
-        try {
-          const result = db.prepare("INSERT INTO users (name,email,password_hash) VALUES (?,?,?)").run(name, email, hashPassword(password));
-          db.prepare("UPDATE sessions SET user_id = ? WHERE id = ?").run(Number(result.lastInsertRowid), session.id);
-          return redirect(res, data.next || "/account");
-        } catch (error) {
-          if (String(error).includes("UNIQUE")) return redirect(res, `/login?notice=${encodeURIComponent("An account with that email already exists.")}`);
-          throw error;
-        }
-      }
-      if (url.pathname === "/login") {
-        const user = db.prepare("SELECT * FROM users WHERE email = ?").get((data.email || "").trim().toLowerCase());
-        if (!user || !verifyPassword(data.password || "", user.password_hash)) return redirect(res, `/login?notice=${encodeURIComponent("Email or password is incorrect.")}&next=${encodeURIComponent(data.next || "/account")}`);
-        db.prepare("UPDATE sessions SET user_id = ? WHERE id = ?").run(user.id, session.id);
-        return redirect(res, data.next || "/account");
-      }
-      if (url.pathname === "/logout") {
-        db.prepare("UPDATE sessions SET user_id = NULL WHERE id = ?").run(session.id);
-        return redirect(res, "/");
-      }
-      if (url.pathname === "/track") {
-        const order = db.prepare("SELECT * FROM orders WHERE order_number = ? AND phone = ?").get((data.order_number || "").trim().toUpperCase(), (data.phone || "").trim());
-        return send(res, 200, order ? trackPage(url, session, cart, order) : trackPage(new URL("/track?notice=Order+not+found.", requestOrigin(req)), session, cart));
-      }
-      if (url.pathname === "/wishlist/toggle") {
-        if (!requireAuth(session, res, "/wishlist")) return;
-        const product = db.prepare("SELECT * FROM products WHERE id = ? AND active = 1").get(Number(data.product_id));
-        if (!product) return redirect(res, "/products?notice=Product+not+found.");
-        const existing = db.prepare("SELECT id FROM wishlist_items WHERE user_id = ? AND product_id = ?").get(session.user.id, product.id);
-        if (existing) db.prepare("DELETE FROM wishlist_items WHERE id = ?").run(existing.id);
-        else db.prepare("INSERT OR IGNORE INTO wishlist_items (user_id, product_id) VALUES (?, ?)").run(session.user.id, product.id);
-        return redirect(res, `/product/${product.slug}?notice=${existing ? "Removed+from+wishlist." : "Added+to+wishlist."}`);
-      }
-      if (url.pathname === "/reviews/add") {
-        if (!requireAuth(session, res, "/login")) return;
-        const product = db.prepare("SELECT * FROM products WHERE id = ? AND active = 1").get(Number(data.product_id));
-        if (!product) return redirect(res, "/products?notice=Product+not+found.");
-        const rating = Math.max(1, Math.min(5, Number(data.rating) || 5));
-        const comment = String(data.comment || "").trim().slice(0, 600);
-        if (comment.length >= 8) db.prepare("INSERT INTO reviews (product_id,user_id,name,rating,comment) VALUES (?,?,?,?,?)").run(product.id, session.user.id, session.user.name, rating, comment);
-        return redirect(res, `/product/${product.slug}?notice=Review+submitted.`);
-      }
-      if (url.pathname === "/admin/products/save") {
-        if (!requireAdmin(session, res)) return;
-        const image = saveProductImage(data.files?.product_image);
-        const id = Number(data.id || 0);
-        const name = String(data.name || "").trim();
-        const slug = slugify(data.slug || name);
-        if (!name || !slug) return redirect(res, "/admin/products?notice=Product+name+is+required.");
-        const values = {
-          slug,
-          name,
-          category: data.category,
-          price: Math.max(1, Number(data.price) || 1),
-          min_qty: Math.max(1, Number(data.min_qty) || 1),
-          rating: Math.max(1, Math.min(5, Number(data.rating) || 4.8)),
-          badge: String(data.badge || "").trim(),
-          description: String(data.description || "").trim(),
-          sizes: String(data.sizes || "").trim(),
-          materials: String(data.materials || "").trim(),
-          print_options: String(data.print_options || "").trim(),
-          color: String(data.color || "cobalt").trim(),
-          active: data.active === "1" ? 1 : 0
-        };
-        if (id) {
-          const current = db.prepare("SELECT * FROM products WHERE id = ?").get(id);
-          if (!current) return redirect(res, "/admin/products?notice=Product+not+found.");
-          db.prepare(`UPDATE products SET slug=?,name=?,category=?,price=?,min_qty=?,rating=?,badge=?,description=?,sizes=?,materials=?,print_options=?,color=?,active=?,image_original_name=?,image_stored_name=?,image_mime=?,image_size=? WHERE id=?`)
-            .run(values.slug, values.name, values.category, values.price, values.min_qty, values.rating, values.badge, values.description, values.sizes, values.materials, values.print_options, values.color, values.active, image?.original || current.image_original_name, image?.stored || current.image_stored_name, image?.mime || current.image_mime, image?.size || current.image_size, id);
-        } else {
-          db.prepare(`INSERT INTO products (slug,name,category,price,min_qty,rating,badge,description,sizes,materials,print_options,color,active,image_original_name,image_stored_name,image_mime,image_size) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-            .run(values.slug, values.name, values.category, values.price, values.min_qty, values.rating, values.badge, values.description, values.sizes, values.materials, values.print_options, values.color, values.active, image?.original || null, image?.stored || null, image?.mime || null, image?.size || null);
-        }
-        return redirect(res, "/admin/products?notice=Product+saved.");
-      }
-      if (url.pathname === "/admin/products/delete") {
-        if (!requireAdmin(session, res)) return;
-        db.prepare("UPDATE products SET active = 0 WHERE id = ?").run(Number(data.id));
-        return redirect(res, "/admin/products?notice=Product+hidden+from+storefront.");
-      }
-      if (url.pathname === "/admin/orders/status") {
-        if (!requireAdmin(session, res)) return;
-        const status = ORDER_STATUSES.includes(data.status) ? data.status : "Pending";
-        const orderId = Number(data.order_id);
-        const note = String(data.note || "").trim().slice(0, 400);
-        const tracking = String(data.tracking_number || "").trim().slice(0, 80);
-        db.prepare("UPDATE orders SET status = ?, tracking_number = ?, status_updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(status, tracking || null, orderId);
-        db.prepare("INSERT INTO order_status_events (order_id,status,note) VALUES (?,?,?)").run(orderId, status, note);
-        await notifyOrder(orderId, "status_update", note);
-        return redirect(res, "/admin/orders?notice=Order+status+updated.");
-      }
-      if (url.pathname === "/cart/add") {
-        const product = db.prepare("SELECT * FROM products WHERE id = ? AND active = 1").get(Number(data.product_id));
-        if (!product) return send(res, 404, "Product not found", "text/plain");
-        const artwork = saveArtwork(data.files?.artwork_file);
-        const quantity = Math.max(product.min_qty, Number(data.quantity) || product.min_qty);
-        db.prepare(`INSERT INTO cart_items (session_id,product_id,quantity,size,material,print_option,artwork_note,artwork_original_name,artwork_stored_name,artwork_mime,artwork_size,unit_price) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
-          .run(session.id, product.id, quantity, data.size, data.material, data.print_option, (data.artwork_note || "").slice(0, 500), artwork?.original || null, artwork?.stored || null, artwork?.mime || null, artwork?.size || null, product.price / product.min_qty);
-        return redirect(res, "/cart?notice=Product+added+to+your+cart.");
-      }
-      if (url.pathname === "/cart/update") {
-        const quantity = Number(data.quantity);
-        if (quantity <= 0) db.prepare("DELETE FROM cart_items WHERE id = ? AND session_id = ?").run(Number(data.item_id), session.id);
-        else db.prepare("UPDATE cart_items SET quantity = ? WHERE id = ? AND session_id = ?").run(quantity, Number(data.item_id), session.id);
-        return redirect(res, "/cart");
-      }
-      if (url.pathname === "/payment/create") {
-        if (!requireAuth(session, res, "/checkout")) return;
-        if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) return sendJson(res, 503, { error: "Online payment is not configured." });
-        const freshCart = cartData(session.id);
-        if (!freshCart.items.length) return sendJson(res, 400, { error: "Your cart is empty." });
-        const totals = cartTotals(freshCart, data.postal_code, data.coupon_code);
-        const razorpayOrder = await createRazorpayOrder(totals.total, `po_${Date.now()}`);
-        return sendJson(res, 200, { orderId: razorpayOrder.id, amount: razorpayOrder.amount, currency: razorpayOrder.currency, keyId: RAZORPAY_KEY_ID });
-      }
-      if (url.pathname === "/payment/verify") {
-        if (!requireAuth(session, res, "/checkout")) return;
-        const signature = crypto.createHmac("sha256", RAZORPAY_KEY_SECRET)
-          .update(`${data.razorpay_order_id}|${data.razorpay_payment_id}`)
-          .digest("hex");
-        const receivedSignature = data.razorpay_signature || "";
-        if (receivedSignature.length !== signature.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(receivedSignature))) {
-          return redirect(res, `/checkout?notice=${encodeURIComponent("Payment verification failed. No order was created.")}`);
-        }
-        const freshCart = cartData(session.id);
-        const orderNumber = createLocalOrder(session, freshCart, data, "razorpay", data.razorpay_payment_id);
-        return redirect(res, `/account?notice=${encodeURIComponent(`Payment received. Order ${orderNumber} placed successfully.`)}`);
-      }
-      if (url.pathname === "/checkout") {
-        if (!requireAuth(session, res, "/checkout")) return;
-        const freshCart = cartData(session.id);
-        if (!freshCart.items.length) return redirect(res, "/cart");
-        if (data.payment_method !== "cod") return redirect(res, `/checkout?notice=${encodeURIComponent("Please complete the secure online payment window.")}`);
-        const orderNumber = createLocalOrder(session, freshCart, data, "cod");
-        return redirect(res, `/account?notice=${encodeURIComponent(`Order ${orderNumber} placed successfully.`)}`);
-      }
-    }
-    send(res, 404, layout("Page not found", `<div class="empty section"><h1>That page missed the press.</h1><p>Let’s get you back to the print shop.</p><a class="button primary" href="/">Go home</a></div>`, session, cart));
   } catch (error) {
     console.error(error);
     send(res, 500, process.env.NODE_ENV === "test" ? error.stack : "Something went wrong. Please try again.", "text/plain");
   }
 });
 
-server.listen(PORT, () => console.log(`PrintOasis running at http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`PrintOasis running at http://localhost:${PORT}`)
+);

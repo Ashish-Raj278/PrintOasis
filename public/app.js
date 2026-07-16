@@ -33,7 +33,7 @@ if (quantity && price) {
   const unit = Number(price.dataset.unitPrice);
   const minimum = Number(quantity.min || 1);
   const formatter = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
-  const update = () => { price.textContent = formatter.format((Number(quantity.value) || minimum) * unit / minimum); };
+  const update = () => { price.textContent = formatter.format((Number(quantity.value) || minimum) * unit); };
   quantity.addEventListener("input", update);
   update();
 }
@@ -72,6 +72,11 @@ checkoutForm?.addEventListener("submit", async event => {
 
   const button = checkoutForm.querySelector('button[type="submit"]');
   const formData = new FormData(checkoutForm);
+  const releasePaymentReservation = () => fetch("/payment/failed", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(formData)
+  }).catch(() => {});
   button.disabled = true;
   button.textContent = "Opening secure payment…";
 
@@ -120,7 +125,8 @@ checkoutForm?.addEventListener("submit", async event => {
       }
     });
     razorpay.on("payment.failed", response => {
-      alert(response.error.description || "Payment failed. Please try again.");
+      releasePaymentReservation();
+      alert(response.error.description || "Payment failed. Your reserved cart items were released.");
       button.disabled = false;
       button.textContent = button.dataset.originalText;
     });

@@ -6,10 +6,11 @@
   "scripts": {
     "start": "node server.js",
     "share": "powershell -ExecutionPolicy Bypass -File ./share-preview.ps1",
-    "check": "node --check server.js && node --check public/app.js && node --check routes/auth.js && node --check routes/products.js && node --check routes/cart.js && node --check routes/checkout.js && node --check routes/admin.js && node --check routes/account.js && node --check routes/static.js"
+    "check": "node --check server.js && node --check services/email.js && node --check public/app.js && node --check routes/auth.js && node --check routes/products.js && node --check routes/cart.js && node --check routes/checkout.js && node --check routes/admin.js && node --check routes/account.js && node --check routes/static.js"
   },
   "dependencies": {
-    "nodemailer": "^9.0.3"
+    "nodemailer": "^9.0.3",
+    "pdfkit": "^0.19.1"
   },
   "engines": {
     "node": ">=22.5.0"

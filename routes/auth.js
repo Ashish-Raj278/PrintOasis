@@ -75,6 +75,7 @@ module.exports = async function authRoutes(ctx) {
     return true;
   }
   if (url.pathname === "/logout") {
+    app.releaseSessionReservations(session.id);
     app.db.prepare("UPDATE sessions SET user_id = NULL WHERE id = ?").run(session.id);
     app.redirect(res, "/");
     return true;

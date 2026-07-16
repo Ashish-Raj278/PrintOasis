@@ -32,11 +32,17 @@ try {
     next = "/account"
   } | Out-Null
 
-  $product = Invoke-WebRequest -UseBasicParsing -WebSession $web "$baseUrl/product/classic-business-cards"
+  $productsPage = Invoke-WebRequest -UseBasicParsing -WebSession $web "$baseUrl/products"
+  $slug = [regex]::Match($productsPage.Content, 'href="/product/([^"]+)"').Groups[1].Value
+  if (-not $slug) { throw "No visible product found" }
+  $product = Invoke-WebRequest -UseBasicParsing -WebSession $web "$baseUrl/product/$slug"
   $csrf = Get-Csrf $product.Content
+  $productId = [regex]::Match($product.Content, 'name="product_id" value="(\d+)"').Groups[1].Value
+  $productName = [regex]::Match($product.Content, '<h1>([^<]+)</h1>').Groups[1].Value
+  if (-not $productId -or -not $productName) { throw "Product form details not found" }
   Invoke-WebRequest -UseBasicParsing -WebSession $web -Method Post -Uri "$baseUrl/cart/add" -Body @{
     csrf = $csrf
-    product_id = "1"
+    product_id = $productId
     quantity = "100"
     size = "3.5 x 2 in"
     material = "Matte"
@@ -45,7 +51,7 @@ try {
   } | Out-Null
 
   $cart = Invoke-WebRequest -UseBasicParsing -WebSession $web "$baseUrl/cart"
-  if ($cart.Content -notmatch "Classic Business Cards") { throw "Cart persistence failed" }
+  if ($cart.Content -notmatch [regex]::Escape($productName)) { throw "Cart persistence failed" }
 
   $checkout = Invoke-WebRequest -UseBasicParsing -WebSession $web "$baseUrl/checkout"
   $csrf = Get-Csrf $checkout.Content
@@ -108,7 +114,8 @@ try {
     materials = "Matte"
     print_options = "Full color"
     color = "cobalt"
-    active = "1"
+    stock = "10"
+    status = "active"
   } | Out-Null
   $adminProducts = Invoke-WebRequest -UseBasicParsing -WebSession $admin "$baseUrl/admin/products"
   if ($adminProducts.Content -notmatch $smokeProductName) { throw "Admin product create failed" }
