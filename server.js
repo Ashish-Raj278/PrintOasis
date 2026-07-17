@@ -30,6 +30,7 @@ const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_USER = process.env.SMTP_USER || "";
 const SMTP_PASS = process.env.SMTP_PASS || "";
 const SMTP_SECURE = process.env.SMTP_SECURE === "true" || SMTP_PORT === 465;
+const EMAIL_DELIVERY_ENABLED = process.env.EMAIL_DELIVERY_ENABLED !== "false" && process.env.NODE_ENV !== "test";
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || (process.env.NODE_ENV === "production" ? "" : "admin@printoasis.example")).trim().toLowerCase();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || (process.env.NODE_ENV === "production" ? "" : "PrintOasisAdmin123!");
 const ROOT = __dirname;
@@ -41,7 +42,7 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(PRODUCT_IMAGE_DIR, { recursive: true });
 fs.mkdirSync(EMAIL_LOG_DIR, { recursive: true });
-const emailService = createEmailService({ host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE, user: SMTP_USER, pass: SMTP_PASS, from: EMAIL_FROM });
+const emailService = createEmailService({ enabled: EMAIL_DELIVERY_ENABLED, host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE, user: SMTP_USER, pass: SMTP_PASS, from: EMAIL_FROM });
 const db = new DatabaseSync(path.join(DATA_DIR, "store.db"));
 db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
 const ORDER_STATUSES = ["Pending", "Printing", "Packed", "Shipped", "Delivered", "Cancelled"];
@@ -641,29 +642,57 @@ function saveProductImage(file) {
 
 function notice(url) {
   const value = url.searchParams.get("notice");
-  return value ? `<div class="notice">${esc(value)}</div>` : "";
+  if (!value) return "";
+  const type = /could not|failed|invalid|incorrect|unavailable|not found|must|no items|empty|only \d+ items/i.test(value) ? "error" : "success";
+  return `<div class="notice ${type}" role="status" aria-live="polite"><span>${esc(value)}</span><button type="button" class="notice-dismiss" aria-label="Dismiss message">&times;</button></div>`;
+}
+
+function emptyState(kind, title, description, primaryHref, primaryLabel, secondaryHref = "", secondaryLabel = "") {
+  return `<div class="empty empty-state empty-${kind}"><span class="empty-icon" aria-hidden="true"></span><h2>${esc(title)}</h2><p>${esc(description)}</p><div class="empty-actions"><a class="button primary" href="${primaryHref}">${esc(primaryLabel)}</a>${secondaryHref ? `<a class="button ghost" href="${secondaryHref}">${esc(secondaryLabel)}</a>` : ""}</div></div>`;
 }
 
 function nav(session, cart) {
+  const navigationProducts = db.prepare(`SELECT name, slug, category, badge FROM products WHERE ${visibleProductCondition()} ORDER BY name`).all();
+  const productsByCategory = new Map();
+  for (const product of navigationProducts) {
+    const products = productsByCategory.get(product.category) || [];
+    products.push(product);
+    productsByCategory.set(product.category, products);
+  }
+  const navigationGroups = categories.map(category => ({
+    slug: category[0],
+    name: category[1],
+    description: category[2],
+    products: productsByCategory.get(category[0]) || []
+  }));
+  const megaMenu = (group, allProducts = false) => {
+    const menuId = allProducts ? "all-products-menu" : `category-menu-${group.slug}`;
+    const featured = group.products.find(product => /best|popular|premium|new/i.test(product.badge || "")) || group.products[0];
+    const content = allProducts
+      ? `<div class="mega-menu-grid">${navigationGroups.map(item => `<section><h2><a href="/products?category=${encodeURIComponent(item.slug)}">${esc(item.name)}</a></h2>${item.products.length ? item.products.map(product => `<a href="/product/${encodeURIComponent(product.slug)}">${esc(product.name)}${product.badge ? `<small>${esc(product.badge)}</small>` : ""}</a>`).join("") : `<p class="mega-empty">New products coming soon.</p>`}</section>`).join("")}</div>`
+      : `<div class="mega-category-content"><section class="mega-product-list"><p>${esc(group.description)}</p>${group.products.length ? group.products.map(product => `<a href="/product/${encodeURIComponent(product.slug)}">${esc(product.name)}${product.badge ? `<small>${esc(product.badge)}</small>` : ""}</a>`).join("") : `<p class="mega-empty">New products coming soon.</p>`}</section>${featured ? `<a class="mega-featured-product" href="/product/${encodeURIComponent(featured.slug)}"><span>FEATURED PRODUCT</span><b>${esc(featured.name)}</b><small>${featured.badge ? esc(featured.badge) : "Recommended"}</small><i>Explore &rarr;</i></a>` : ""}</div>`;
+    return `<div class="mega-nav-wrap"><button class="mega-nav-trigger" type="button" data-category="${esc(group.slug)}" aria-expanded="false" aria-haspopup="true" aria-controls="${menuId}">${allProducts ? "All products" : esc(group.name)} <span aria-hidden="true">+</span></button><div class="mega-products-menu" id="${menuId}" role="region" aria-label="${allProducts ? "All products" : esc(group.name)} menu" aria-hidden="true"><div class="mega-menu-heading"><span>${allProducts ? "EXPLORE THE CATALOG" : esc(group.name.toUpperCase())}</span><a href="${allProducts ? "/products" : `/products?category=${encodeURIComponent(group.slug)}`}">${allProducts ? "View all products" : `View all ${esc(group.name)}`} &rarr;</a></div>${content}</div></div>`;
+  };
   return `
     <div class="promise">Free delivery over ₹999 · Select products ready in 4 hours</div>
-    <header class="site-header">
+    <a class="skip-link" href="#main-content">Skip to main content</a>
+    <header class="site-header" aria-label="Site header">
       <a class="brand" href="/" aria-label="PrintOasis home"><span>PRINT</span>OASIS<i>.</i></a>
-      <form class="search" action="/products"><input name="q" placeholder="Search cards, stickers, signs…" aria-label="Search products"><button>Search</button></form>
-      <nav class="header-actions">
+      <form class="search" action="/products" data-search-form role="search"><input name="q" placeholder="Search business cards, flyers, labels..." aria-label="Search products" autocomplete="off" aria-expanded="false" aria-controls="search-suggestions"><button type="submit">Search</button><div class="search-suggestions" id="search-suggestions" role="region" aria-label="Search suggestions" hidden><div class="search-suggestions-section" data-search-recent hidden><span>Recent searches</span><div></div></div><div class="search-suggestions-section"><span>Popular searches</span><div>${["Business Cards", "Flyers", "Stickers", "Photo Mugs"].map(term => `<a href="/products?q=${encodeURIComponent(term)}">${esc(term)}</a>`).join("")}</div></div><div class="search-suggestions-section"><span>Browse a category</span><div>${categories.slice(0, 4).map(category => `<a href="/products?category=${encodeURIComponent(category[0])}">${esc(category[1])}</a>`).join("")}</div></div><div class="search-suggestions-section search-live-results" data-search-results hidden><span>Product suggestions</span><div></div></div></div></form>
+      <nav class="header-actions" aria-label="Account and support">
         ${isAdmin(session) ? `<a href="/admin">Admin</a>` : ""}
         <a href="/help">Help</a>
         <a href="/track">Track</a>
         ${session.user ? `<a href="/wishlist">Wishlist</a>` : ""}
         ${session.user ? `<a href="/account">Hi, ${esc(session.user.name.split(" ")[0])}</a>` : `<a href="/login">Login</a>`}
         <a class="cart-link" href="/cart">Cart <b>${cart.count}</b></a>
-        <button class="theme-toggle" type="button" aria-label="Toggle dark mode">Dark</button>
+        <button class="theme-toggle" type="button" aria-label="Toggle dark mode" aria-pressed="false">Dark</button>
       </nav>
-      <button class="menu-toggle" type="button" aria-label="Toggle menu">Menu</button>
+      <button class="menu-toggle" type="button" aria-label="Toggle product categories" aria-controls="category-navigation" aria-expanded="false">Menu</button>
     </header>
-    <nav class="category-nav">
-      <a href="/products">All products</a>
-      ${categories.slice(0, 7).map(c => `<a href="/products?category=${c[0]}">${c[1]}</a>`).join("")}
+    <nav class="category-nav" id="category-navigation" aria-label="Product categories">
+      ${megaMenu({ name: "All products", slug: "all-products", products: [] }, true)}
+      ${navigationGroups.map(group => megaMenu(group)).join("")}
     </nav>`;
 }
 
@@ -679,7 +708,7 @@ function layout(title, content, session, cart, description = "Custom printing fo
     <link rel="stylesheet" href="/public/styles.css">
   </head><body>
     ${nav(session, cart)}
-    <main>${content}</main>
+    <main id="main-content" tabindex="-1">${content}</main>
     <footer>
       <div><a class="brand light" href="/"><span>PRINT</span>OASIS<i>.</i></a><p>Ideas, made tangible.</p></div>
       <div><h4>Shop</h4><a href="/products">All products</a><a href="/products?category=same-day">Same-day prints</a><a href="/products?category=business-cards">Business cards</a></div>
@@ -693,48 +722,82 @@ function layout(title, content, session, cart, description = "Custom printing fo
 
 function productArt(product, large = false) {
   if (product.image_stored_name) {
-    return `<div class="product-photo ${large ? "large" : ""}"><img src="/uploads/product-images/${encodeURIComponent(product.image_stored_name)}" alt="${esc(product.name)} mockup"></div>`;
+    return `<div class="product-photo ${large ? "large" : ""}"><img src="/uploads/product-images/${encodeURIComponent(product.image_stored_name)}" alt="${esc(product.name)} mockup" ${large ? "fetchpriority=high" : 'loading="lazy" decoding="async"'}></div>`;
   }
-  return `<div class="product-art ${esc(product.color)} ${large ? "large" : ""}">
+  return `<div class="product-art ${esc(product.color)} ${large ? "large" : ""}" role="img" aria-label="${esc(product.name)} product illustration">
     <span class="art-sheet"></span><span class="art-mark">${esc(product.name.split(" ").map(w => w[0]).join("").slice(0, 2))}</span>
     <small>${esc(product.category.replace("-", " "))}</small>
   </div>`;
 }
 
-function productCard(product) {
+function highlightSearch(value, query = "") {
+  const text = esc(value);
+  const term = String(query).trim();
+  if (!term) return text;
+  const expression = new RegExp(`(${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "ig");
+  return text.replace(expression, "<mark>$1</mark>");
+}
+
+function productCard(product, searchQuery = "") {
   const available = sellableQuantity(product);
   return `<article class="product-card">
     <a href="/product/${product.slug}">${productArt(product)}</a>
     <div class="product-meta"><span class="badge">${esc(product.badge)}</span><span>★ ${product.rating}</span></div>
-    <h3><a href="/product/${product.slug}">${esc(product.name)}</a></h3>
+    <h3><a href="/product/${product.slug}">${highlightSearch(product.name, searchQuery)}</a></h3>
     <p>From <strong>${money(product.price)}</strong> / ${product.min_qty === 1 ? "piece" : `${product.min_qty} pcs`}${available <= 0 ? ` <span class="stock-note">Out of Stock</span>` : ""}</p>
+    ${searchQuery ? `<small class="product-search-snippet">${highlightSearch(product.description, searchQuery)}</small>` : ""}
   </article>`;
 }
 
 function homePage(session, cart) {
   const featured = db.prepare(`SELECT * FROM products WHERE ${visibleProductCondition()} ORDER BY featured DESC, rating DESC LIMIT 8`).all();
+  const categoryCounts = new Map(db.prepare(`SELECT category, COUNT(*) AS count FROM products WHERE ${visibleProductCondition()} GROUP BY category`).all().map(row => [row.category, row.count]));
+  const testimonials = db.prepare(`
+    SELECT r.name, r.rating, r.comment, r.verified_purchase, p.name AS product_name
+    FROM reviews r
+    JOIN products p ON p.id = r.product_id
+    WHERE r.approved = 1 AND ${visibleProductCondition("p")}
+    ORDER BY r.id DESC
+    LIMIT 6
+  `).all();
+  const homeStats = {
+    orders: Number(db.prepare("SELECT COUNT(*) AS count FROM orders WHERE status != 'Cancelled'").get().count),
+    customers: Number(db.prepare("SELECT COUNT(*) AS count FROM users").get().count),
+    products: Number(db.prepare(`SELECT COUNT(*) AS count FROM products WHERE ${visibleProductCondition()}`).get().count),
+    categories: categories.length
+  };
+  const heroSlides = [
+    ["PREMIUM BUSINESS CARDS", "Leave a lasting first impression.", "Exceptionally finished cards with the weight, texture and precision your brand deserves.", "/products?category=business-cards", "Explore business cards", "hero-business"],
+    ["CUSTOM APPAREL", "Wear the work you are proud of.", "Turn team uniforms, event merchandise and everyday ideas into memorable custom apparel.", "/products?category=apparel", "Create custom apparel", "hero-apparel"],
+    ["MARKETING MATERIALS", "Make every campaign impossible to miss.", "Posters, flyers, displays and more, produced with rich colour and a crisp finish.", "/products?category=marketing", "Shop marketing prints", "hero-marketing"],
+    ["BULK PRINTING", "A print partner built to scale.", "Consistent quality, business controls and reliable fulfilment for every location and every order.", "/business", "Explore business printing", "hero-business-solutions"]
+  ];
   return layout("Online printing made brilliantly simple", `
-    <section class="hero">
-      <div class="hero-copy">
-        <span class="eyebrow">PRINT THAT MEANS BUSINESS</span>
-        <h1>Your big ideas deserve a <em>great finish.</em></h1>
-        <p>From one custom tee to a complete brand rollout. Premium printing, transparent pricing and doorstep delivery across India.</p>
-        <div class="hero-cta"><a class="button primary" href="/products">Start creating</a><a class="button ghost" href="/business">Business solutions</a></div>
-        <div class="hero-proof"><span><b>4.8/5</b> customer rating</span><span><b>25k+</b> orders delivered</span><span><b>100%</b> quality checked</span></div>
-      </div>
-      <div class="hero-visual">
-        <img src="/public/hero-print-studio.png" alt="Colorful printed cards, packaging, stickers and posters">
-        <span class="delivery-stamp">4 HR<br><small>SELECT PRINTS</small></span>
-      </div>
+    <section class="home-hero carousel-shell" data-carousel data-carousel-interval="4000" aria-label="PrintOasis promotions">
+      <div class="carousel-track">${heroSlides.map((slide, index) => `<article class="hero-slide ${slide[5]} ${index === 0 ? "is-active" : ""}" aria-hidden="${index === 0 ? "false" : "true"}"><img src="/public/hero-print-studio.png" alt="${index === 0 ? "Premium printed cards, packaging and colourful print samples" : ""}" ${index === 0 ? "fetchpriority=high" : "loading=lazy"}><div class="hero-slide-overlay"></div><div class="hero-copy"><span class="eyebrow">${slide[0]}</span><h1>${slide[1]}</h1><p>${slide[2]}</p><div class="hero-cta"><a class="button primary" href="${slide[3]}">${slide[4]}</a><a class="button ghost light-ghost" href="/products">All products</a></div></div></article>`).join("")}</div>
+      <div class="carousel-controls"><button class="carousel-arrow previous" type="button" aria-label="Previous promotion">&larr;</button><div class="carousel-dots" role="tablist" aria-label="Choose promotion">${heroSlides.map((_, index) => `<button type="button" role="tab" aria-label="Promotion ${index + 1}" aria-selected="${index === 0}" data-carousel-dot="${index}"></button>`).join("")}</div><button class="carousel-arrow next" type="button" aria-label="Next promotion">&rarr;</button></div>
+      <a class="hero-scroll-indicator" href="#offers" aria-label="Scroll to current offers"><span></span>Scroll to discover</a>
     </section>
-    <section class="section">
+    <section class="home-offers section" id="offers" data-carousel data-carousel-interval="5500" aria-label="Current offers">
+      <div class="section-heading"><div><span class="eyebrow">PRINT MORE, SAVE MORE</span><h2>Offers worth printing for</h2></div><a href="/products">Shop all offers &rarr;</a></div>
+      <div class="offers-viewport"><div class="carousel-track offer-track">${[["20% OFF", "Business cards", "Use code FIRST20 on your first card order.", "business-cards"], ["FREE SHIPPING", "Orders above Rs. 999", "One less thing between your idea and your doorstep.", "products"], ["BULK SAVINGS", "Built for bigger runs", "Get tailored pricing for high-volume and recurring orders.", "business"], ["SAME-DAY SELECTS", "In a hurry?", "Choose eligible essentials for a faster production window.", "same-day"]].map((offer, index) => `<article class="offer-card offer-${index + 1}" aria-hidden="${index === 0 ? "false" : "true"}"><span>${offer[0]}</span><h3>${offer[1]}</h3><p>${offer[2]}</p><a href="/${offer[3] === "products" ? "products" : offer[3] === "business" ? "business" : `products?category=${offer[3]}`}">Explore &rarr;</a></article>`).join("")}</div></div>
+      <div class="carousel-controls compact-controls"><button class="carousel-arrow previous" type="button" aria-label="Previous offer">&larr;</button><div class="carousel-dots" role="tablist" aria-label="Choose offer">${[0, 1, 2, 3].map(index => `<button type="button" role="tab" aria-label="Offer ${index + 1}" aria-selected="${index === 0}" data-carousel-dot="${index}"></button>`).join("")}</div><button class="carousel-arrow next" type="button" aria-label="Next offer">&rarr;</button></div>
+    </section>
+    <section class="section popular-categories reveal-on-scroll">
       <div class="section-heading"><div><span class="eyebrow">FIND YOUR PRINT</span><h2>Shop by category</h2></div><a href="/products">See everything →</a></div>
-      <div class="category-grid">${categories.map(c => `<a class="category-card" href="/products?category=${c[0]}"><span>${c[3]}</span><div><h3>${c[1]}</h3><p>${c[2]}</p></div><b>→</b></a>`).join("")}</div>
+      <div class="category-grid">${categories.map(c => `<a class="category-card" href="/products?category=${c[0]}"><span>${c[3]}</span><div><h3>${c[1]}</h3><p>${c[2]}</p><small>${categoryCounts.get(c[0]) || 0} product${categoryCounts.get(c[0]) === 1 ? "" : "s"}</small></div><b>→</b></a>`).join("")}</div>
     </section>
-    <section class="section tint">
+    <section class="section tint featured-products reveal-on-scroll" data-product-carousel data-carousel-interval="8000">
       <div class="section-heading"><div><span class="eyebrow">CUSTOMER FAVOURITES</span><h2>Most loved prints</h2></div><a href="/products">View all →</a></div>
-      <div class="product-grid">${featured.map(productCard).join("")}</div>
+      <div class="product-carousel-viewport"><div class="product-grid product-carousel-track">${featured.map(productCard).join("")}</div></div>
+      <div class="product-carousel-controls"><button class="carousel-arrow previous" type="button" aria-label="Previous featured products">&larr;</button><button class="carousel-arrow next" type="button" aria-label="Next featured products">&rarr;</button></div>
     </section>
+    <section class="home-testimonials section reveal-on-scroll" data-carousel data-carousel-interval="8000" aria-label="Customer testimonials">
+      <div class="section-heading"><div><span class="eyebrow">REAL ORDERS, REAL WORDS</span><h2>Trusted by people who make things happen</h2></div></div>
+      <div class="testimonials-viewport"><div class="carousel-track testimonial-track">${testimonials.length ? testimonials.map((review, index) => `<article class="testimonial-card" aria-hidden="${index === 0 ? "false" : "true"}"><span class="testimonial-stars" aria-label="${review.rating} out of 5 stars">${"★".repeat(review.rating)}${"☆".repeat(5 - review.rating)}</span><blockquote>${esc(review.comment)}</blockquote><div class="testimonial-author"><b>${esc(review.name)}</b><span>${esc(review.product_name)}${review.verified_purchase ? " · Verified Purchase" : ""}</span></div></article>`).join("") : `<article class="testimonial-card empty-testimonial"><span class="testimonial-stars" aria-hidden="true">★★★★★</span><blockquote>Customer reviews from verified, delivered orders will appear here.</blockquote><div class="testimonial-author"><b>PrintOasis customers</b><span>Made-to-order print, carefully delivered</span></div></article>`}</div></div>
+      <div class="carousel-controls compact-controls"><button class="carousel-arrow previous" type="button" aria-label="Previous testimonial">&larr;</button><div class="carousel-dots" role="tablist" aria-label="Choose testimonial">${(testimonials.length ? testimonials : [null]).map((_, index) => `<button type="button" role="tab" aria-label="Testimonial ${index + 1}" aria-selected="${index === 0}" data-carousel-dot="${index}"></button>`).join("")}</div><button class="carousel-arrow next" type="button" aria-label="Next testimonial">&rarr;</button></div>
+    </section>
+    <section class="home-statistics reveal-on-scroll" aria-label="PrintOasis statistics">${[[homeStats.orders, "Orders completed"], [homeStats.customers, "Happy customers"], [homeStats.products, "Products available"], [homeStats.categories, "Print categories"]].map(stat => `<article><b data-count="${stat[0]}">0</b><span>${stat[1]}</span></article>`).join("")}</section>
     <section class="business-banner">
       <div><span class="eyebrow">PRINTOASIS FOR BUSINESS</span><h2>One print partner.<br>Every business need.</h2><p>Centralised ordering, brand controls, nationwide fulfilment and dedicated account support.</p><a class="button light-button" href="/business">Explore business printing</a></div>
       <div class="business-stats"><span><b>48h</b> standard dispatch</span><span><b>30+</b> product formats</span><span><b>Pan-India</b> delivery</span></div>
@@ -746,19 +809,28 @@ function homePage(session, cart) {
 function productsPage(url, session, cart) {
   const category = url.searchParams.get("category") || "";
   const q = url.searchParams.get("q") || "";
- let sql = `SELECT * FROM products WHERE ${visibleProductCondition()}`;
+  const sort = ["recommended", "price-asc", "price-desc", "newest"].includes(url.searchParams.get("sort")) ? url.searchParams.get("sort") : "recommended";
+  const productsUrl = (nextCategory = category) => {
+    const params = new URLSearchParams();
+    if (nextCategory) params.set("category", nextCategory);
+    if (q) params.set("q", q);
+    if (sort !== "recommended") params.set("sort", sort);
+    const query = params.toString();
+    return `/products${query ? `?${query}` : ""}`;
+  };
+  let sql = `SELECT * FROM products WHERE ${visibleProductCondition()}`;
   const args = [];
   if (category) { sql += " AND category = ?"; args.push(category); }
   if (q) { sql += " AND (name LIKE ? OR description LIKE ?)"; args.push(`%${q}%`, `%${q}%`); }
-  sql += " ORDER BY rating DESC, name";
+  sql += sort === "price-asc" ? " ORDER BY price ASC, rating DESC" : sort === "price-desc" ? " ORDER BY price DESC, rating DESC" : sort === "newest" ? " ORDER BY id DESC" : " ORDER BY rating DESC, name";
   const products = db.prepare(sql).all(...args);
   const categoryInfo = categories.find(c => c[0] === category);
   return layout(categoryInfo ? categoryInfo[1] : q ? `Search: ${q}` : "All products", `
     <section class="page-hero compact"><span class="eyebrow">PRINT SHOP</span><h1>${categoryInfo ? esc(categoryInfo[1]) : q ? `Results for “${esc(q)}”` : "All products"}</h1><p>${categoryInfo ? esc(categoryInfo[2]) : `${products.length} customizable products for work, events and gifting.`}</p></section>
     <section class="catalog section">
-      <aside><h3>Categories</h3><a class="${!category ? "active" : ""}" href="/products">All products</a>${categories.map(c => `<a class="${category === c[0] ? "active" : ""}" href="/products?category=${c[0]}">${c[1]}</a>`).join("")}</aside>
-      <div><div class="catalog-bar"><b>${products.length} products</b><span>Sorted by recommended</span></div>
-      ${products.length ? `<div class="product-grid">${products.map(productCard).join("")}</div>` : `<div class="empty"><h2>No products found</h2><p>Try a broader search or explore all products.</p><a class="button primary" href="/products">Browse products</a></div>`}</div>
+      <aside class="catalog-filters"><h3>Categories</h3><a class="${!category ? "active" : ""}" href="${productsUrl("")}"${!category ? ' aria-current="page"' : ""}>All products</a>${categories.map(c => `<a class="${category === c[0] ? "active" : ""}" href="${productsUrl(c[0])}"${category === c[0] ? ' aria-current="page"' : ""}>${c[1]}</a>`).join("")}</aside>
+      <div><div class="catalog-bar"><div><span class="catalog-result-label">${q ? `Search results for “${esc(q)}”` : categoryInfo ? esc(categoryInfo[1]) : "All products"}</span><b>${products.length} product${products.length === 1 ? "" : "s"}</b></div><form class="catalog-sort" method="get" action="/products"><input type="hidden" name="q" value="${esc(q)}"><input type="hidden" name="category" value="${esc(category)}"><label>Sort by<select name="sort" onchange="this.form.submit()"><option value="recommended" ${sort === "recommended" ? "selected" : ""}>Recommended</option><option value="newest" ${sort === "newest" ? "selected" : ""}>Newest</option><option value="price-asc" ${sort === "price-asc" ? "selected" : ""}>Price: low to high</option><option value="price-desc" ${sort === "price-desc" ? "selected" : ""}>Price: high to low</option></select></label><noscript><button class="button ghost" type="submit">Apply</button></noscript></form></div>
+      ${products.length ? `<div class="product-grid">${products.map(product => productCard(product, q)).join("")}</div>` : `${emptyState("search", "No products matched your search", "Try a broader search or browse one of our popular print collections.", "/products", "Browse all products", "/help", "Get print help")}<div class="search-category-shortcuts">${categories.slice(0, 5).map(item => `<a href="/products?category=${encodeURIComponent(item[0])}">${esc(item[1])}</a>`).join("")}</div>`}</div>
     </section>
   `, session, cart);
 }
@@ -781,6 +853,11 @@ function productPage(product, session, cart) {
     FROM reviews
     WHERE product_id = ? AND approved = 1
   `).get(product.id);
+  const stockState = sellable <= 0
+    ? { kind: "out", label: "Out of stock" }
+    : sellable <= Math.max(product.min_qty, 5)
+      ? { kind: "low", label: `Low stock: ${sellable} available` }
+      : { kind: "in", label: `In stock: ${sellable} available` };
   const recommendations = db.prepare(`SELECT * FROM products WHERE category = ? AND id != ? AND ${visibleProductCondition()} ORDER BY rating DESC LIMIT 4`).all(product.category, product.id);
   const wished = session.user ? db.prepare("SELECT id FROM wishlist_items WHERE user_id = ? AND product_id = ?").get(session.user.id, product.id) : null;
   const canReview = session.user ? hasDeliveredPurchase(session.user.id, product.id) : false;
@@ -789,7 +866,7 @@ function productPage(product, session, cart) {
     <section class="product-detail">
       <div class="product-gallery">${productArt(product, true)}<div class="quality-note"><b>✓ Free artwork quality check</b><span>We review every file before printing.</span></div></div>
       <div class="product-config">
-        <span class="badge">${esc(product.badge)}</span><h1>${esc(product.name)}</h1><div class="rating">★★★★★ <span>${product.rating} · Quality assured</span></div><p class="lead">${esc(product.description)}</p>
+        <span class="badge">${esc(product.badge)}</span><h1>${esc(product.name)}</h1><div class="rating"><span class="rating-stars" aria-label="${product.rating} out of 5 stars">★★★★★</span><span>${product.rating} · ${reviewSummary.count ? `${reviewSummary.count} review${reviewSummary.count === 1 ? "" : "s"}` : "No reviews yet"}</span></div><p class="lead">${esc(product.description)}</p>
         <ul class="feature-list"><li>Low minimum order of ${product.min_qty}</li><li>Rich, calibrated color</li><li>Tracked delivery across India</li></ul>
         ${session.user ? `<form action="/wishlist/toggle" method="post" class="inline-action"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}"><button class="button ghost wishlist-button" type="submit" aria-label="${wished ? "Remove from wishlist" : "Add to wishlist"}">${wished ? "♥ Saved" : "♡ Wishlist"}</button></form>` : `<a class="button ghost wishlist-button" href="/login?next=${encodeURIComponent(`/product/${product.slug}`)}">♡ Wishlist</a>`}
         <form action="/cart/add" method="post" class="config-form" enctype="multipart/form-data">
@@ -800,7 +877,7 @@ function productPage(product, session, cart) {
           <label>Quantity<input type="number" name="quantity" min="1" step="1" max="${sellable}" value="${defaultQuantity || 1}" ${sellable <= 0 ? "disabled" : "required"}></label>
           <label class="full">Artwork notes <textarea name="artwork_note" rows="3" placeholder="Design link, file name, colors or special instructions"></textarea></label>
           <label class="full">Upload artwork <input class="artwork-input" type="file" name="artwork_file" accept=".pdf,.png,.ai,.psd,application/pdf,image/png"><small class="input-help">Accepted: PDF, PNG, AI, PSD up to 25 MB.</small><span class="artwork-preview"></span></label>
-          <div class="price-box"><span>Starting total</span><strong data-unit-price="${product.price / product.min_qty}">${money(defaultQuantity ? defaultQuantity * product.price / product.min_qty : product.price)}</strong><small>${available <= 0 ? "Out of Stock" : `${sellable} available now`} · Inclusive of taxes</small></div>
+          <div class="price-box"><span>Starting total</span><strong data-unit-price="${product.price / product.min_qty}">${money(defaultQuantity ? defaultQuantity * product.price / product.min_qty : product.price)}</strong><small>${available <= 0 ? "Out of Stock" : `${sellable} available now`} · Inclusive of taxes</small><span class="stock-state ${stockState.kind}">${stockState.label}</span></div>
           ${available > 0
   ? `<button class="button primary full" type="submit">Add to cart</button>`
   : `<button class="button full" type="button" disabled>Out of Stock</button>`}
@@ -821,7 +898,7 @@ function productPage(product, session, cart) {
                </div>
              </div>`
           : `<div class="review-summary"><span class="review-count">No reviews yet</span><div class="rating-breakdown" aria-label="Rating breakdown">${[5, 4, 3, 2, 1].map(rating => `<span>${rating}★ <b>0</b></span>`).join("")}</div></div>`}
-        <div class="reviews">${reviews.length ? reviews.map(r => `<article><b>${"★".repeat(r.rating)}${"☆".repeat(5 - r.rating)}</b><p>${esc(r.comment)}</p><small>${esc(r.name)} · ${new Date(r.created_at + "Z").toLocaleDateString("en-IN", { dateStyle: "medium" })}${r.verified_purchase ? ` · <span class="verified-purchase">Verified Purchase</span>` : ""}</small></article>`).join("") : `<div class="empty slim"><h3>No reviews yet</h3><p>Be the first to review this product.</p></div>`}</div>
+        <div class="reviews">${reviews.length ? reviews.map(r => `<article><b>${"★".repeat(r.rating)}${"☆".repeat(5 - r.rating)}</b><p>${esc(r.comment)}</p><small>${esc(r.name)} · ${new Date(r.created_at + "Z").toLocaleDateString("en-IN", { dateStyle: "medium" })}${r.verified_purchase ? ` · <span class="verified-purchase">Verified Purchase</span>` : ""}</small></article>`).join("") : emptyState("review", "No reviews yet", "Verified customer feedback will appear here after delivery.", "/products", "Browse products", "/help", "Read FAQ")}</div>
         ${
 !session.user
 ? `<div class="empty slim">
@@ -841,7 +918,7 @@ function productPage(product, session, cart) {
 }
       </div>
     </section>
-    ${recommendations.length ? `<section class="section tint"><div class="section-heading"><div><span class="eyebrow">SMART RECOMMENDATIONS</span><h2>Often ordered together</h2></div></div><div class="product-grid">${recommendations.map(productCard).join("")}</div></section>` : ""}
+    ${recommendations.length ? `<section class="section tint related-products" data-product-carousel><div class="section-heading"><div><span class="eyebrow">SMART RECOMMENDATIONS</span><h2>Often ordered together</h2></div><a href="/products?category=${encodeURIComponent(product.category)}">View category &rarr;</a></div><div class="product-carousel-viewport"><div class="product-grid product-carousel-track">${recommendations.map(productCard).join("")}</div></div><div class="product-carousel-controls"><button class="carousel-arrow previous" type="button" aria-label="Previous related products">&larr;</button><button class="carousel-arrow next" type="button" aria-label="Next related products">&rarr;</button></div></section>` : ""}
   `, session, cart, product.description);
 }
 
@@ -877,7 +954,7 @@ function cartPage(url, session, cart) {
     <section class="page-hero compact"><span class="eyebrow">YOUR ORDER</span><h1>Shopping cart</h1><p>Review your print specifications before checkout.</p></section>
     ${notice(url)}
     <section class="cart-layout section">
-      <div>${cart.items.length ? cart.items.map(item => `<article class="cart-item">${productArt(item)}<div class="cart-copy"><h3><a href="/product/${item.slug}">${esc(item.name)}</a></h3><p>${esc(item.size)} · ${esc(item.material)} · ${esc(item.print_option)}</p>${item.artwork_note ? `<small>Artwork note: ${esc(item.artwork_note)}</small>` : ""}${item.artwork_original_name ? `<small>Uploaded file: ${esc(item.artwork_original_name)}</small>` : ""}</div><form action="/cart/update" method="post"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="item_id" value="${item.id}"><label>Qty<input name="quantity" type="number" min="0" max="${item.quantity + sellableQuantity(item)}" value="${item.quantity}"></label><small>${item.quantity + sellableQuantity(item)} max available</small><button>Update</button></form><strong>${money(item.quantity * item.unit_price)}</strong></article>`).join("") : `<div class="empty"><h2>Your cart is waiting for a great idea.</h2><p>Choose a product and customize it to get started.</p><a class="button primary" href="/products">Explore products</a></div>`}</div>
+      <div>${cart.items.length ? cart.items.map(item => `<article class="cart-item">${productArt(item)}<div class="cart-copy"><h3><a href="/product/${item.slug}">${esc(item.name)}</a></h3><p>${esc(item.size)} · ${esc(item.material)} · ${esc(item.print_option)}</p>${item.artwork_note ? `<small>Artwork note: ${esc(item.artwork_note)}</small>` : ""}${item.artwork_original_name ? `<small>Uploaded file: ${esc(item.artwork_original_name)}</small>` : ""}</div><form action="/cart/update" method="post"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="item_id" value="${item.id}"><label>Qty<input name="quantity" type="number" min="0" max="${item.quantity + sellableQuantity(item)}" value="${item.quantity}"></label><small>${item.quantity + sellableQuantity(item)} max available</small><button>Update</button></form><strong>${money(item.quantity * item.unit_price)}</strong></article>`).join("") : emptyState("cart", "Your cart is waiting.", "Choose a product and make it yours when the idea is ready.", "/products", "Browse products", "/help", "Need print help?")}</div>
       ${cart.items.length ? `<aside class="order-summary"><h2>Order summary</h2><p><span>Subtotal</span><b>${money(totals.subtotal)}</b></p><p><span>Delivery estimate</span><b>${totals.delivery === 0 ? "FREE" : money(totals.delivery)}</b></p><p class="total"><span>Total</span><b>${money(totals.total)}</b></p><small>Taxes included. Exact shipping updates by PIN code at checkout.</small><a class="button primary" href="/checkout">Proceed to checkout</a><a href="/products">Continue shopping</a></aside>` : ""}
     </section>
   `, session, cart);
@@ -941,18 +1018,14 @@ function passwordPage(url, session, cart) {
 
 function orderList(orders, session) {
   if (!orders.length)
-    return `<div class="empty slim">
-      <h3>No orders yet</h3>
-      <p>Your completed purchases will appear here.</p>
-      <a class="button primary" href="/products">Shop products</a>
-    </div>`;
+    return emptyState("orders", "You have not placed an order yet", "Your print history, tracking and invoices will appear here.", "/products", "Start shopping", "/help", "How ordering works");
 
   return `<div class="orders">
     ${orders.map(order => `
-      <article>
-        <span>${esc(order.order_number)}</span>
+      <article class="order-card">
+        <div class="order-card-summary"><span>${esc(order.order_number)}</span><small>Placed ${new Date(order.created_at + "Z").toLocaleDateString("en-IN", { dateStyle: "medium" })}</small></div>
         <b class="status ${statusClass(order.status)}">${esc(order.status)}</b>
-        <small>${money(order.total)} · ${new Date(order.created_at + "Z").toLocaleString("en-IN")}</small>
+        <small class="order-card-total">${money(order.total)} · ${order.status === "Delivered" ? "Completed" : "In progress"}</small>
         <a class="button ghost" href="/account/orders/${order.id}">View Details →</a>
         ${session ? `<form method="post" action="/account/orders/reorder"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="order_id" value="${order.id}"><button class="button ghost" type="submit">Reorder</button></form>` : ""}
       </article>
@@ -999,14 +1072,16 @@ function orderDetailsPage(order, session, cart) {
     WHERE oi.order_id = ?
   `).all(order.id);
 
-  for (const item of items) {
-    item.review = db.prepare(`
-      SELECT id, rating, comment
+  const reviewByProductId = new Map();
+  if (items.length) {
+    const reviewRows = db.prepare(`
+      SELECT id, product_id, rating, comment
       FROM reviews
-      WHERE user_id = ? AND product_id = ?
-      LIMIT 1
-    `).get(session.user.id, item.product_id);
+      WHERE user_id = ? AND product_id IN (${items.map(() => "?").join(",")})
+    `).all(session.user.id, ...items.map(item => item.product_id));
+    for (const review of reviewRows) reviewByProductId.set(review.product_id, review);
   }
+  for (const item of items) item.review = reviewByProductId.get(item.product_id) || null;
 
   return layout(
     `Order ${order.order_number}`,
@@ -1017,19 +1092,17 @@ function orderDetailsPage(order, session, cart) {
     </section>
 
     <section class="section narrow order-details">
+      <header class="order-detail-header"><div><span class="eyebrow">ORDER STATUS</span><h2>${esc(order.status)}</h2><p>Order total <strong>${money(order.total)}</strong></p></div><b class="status ${statusClass(order.status)}">${esc(order.status)}</b></header>
 
-      <b class="status ${statusClass(order.status)}">${esc(order.status)}</b>
+      <section class="shipment-panel"><div><span class="panel-label">Shipment timeline</span><h3>${order.status === "Delivered" ? "Delivered to your address" : "Your order is moving through production"}</h3></div>${statusTimeline(order)}</section>
 
-      ${statusTimeline(order)}
-
-      ${order.courier_name ? `<p><strong>Courier:</strong> ${esc(order.courier_name)}</p>` : ""}
-      ${order.tracking_number ? `<p><strong>Tracking number:</strong> ${esc(order.tracking_number)}</p>` : ""}
-      ${order.estimated_delivery ? `<p><strong>Estimated delivery:</strong> ${new Date(order.estimated_delivery).toLocaleDateString("en-IN", { dateStyle: "medium" })}</p>` : ""}
-
-      <div class="order-actions">
-        ${order.tracking_url ? `<a class="button primary" href="${esc(order.tracking_url)}" target="_blank" rel="noopener">Track Package</a>` : ""}
-        <a class="button ghost" href="/invoice/${encodeURIComponent(order.order_number)}">View invoice</a>
+      <div class="order-information-grid">
+        <article><span class="panel-label">Delivery address</span><p>${esc(order.customer_name)}<br>${esc(order.address)}<br>${esc(order.city)} - ${esc(order.postal_code)}<br>${esc(order.phone)}</p></article>
+        <article><span class="panel-label">Payment summary</span><p><strong>${money(order.total)}</strong><br>${esc(order.payment_id ? "Payment confirmed" : "Payment details recorded")}<br>Placed ${new Date(order.created_at + "Z").toLocaleDateString("en-IN", { dateStyle: "medium" })}</p></article>
+        <article class="tracking-information"><span class="panel-label">Tracking</span>${order.courier_name || order.tracking_number || order.estimated_delivery ? `<p>${order.courier_name ? `<strong>${esc(order.courier_name)}</strong><br>` : ""}${order.tracking_number ? `<code>${esc(order.tracking_number)}</code><br>` : ""}${order.estimated_delivery ? `Estimated delivery: ${new Date(order.estimated_delivery).toLocaleDateString("en-IN", { dateStyle: "medium" })}` : ""}</p>` : `<p>Tracking details will appear when your order is dispatched.</p>`}${order.tracking_url ? `<a class="button primary" href="${esc(order.tracking_url)}" target="_blank" rel="noopener">Track package</a>` : ""}</article>
       </div>
+
+      <section class="order-invoice-card"><div><span class="panel-label">GST invoice</span><h3>Print-ready invoice for this order</h3><p>View the full billing breakdown, then print or save it as a PDF.</p></div><a class="button ghost" href="/invoice/${encodeURIComponent(order.order_number)}">View invoice</a></section>
 
       <h2>Items in this order</h2>
 
@@ -1061,7 +1134,7 @@ function infoPage(kind, session, cart) {
 
 function adminTabs(active) {
   const tabs = [["/admin", "Dashboard"], ["/admin/products", "Products"], ["/admin/coupons", "Coupons"], ["/admin/orders", "Orders"], ["/admin/notifications", "Notifications"]];
-  return `<aside>${tabs.map(([href, label]) => `<a class="${active === label ? "active" : ""}" href="${href}">${label}</a>`).join("")}</aside>`;
+  return `<aside aria-label="Admin navigation">${tabs.map(([href, label]) => `<a class="${active === label ? "active" : ""}" href="${href}"${active === label ? ' aria-current="page"' : ""}>${label}</a>`).join("")}</aside>`;
 }
 
 function adminPage(title, active, body, session, cart) {
@@ -1082,12 +1155,12 @@ function adminDashboardPage(session, cart) {
   const recent = db.prepare("SELECT o.*, u.email FROM orders o JOIN users u ON u.id = o.user_id ORDER BY o.id DESC LIMIT 6").all();
   return adminPage("Operations dashboard", "Dashboard", `
     <div class="account-cards admin-stats">
-      <article><span>Active products</span><b>${stats.products}</b><a href="/admin/products">Manage catalog</a></article>
-      <article><span>Total orders</span><b>${stats.orders}</b><a href="/admin/orders">View orders</a></article>
-      <article><span>Open jobs</span><b>${stats.pending}</b><a href="/admin/orders">Update status</a></article>
-      <article><span>Revenue</span><b class="small">${money(stats.revenue)}</b><a href="/admin/orders">See sales</a></article>
+      <article class="admin-stat-card"><span>Active products</span><b>${stats.products}</b><a href="/admin/products">Manage catalog</a></article>
+      <article class="admin-stat-card"><span>Total orders</span><b>${stats.orders}</b><a href="/admin/orders">View orders</a></article>
+      <article class="admin-stat-card"><span>Open jobs</span><b>${stats.pending}</b><a href="/admin/orders">Update status</a></article>
+      <article class="admin-stat-card"><span>Revenue</span><b class="small">${money(stats.revenue)}</b><a href="/admin/orders">See sales</a></article>
     </div>
-    <div class="admin-grid"><article><h2>Status pipeline</h2>${statusCounts.length ? statusCounts.map(s => `<p><span>${esc(s.status)}</span><b>${s.count}</b></p>`).join("") : "<p>No orders yet.</p>"}</article><article><h2>Recent orders</h2>${adminOrderRows(recent, session, false)}</article></div>
+    <div class="admin-grid"><article><h2>Status pipeline</h2>${statusCounts.length ? statusCounts.map(s => `<p><span class="status ${statusClass(s.status)}">${esc(s.status)}</span><b>${s.count}</b></p>`).join("") : "<p>No orders yet.</p>"}</article><article><h2>Recent orders</h2>${adminOrderRows(recent, session, false)}</article></div>
   `, session, cart);
 }
 
@@ -1124,11 +1197,25 @@ function productForm(product, session) {
 function adminProductsPage(url, session, cart) {
   const editId = Number(url.searchParams.get("edit") || 0);
   const editing = editId ? db.prepare("SELECT * FROM products WHERE id = ?").get(editId) : null;
-  const products = db.prepare("SELECT * FROM products ORDER BY status = 'hidden', category, name").all();
+  const query = String(url.searchParams.get("q") || "").trim().slice(0, 80);
+  const status = ["", "active", "hidden"].includes(url.searchParams.get("status")) ? url.searchParams.get("status") : "";
+  const inventory = ["", "in", "low", "out"].includes(url.searchParams.get("inventory")) ? url.searchParams.get("inventory") : "";
+  const where = [];
+  const params = [];
+  if (query) { where.push("(name LIKE ? OR slug LIKE ? OR category LIKE ?)"); params.push(`%${query}%`, `%${query}%`, `%${query}%`); }
+  if (status) { where.push("status = ?"); params.push(status); }
+  const productSql = `SELECT * FROM products${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY status = 'hidden', category, name`;
+  const products = db.prepare(productSql).all(...params).filter(product => {
+    const available = productAvailable(product);
+    if (inventory === "out") return available <= 0;
+    if (inventory === "low") return available > 0 && available <= Math.max(5, product.min_qty);
+    if (inventory === "in") return available > Math.max(5, product.min_qty);
+    return true;
+  });
   return adminPage("Product manager", "Products", `
     <div class="section-heading compact-heading"><div><span class="eyebrow">CATALOG CRUD</span><h2>${editing ? `Edit ${esc(editing.name)}` : "Add product"}</h2></div></div>
     ${productForm(editing, session)}
-    <div class="admin-table"><h2>All products</h2>${products.map(p => `<article><div>${productArt(p)}<span><b>${esc(p.name)}</b><small>${esc(p.category)} · ${money(p.price)} · min ${p.min_qty} · ${p.status === "hidden" ? "hidden" : "active"}</small><small>Stock ${p.stock ?? 0} · Reserved ${p.reserved ?? 0} · Available ${productAvailable(p)}</small></span></div><nav><a class="button ghost" href="/admin/products?edit=${p.id}">Edit</a><form method="post" action="/admin/products/delete"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="id" value="${p.id}"><button class="button ghost" type="submit">Delete</button></form></nav></article>`).join("")}</div>
+    <div class="admin-table"><div class="admin-table-heading"><div><span class="eyebrow">CATALOG OVERVIEW</span><h2>All products</h2></div><form class="admin-list-filters" method="get" action="/admin/products"><input name="q" value="${esc(query)}" placeholder="Search name, slug or category"><select name="status"><option value="">All statuses</option><option value="active" ${status === "active" ? "selected" : ""}>Active</option><option value="hidden" ${status === "hidden" ? "selected" : ""}>Hidden</option></select><select name="inventory"><option value="">All inventory</option><option value="in" ${inventory === "in" ? "selected" : ""}>In stock</option><option value="low" ${inventory === "low" ? "selected" : ""}>Low stock</option><option value="out" ${inventory === "out" ? "selected" : ""}>Out of stock</option></select><button class="button ghost" type="submit">Filter</button></form></div>${products.map(p => { const available = productAvailable(p); const stockKind = available <= 0 ? "out" : available <= Math.max(5, p.min_qty) ? "low" : "in"; return `<article><div>${productArt(p)}<span><b>${esc(p.name)}</b><small>${esc(p.category)} · ${money(p.price)} · min ${p.min_qty} · ${p.status === "hidden" ? "hidden" : "active"}</small><span class="admin-inventory"><span class="stock-state ${stockKind}">${available <= 0 ? "Out of stock" : available <= Math.max(5, p.min_qty) ? `Low: ${available} available` : `${available} available`}</span><small>Physical ${p.stock ?? 0} · Reserved ${p.reserved ?? 0}</small></span></span></div><nav><a class="button ghost" href="/admin/products?edit=${p.id}">Edit</a><form method="post" action="/admin/products/delete"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="id" value="${p.id}"><button class="button ghost" type="submit">Delete</button></form></nav></article>`; }).join("") || emptyState("admin-products", "No products matched these filters", "Try clearing a filter or create a new product.", "/admin/products", "Clear filters")}</div>
   `, session, cart);
 }
 
@@ -1144,13 +1231,13 @@ function adminCouponsPage(url, session, cart) {
   return adminPage("Coupon manager", "Coupons", `
     <div class="section-heading compact-heading"><div><span class="eyebrow">CHECKOUT PROMOTIONS</span><h2>${editing ? `Edit ${esc(editing.code)}` : "Create coupon"}</h2></div></div>
     ${couponForm(editing, session)}
-    <div class="admin-table"><h2>All coupons</h2>${coupons.length ? coupons.map(coupon => `<article><div><span><b>${esc(coupon.code)}</b><small>${coupon.type === "percent" ? `${coupon.value}%` : money(coupon.value)} · Minimum ${money(coupon.minimum_order || coupon.min_total || 0)}${coupon.maximum_discount ? ` · Cap ${money(coupon.maximum_discount)}` : ""}</small><small>${coupon.active ? "Active" : "Disabled"} · Used ${coupon.times_used || 0}${coupon.usage_limit ? ` / ${coupon.usage_limit}` : ""}${coupon.expiry_date ? ` · Expires ${esc(coupon.expiry_date)}` : ""}</small></span></div><nav><a class="button ghost" href="/admin/coupons?edit=${encodeURIComponent(coupon.code)}">Edit</a><form method="post" action="/admin/coupons/toggle"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="code" value="${esc(coupon.code)}"><button class="button ghost">${coupon.active ? "Disable" : "Enable"}</button></form><form method="post" action="/admin/coupons/delete" onsubmit="return confirm('Delete this coupon?');"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="code" value="${esc(coupon.code)}"><button class="button ghost">Delete</button></form></nav></article>`).join("") : `<div class="empty slim"><h3>No coupons yet</h3><p>Create one to offer a checkout promotion.</p></div>`}</div>
+    <div class="admin-table"><h2>All coupons</h2>${coupons.length ? coupons.map(coupon => `<article><div><span><b>${esc(coupon.code)}</b><small>${coupon.type === "percent" ? `${coupon.value}%` : money(coupon.value)} · Minimum ${money(coupon.minimum_order || coupon.min_total || 0)}${coupon.maximum_discount ? ` · Cap ${money(coupon.maximum_discount)}` : ""}</small><small>${coupon.active ? "Active" : "Disabled"} · Used ${coupon.times_used || 0}${coupon.usage_limit ? ` / ${coupon.usage_limit}` : ""}${coupon.expiry_date ? ` · Expires ${esc(coupon.expiry_date)}` : ""}</small></span></div><nav><a class="button ghost" href="/admin/coupons?edit=${encodeURIComponent(coupon.code)}">Edit</a><form method="post" action="/admin/coupons/toggle"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="code" value="${esc(coupon.code)}"><button class="button ghost">${coupon.active ? "Disable" : "Enable"}</button></form><form method="post" action="/admin/coupons/delete" onsubmit="return confirm('Delete this coupon?');"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="code" value="${esc(coupon.code)}"><button class="button ghost">Delete</button></form></nav></article>`).join("") : emptyState("coupon", "No coupons yet", "Create a promotion to offer a checkout incentive.", "/admin/coupons", "Create coupon")}</div>
   `, session, cart);
 }
 
 function adminOrderRows(orders, session, editable = true) {
   if (!orders.length)
-    return `<div class="empty slim"><h3>No orders yet</h3><p>Orders will appear here after checkout.</p></div>`;
+    return emptyState("admin-orders", "No orders yet", "New customer orders will appear here after checkout.", "/admin/products", "Manage products");
 
   return `<div class="admin-orders">
     ${orders.map(o => `
@@ -1234,9 +1321,15 @@ function adminOrderRows(orders, session, editable = true) {
   </div>`;
 }
 
-function adminOrdersPage(session, cart) {
-  const orders = db.prepare("SELECT o.*, u.email FROM orders o JOIN users u ON u.id = o.user_id ORDER BY o.id DESC").all();
-  return adminPage("Order manager", "Orders", `<p class="lead">Update statuses through Pending, Printing, Packed, Shipped, Delivered and Cancelled. Cancelled orders automatically restore deducted stock once.</p>${adminOrderRows(orders, session, true)}`, session, cart);
+function adminOrdersPage(url, session, cart) {
+  const query = String(url.searchParams.get("q") || "").trim().slice(0, 80);
+  const status = ORDER_STATUSES.includes(url.searchParams.get("status")) ? url.searchParams.get("status") : "";
+  const where = [];
+  const params = [];
+  if (query) { where.push("(o.order_number LIKE ? OR o.customer_name LIKE ? OR u.email LIKE ?)"); params.push(`%${query}%`, `%${query}%`, `%${query}%`); }
+  if (status) { where.push("o.status = ?"); params.push(status); }
+  const orders = db.prepare(`SELECT o.*, u.email FROM orders o JOIN users u ON u.id = o.user_id${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY o.id DESC`).all(...params);
+  return adminPage("Order manager", "Orders", `<div class="admin-table-heading"><div><span class="eyebrow">FULFILMENT</span><h2>Order operations</h2></div><form class="admin-list-filters" method="get" action="/admin/orders"><input name="q" value="${esc(query)}" placeholder="Order number, customer or email"><select name="status"><option value="">All statuses</option>${ORDER_STATUSES.map(item => `<option ${status === item ? "selected" : ""}>${item}</option>`).join("")}</select><button class="button ghost" type="submit">Filter</button></form></div><p class="lead">Update statuses through Pending, Printing, Packed, Shipped, Delivered and Cancelled. Cancelled orders automatically restore deducted stock once.</p>${adminOrderRows(orders, session, true)}`, session, cart);
 }
 
 function adminNotificationsPage(session, cart) {
@@ -1246,13 +1339,13 @@ function adminNotificationsPage(session, cart) {
 
 function wishlistPage(session, cart) {
   const products = db.prepare(`SELECT p.*, w.saved_price FROM wishlist_items w JOIN products p ON p.id = w.product_id WHERE w.user_id = ? AND ${visibleProductCondition("p")} ORDER BY w.id DESC`).all(session.user.id);
-  return layout("Wishlist", `<section class="page-hero compact"><span class="eyebrow">SAVED PRINTS</span><h1>Your wishlist</h1><p>Keep client favourites and repeat-order ideas close.</p></section><section class="section">${products.length ? `<div class="product-grid">${products.map(product => { const available = sellableQuantity(product); const priceNote = Number(product.price) < Number(product.saved_price) ? "Price dropped" : Number(product.price) > Number(product.saved_price) ? "Price increased" : "Price unchanged"; const stockNote = available <= 0 ? "Out of Stock" : available <= Math.max(5, product.min_qty) ? "Low Stock" : "In Stock"; return `<article class="wishlist-card">${productArt(product)}<h3><a href="/product/${esc(product.slug)}">${esc(product.name)}</a></h3><p>${money(product.price)} · ${esc(priceNote)} · ${esc(stockNote)}</p><div class="wishlist-actions"><form method="post" action="/wishlist/move-to-cart"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}"><button class="button primary" type="submit" ${available <= 0 ? "disabled" : ""}>Move to cart</button></form><form method="post" action="/wishlist/toggle"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}"><input type="hidden" name="next" value="/wishlist"><button class="button ghost" type="submit">Remove</button></form></div></article>`; }).join("")}</div>` : `<div class="empty"><h2>No saved products yet</h2><p>Open a product and add it to your wishlist.</p><a class="button primary" href="/products">Browse products</a></div>`}</section>`, session, cart);
+  return layout("Wishlist", `<section class="page-hero compact"><span class="eyebrow">SAVED PRINTS</span><h1>Your wishlist</h1><p>Keep client favourites and repeat-order ideas close.</p></section><section class="section wishlist-section">${products.length ? `<div class="product-grid wishlist-grid">${products.map(product => { const available = sellableQuantity(product); const priceChanged = Number(product.price) !== Number(product.saved_price); const priceNote = Number(product.price) < Number(product.saved_price) ? "Price dropped" : Number(product.price) > Number(product.saved_price) ? "Price increased" : "Price unchanged"; const stockKind = available <= 0 ? "out" : available <= Math.max(5, product.min_qty) ? "low" : "in"; const stockNote = stockKind === "out" ? "Out of Stock" : stockKind === "low" ? "Low Stock" : "In Stock"; return `<article class="wishlist-card">${productArt(product)}<div class="wishlist-card-content"><div class="wishlist-card-meta"><span class="wishlist-price-note ${priceChanged ? "changed" : ""}">${esc(priceNote)}</span><span class="stock-state ${stockKind}">${esc(stockNote)}</span></div><h3><a href="/product/${esc(product.slug)}">${esc(product.name)}</a></h3><div class="wishlist-pricing"><strong>${money(product.price)}</strong>${priceChanged ? `<s>${money(product.saved_price)}</s>` : ""}${Number(product.price) < Number(product.saved_price) ? `<small>Save ${money(Number(product.saved_price) - Number(product.price))}</small>` : ""}</div><div class="wishlist-actions"><a class="button ghost" href="/product/${esc(product.slug)}">View product</a><form method="post" action="/wishlist/move-to-cart"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}"><button class="button primary" type="submit" ${available <= 0 ? "disabled" : ""}>Add to cart</button></form><form method="post" action="/wishlist/toggle"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}"><input type="hidden" name="next" value="/wishlist"><button class="button ghost" type="submit" aria-label="Remove ${esc(product.name)} from wishlist">Remove</button></form></div></div></article>`; }).join("")}</div>` : emptyState("wishlist", "Save products for later", "Keep client favourites and repeat-order ideas ready to revisit.", "/products", "Browse products", "/account", "View account")}</section>`, session, cart);
 }
 
 function statusTimeline(order) {
-  if (order.status === "Cancelled") return `<div class="status-timeline"><span class="done">Pending</span><span class="done">Cancelled</span></div>`;
+  if (order.status === "Cancelled") return `<div class="status-timeline" aria-label="Order status timeline"><span class="done">Pending</span><span class="done current" aria-current="step">Cancelled</span></div>`;
   const index = Math.max(0, ORDER_STATUSES.indexOf(order.status));
-  return `<div class="status-timeline">${ORDER_STATUSES.filter(s => s !== "Cancelled").map((s, i) => `<span class="${i <= index ? "done" : ""}">${esc(s)}</span>`).join("")}</div>`;
+  return `<div class="status-timeline" aria-label="Order status timeline">${ORDER_STATUSES.filter(s => s !== "Cancelled").map((s, i) => `<span class="${i <= index ? "done" : ""}${i === index ? " current" : ""}"${i === index ? ' aria-current="step"' : ""}>${esc(s)}</span>`).join("")}</div>`;
 }
 
 function trackPage(url, session, cart, result = null) {
@@ -1290,12 +1383,9 @@ function trackPage(url, session, cart, result = null) {
         result
           ? `
         <div class="track-result">
-
-          <h2>${esc(result.order_number)}</h2>
-
-          <b class="status ${statusClass(result.status)}">
+          <div class="track-result-head"><div><span class="panel-label">Order number</span><h2>${esc(result.order_number)}</h2></div><b class="status ${statusClass(result.status)}">
             ${esc(result.status)}
-          </b>
+          </b></div>
 
           ${statusTimeline(result)}
 
@@ -1306,7 +1396,7 @@ ${result.courier_name
   : ""}
 
 ${result.tracking_number
-  ? `<p><strong>Tracking Number:</strong> ${esc(result.tracking_number)}</p>`
+  ? `<p><strong>Tracking Number:</strong> <code>${esc(result.tracking_number)}</code></p>`
   : ""}
 
 ${result.estimated_delivery
@@ -1342,7 +1432,7 @@ ${result.tracking_url
 function invoicePage(order, items, session, cart) {
   const taxable = Math.round(order.total / 1.18);
   const gst = order.total - taxable;
-  return layout(`Invoice ${order.order_number}`, `<section class="invoice section narrow"><div class="invoice-head"><div><span class="eyebrow">GST INVOICE</span><h1>${esc(order.order_number)}</h1><p>${new Date(order.created_at + "Z").toLocaleDateString("en-IN", { dateStyle: "long" })}</p></div><button class="button primary" onclick="window.print()">Print / Save PDF</button></div><div class="invoice-box"><h2>Bill to</h2><p>${esc(order.customer_name)}<br>${esc(order.address)}<br>${esc(order.city)} - ${esc(order.postal_code)}<br>Phone: ${esc(order.phone)}${order.gst_number ? `<br>GST: ${esc(order.gst_number)}` : ""}</p></div><table class="invoice-table"><thead><tr><th>Item</th><th>Qty</th><th>Rate</th><th>Total</th></tr></thead><tbody>${items.map(i => `<tr><td>${esc(i.product_name)}<small>${esc(i.configuration)}</small></td><td>${i.quantity}</td><td>${money(i.unit_price)}</td><td>${money(i.quantity * i.unit_price)}</td></tr>`).join("")}</tbody></table><div class="invoice-totals"><p><span>Shipping</span><b>${money(order.shipping_fee || 0)}</b></p><p><span>Discount</span><b>${money(order.discount || 0)}</b></p><p><span>Taxable value</span><b>${money(taxable)}</b></p><p><span>GST included</span><b>${money(gst)}</b></p><p class="total"><span>Grand total</span><b>${money(order.total)}</b></p></div></section>`, session, cart);
+  return layout(`Invoice ${order.order_number}`, `<section class="invoice section narrow"><div class="invoice-head"><div><span class="eyebrow">GST INVOICE</span><h1>${esc(order.order_number)}</h1><p>${new Date(order.created_at + "Z").toLocaleDateString("en-IN", { dateStyle: "long" })}</p></div><div class="invoice-actions"><a class="button ghost" href="/account/orders/${order.id}">Back to order</a><button class="button primary" onclick="window.print()">Print / Save PDF</button></div></div><div class="invoice-box"><h2>Bill to</h2><p>${esc(order.customer_name)}<br>${esc(order.address)}<br>${esc(order.city)} - ${esc(order.postal_code)}<br>Phone: ${esc(order.phone)}${order.gst_number ? `<br>GST: ${esc(order.gst_number)}` : ""}</p></div><table class="invoice-table"><caption class="sr-only">Invoice items for ${esc(order.order_number)}</caption><thead><tr><th scope="col">Item</th><th scope="col">Qty</th><th scope="col">Rate</th><th scope="col">Total</th></tr></thead><tbody>${items.map(i => `<tr><td>${esc(i.product_name)}<small>${esc(i.configuration)}</small></td><td>${i.quantity}</td><td>${money(i.unit_price)}</td><td>${money(i.quantity * i.unit_price)}</td></tr>`).join("")}</tbody></table><div class="invoice-totals"><p><span>Shipping</span><b>${money(order.shipping_fee || 0)}</b></p><p><span>Discount</span><b>${money(order.discount || 0)}</b></p><p><span>Taxable value</span><b>${money(taxable)}</b></p><p><span>GST included</span><b>${money(gst)}</b></p><p class="total"><span>Grand total</span><b>${money(order.total)}</b></p></div></section>`, session, cart);
 }
 
 function requireAuth(session, res, next = "/account") {

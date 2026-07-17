@@ -7,7 +7,7 @@ function escHtml(value = "") {
 }
 
 function createEmailService(config) {
-  const configured = Boolean(config.host && config.from);
+  const configured = config.enabled !== false && Boolean(config.host && config.from);
   const transporter = configured ? nodemailer.createTransport({
     host: config.host,
     port: config.port,

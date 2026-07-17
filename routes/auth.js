@@ -57,7 +57,8 @@ module.exports = async function authRoutes(ctx) {
     try {
       const result = app.db.prepare("INSERT INTO users (name,email,password_hash) VALUES (?,?,?)").run(name, email, app.hashPassword(password));
       app.db.prepare("UPDATE sessions SET user_id = ? WHERE id = ?").run(Number(result.lastInsertRowid), session.id);
-      app.redirect(res, data.next || "/account");
+      const next = data.next || "/account";
+      app.redirect(res, `${next}${next.includes("?") ? "&" : "?"}notice=${encodeURIComponent("Account created successfully.")}`);
     } catch (error) {
       if (String(error).includes("UNIQUE")) app.redirect(res, `/login?notice=${encodeURIComponent("An account with that email already exists.")}`);
       else throw error;
@@ -71,13 +72,14 @@ module.exports = async function authRoutes(ctx) {
       return true;
     }
     app.db.prepare("UPDATE sessions SET user_id = ? WHERE id = ?").run(user.id, session.id);
-    app.redirect(res, data.next || "/account");
+    const next = data.next || "/account";
+    app.redirect(res, `${next}${next.includes("?") ? "&" : "?"}notice=${encodeURIComponent("Welcome back.")}`);
     return true;
   }
   if (url.pathname === "/logout") {
     app.releaseSessionReservations(session.id);
     app.db.prepare("UPDATE sessions SET user_id = NULL WHERE id = ?").run(session.id);
-    app.redirect(res, "/");
+    app.redirect(res, `/?notice=${encodeURIComponent("You have been logged out.")}`);
     return true;
   }
   return false;

@@ -17,7 +17,7 @@ module.exports = async function adminRoutes(ctx) {
   }
   if (req.method === "GET" && url.pathname === "/admin/orders") {
     if (!app.requireAdmin(session, res)) return true;
-    app.send(res, 200, app.adminOrdersPage(session, cart));
+    app.send(res, 200, app.adminOrdersPage(url, session, cart));
     return true;
   }
   if (req.method === "GET" && url.pathname === "/admin/notifications") {

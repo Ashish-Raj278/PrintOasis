@@ -19,7 +19,7 @@ try {
   Start-Sleep -Milliseconds 900
   $web = New-Object Microsoft.PowerShell.Commands.WebRequestSession
   $homeResponse = Invoke-WebRequest -UseBasicParsing -WebSession $web "$baseUrl/"
-  if ($homeResponse.StatusCode -ne 200 -or $homeResponse.Content -notmatch "Your big ideas") { throw "Home page failed" }
+  if ($homeResponse.StatusCode -ne 200 -or $homeResponse.Content -notmatch 'data-carousel' -or $homeResponse.Content -notmatch "Leave a lasting first impression") { throw "Home page failed" }
 
   $register = Invoke-WebRequest -UseBasicParsing -WebSession $web "$baseUrl/register"
   $csrf = Get-Csrf $register.Content
@@ -33,7 +33,7 @@ try {
   } | Out-Null
 
   $productsPage = Invoke-WebRequest -UseBasicParsing -WebSession $web "$baseUrl/products"
-  $slug = [regex]::Match($productsPage.Content, 'href="/product/([^"]+)"').Groups[1].Value
+  $slug = [regex]::Match($productsPage.Content, '<article class="product-card">\s*<a href="/product/([^"]+)"').Groups[1].Value
   if (-not $slug) { throw "No visible product found" }
   $product = Invoke-WebRequest -UseBasicParsing -WebSession $web "$baseUrl/product/$slug"
   $csrf = Get-Csrf $product.Content
