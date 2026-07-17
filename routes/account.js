@@ -38,8 +38,34 @@ module.exports = async function accountRoutes(ctx) {
     app.send(res, 200, order ? app.trackPage(url, session, cart, order) : app.trackPage(new URL("/track?notice=Order+not+found.", app.requestOrigin(req)), session, cart));
     return true;
   }
-  if (req.method === "GET" && ["/help", "/contact", "/business", "/faq"].includes(url.pathname)) {
-    app.send(res, 200, app.infoPage(url.pathname.slice(1), session, cart));
+  const infoRoutes = {
+    "/help": "help",
+    "/contact": "contact",
+    "/business": "business",
+    "/faq": "faq",
+    "/shipping-policy": "shipping",
+    "/returns": "returns",
+    "/privacy": "privacy",
+    "/terms": "terms",
+    "/printing-guidelines": "guidelines",
+    "/resources": "resources"
+  };
+  if (req.method === "GET" && infoRoutes[url.pathname]) {
+    app.send(res, 200, app.infoPage(infoRoutes[url.pathname], session, cart, url));
+    return true;
+  }
+  if (req.method === "POST" && url.pathname === "/contact") {
+    if (!app.validCsrf(data, session)) return app.send(res, 403, "Invalid form token", "text/plain"), true;
+    const name = String(data.name || "").trim();
+    const email = String(data.email || "").trim();
+    const phone = String(data.phone || "").trim();
+    const message = String(data.message || "").trim();
+    if (name.length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || phone.length < 7 || message.length < 12) {
+      app.redirect(res, "/contact?notice=" + encodeURIComponent("Please complete every contact field with valid details."));
+      return true;
+    }
+    await app.sendContactEnquiry({ name, email, phone, topic: data.topic, message });
+    app.redirect(res, "/contact?notice=" + encodeURIComponent("Thanks. Your enquiry is with the PrintOasis team."));
     return true;
   }
   if (req.method !== "POST") return false;

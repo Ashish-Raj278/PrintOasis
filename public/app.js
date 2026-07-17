@@ -100,6 +100,54 @@ const showFeedback = (message, type = "success") => {
   feedback.dataset.dismissTimer = String(window.setTimeout(() => dismissFeedback(feedback), 6000));
 };
 
+document.querySelectorAll("[data-copy-value]").forEach(button => {
+  button.addEventListener("click", async () => {
+    const value = button.dataset.copyValue || "";
+    const label = button.dataset.copyLabel || "Value";
+    if (!value) return;
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(value);
+      else {
+        const input = document.createElement("textarea");
+        input.value = value;
+        input.setAttribute("readonly", "");
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.appendChild(input);
+        input.select();
+        document.execCommand("copy");
+        input.remove();
+      }
+      showFeedback(`${label} copied.`);
+    } catch {
+      showFeedback(`Could not copy the ${label.toLowerCase()}.`, "error");
+    }
+  });
+});
+
+document.querySelectorAll(".product-photo img").forEach(image => {
+  const frame = image.closest(".product-photo");
+  if (!frame) return;
+  const finish = () => frame.classList.remove("is-loading");
+  if (image.complete) finish();
+  else {
+    frame.classList.add("is-loading");
+    image.addEventListener("load", finish, { once: true });
+    image.addEventListener("error", finish, { once: true });
+  }
+});
+
+const backToTop = document.createElement("button");
+backToTop.className = "back-to-top";
+backToTop.type = "button";
+backToTop.setAttribute("aria-label", "Back to top");
+backToTop.textContent = "↑";
+document.body.appendChild(backToTop);
+const toggleBackToTop = () => backToTop.classList.toggle("is-visible", window.scrollY > 560);
+window.addEventListener("scroll", toggleBackToTop, { passive: true });
+backToTop.addEventListener("click", () => window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" }));
+toggleBackToTop();
+
 document.querySelectorAll(".notice").forEach(notice => {
   const dismiss = () => notice.remove();
   notice.querySelector(".notice-dismiss")?.addEventListener("click", dismiss);

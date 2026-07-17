@@ -26,7 +26,7 @@ module.exports = async function productRoutes(ctx) {
       res,
       product ? 200 : 404,
       product
-        ? app.productPage(product, session, cart)
+        ? app.productPage(product, session, cart, url)
         : app.layout(
             "Not found",
             `<div class="empty section"><h1>Product not found</h1><a href="/products">Browse products</a></div>`,
