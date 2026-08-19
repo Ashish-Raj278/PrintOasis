@@ -6,7 +6,7 @@ Razorpay-ready checkout and an admin dashboard.
 ## Run
 
 ```powershell
-cd "C:\Users\Ashish\Documents\Codex\2026-06-09\need-to-create-a-print-services\outputs\print-services-site"
+cd PrintOasis
 npm start
 ```
 
@@ -105,7 +105,7 @@ while the client reviews the site. Press `Ctrl+C` to stop sharing.
 Alternatively, from PowerShell:
 
 ```powershell
-cd "C:\Users\Ashish\Documents\Codex\2026-06-09\need-to-create-a-print-services\outputs\print-services-site"
+cd PrintOasis
 npm.cmd run share
 ```
 
