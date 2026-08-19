@@ -3,7 +3,7 @@
 ## Run Locally
 
 ```powershell
-cd "C:\Users\Ashish\Documents\Codex\2026-06-09\need-to-create-a-print-services\outputs\print-services-site"
+cd "C:\Users\Ashish\Documents\Codex\2026-06-09\need-to-create-a-print-services\outputs\PrintOasis-GitHub-Source"
 npm.cmd start
 ```
 
@@ -22,12 +22,12 @@ the client and keep the window open while they review.
 
 ## Upload To GitHub
 
-Upload the `print-services-site` folder as the repository source.
+Upload the `PrintOasis-GitHub-Source` folder as the repository source.
 
 Recommended steps:
 
 ```powershell
-cd "C:\Users\Ashish\Documents\Codex\2026-06-09\need-to-create-a-print-services\outputs\print-services-site"
+cd "C:\Users\Ashish\Documents\Codex\2026-06-09\need-to-create-a-print-services\outputs\PrintOasis-GitHub-Source"
 git init
 git add .
 git commit -m "Initial PrintOasis website"
