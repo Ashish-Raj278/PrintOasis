@@ -4,7 +4,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
 const { URL } = require("node:url");
-const { categories, products: catalogProducts } = require("./catalog");
+const { categories, products: catalogProducts, productPriorities } = require("./catalog");
 const PDFDocument = require("pdfkit");
 const { createEmailService, orderEmailTemplate } = require("./services/email");
 const routes = [
@@ -41,10 +41,17 @@ const ROOT = __dirname;
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(ROOT, "data");
 const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
 const PRODUCT_IMAGE_DIR = path.join(UPLOAD_DIR, "product-images");
+const IMAGE_LIBRARY_DIR = path.join(ROOT, "public", "assets", "images");
+const PRODUCT_IMAGE_LIBRARY_DIR = path.join(IMAGE_LIBRARY_DIR, "products");
+const CATEGORY_IMAGE_LIBRARY_DIR = path.join(IMAGE_LIBRARY_DIR, "categories");
+const HOME_IMAGE_LIBRARY_DIR = path.join(IMAGE_LIBRARY_DIR, "home");
 const EMAIL_LOG_DIR = path.join(DATA_DIR, "email-outbox");
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(PRODUCT_IMAGE_DIR, { recursive: true });
+fs.mkdirSync(PRODUCT_IMAGE_LIBRARY_DIR, { recursive: true });
+fs.mkdirSync(CATEGORY_IMAGE_LIBRARY_DIR, { recursive: true });
+fs.mkdirSync(HOME_IMAGE_LIBRARY_DIR, { recursive: true });
 fs.mkdirSync(EMAIL_LOG_DIR, { recursive: true });
 const emailService = createEmailService({ enabled: EMAIL_DELIVERY_ENABLED, host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE, user: SMTP_USER, pass: SMTP_PASS, from: EMAIL_FROM });
 const db = new DatabaseSync(path.join(DATA_DIR, "store.db"));
@@ -52,6 +59,7 @@ db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
 const ORDER_STATUSES = ["Pending", "Printing", "Packed", "Shipped", "Delivered", "Cancelled"];
 const ALLOWED_ARTWORK_EXTENSIONS = new Set([".pdf", ".png", ".ai", ".psd"]);
 const ALLOWED_IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
+const PREFERRED_IMAGE_EXTENSIONS = [".webp", ".avif", ".jpg", ".jpeg", ".png"];
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_PRODUCT_IMAGE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_SEEDED_STOCK = 1000;
@@ -107,6 +115,22 @@ function initDb() {
       featured INTEGER NOT NULL DEFAULT 0,
       active INTEGER NOT NULL DEFAULT 1
     );
+    CREATE TABLE IF NOT EXISTS product_images (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      product_id INTEGER NOT NULL,
+      image_original_name TEXT NOT NULL,
+      image_stored_name TEXT NOT NULL,
+      image_mime TEXT,
+      image_size INTEGER,
+      role TEXT NOT NULL DEFAULT 'gallery',
+      placement TEXT NOT NULL DEFAULT 'default',
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(product_id, image_stored_name),
+      FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_product_images_product_sort
+      ON product_images(product_id, placement, role, sort_order, id);
     CREATE TABLE IF NOT EXISTS cart_items (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
@@ -260,6 +284,11 @@ function initDb() {
     ["image_mime", "ALTER TABLE products ADD COLUMN image_mime TEXT"],
     ["image_size", "ALTER TABLE products ADD COLUMN image_size INTEGER"]
   ]) if (!productColumns.includes(name)) db.exec(ddl);
+  const productImageColumns = db.prepare("PRAGMA table_info(product_images)").all().map(column => column.name);
+  for (const [name, ddl] of [
+    ["placement", "ALTER TABLE product_images ADD COLUMN placement TEXT NOT NULL DEFAULT 'default'"],
+    ["sort_order", "ALTER TABLE product_images ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"]
+  ]) if (!productImageColumns.includes(name)) db.exec(ddl);
   db.exec("UPDATE products SET reserved = 0 WHERE reserved IS NULL OR reserved < 0");
   db.exec("UPDATE products SET status = CASE WHEN active = 0 THEN 'hidden' ELSE 'active' END WHERE status IS NULL OR status = ''");
   db.exec("UPDATE products SET status = 'hidden' WHERE active = 0 AND status != 'hidden'");
@@ -333,6 +362,7 @@ function initDb() {
   `);
   db.exec("BEGIN");
   try {
+    db.prepare("DELETE FROM products WHERE name = ? OR name LIKE ?").run("Ashish R", "Smoke Poster %");
     for (const product of catalogProducts) upsert.run(...product);
     db.exec("COMMIT");
   } catch (error) {
@@ -352,6 +382,105 @@ const split = value => value.split("|");
 const slugify = value => String(value || "").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 const safeFileName = value => path.basename(String(value || "artwork").replace(/[^a-zA-Z0-9._-]/g, "-"));
 const statusClass = status => slugify(status || "pending");
+const imageMimeType = extension => ({ ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".avif": "image/avif" })[String(extension).toLowerCase()] || "application/octet-stream";
+
+function publicImageUrl(file) {
+  return `/public/assets/images/${file.split(path.sep).join("/").split("/").map(encodeURIComponent).join("/")}`;
+}
+
+function libraryImage(file, stem) {
+  for (const extension of PREFERRED_IMAGE_EXTENSIONS) {
+    const candidate = path.join(file, `${stem}${extension}`);
+    if (fs.existsSync(candidate)) return { url: publicImageUrl(path.relative(IMAGE_LIBRARY_DIR, candidate)), source: "library", name: path.basename(candidate), alt: "" };
+  }
+  return null;
+}
+
+function libraryGalleryImages(product) {
+  const directory = path.join(PRODUCT_IMAGE_LIBRARY_DIR, slugify(product.category), slugify(product.slug));
+  if (!fs.existsSync(directory)) return [];
+  return fs.readdirSync(directory, { withFileTypes: true })
+    .filter(entry => entry.isFile() && PREFERRED_IMAGE_EXTENSIONS.includes(path.extname(entry.name).toLowerCase()))
+    .sort((left, right) => left.name.localeCompare(right.name, "en"))
+    .map(entry => ({
+      name: entry.name,
+      url: publicImageUrl(path.relative(IMAGE_LIBRARY_DIR, path.join(directory, entry.name))),
+      source: "library",
+      alt: ""
+    }));
+}
+
+function productImageRecords(product) {
+  if (!product?.id) return [];
+  if (Array.isArray(product.image_assets)) return product.image_assets;
+  return db.prepare("SELECT * FROM product_images WHERE product_id = ? ORDER BY sort_order, id").all(product.id);
+}
+
+function productImageSet(product) {
+  const libraryDirectory = path.join(PRODUCT_IMAGE_LIBRARY_DIR, slugify(product.category), slugify(product.slug));
+  const records = productImageRecords(product).map(image => ({
+    ...image,
+    name: image.image_stored_name,
+    url: `/uploads/product-images/${encodeURIComponent(image.image_stored_name)}`,
+    source: "upload",
+    alt: ""
+  }));
+  const library = libraryGalleryImages(product);
+  const libraryByStem = new Map(library.map(image => [path.basename(image.name, path.extname(image.name)).toLowerCase(), image]));
+  const recordFor = (role, placement = "default") => records.find(image => image.role === role && image.placement === placement) || records.find(image => image.role === role && image.placement === "default");
+  const legacy = product.image_stored_name ? { name: product.image_stored_name, url: `/uploads/product-images/${encodeURIComponent(product.image_stored_name)}`, source: "legacy", alt: "" } : null;
+  const primary = libraryImage(libraryDirectory, "primary") || recordFor("primary") || legacy || records.find(image => image.role === "gallery") || libraryByStem.get("gallery-01") || library[0] || null;
+  const hover = libraryImage(libraryDirectory, "hover") || recordFor("hover") || primary;
+  const placements = Object.fromEntries(["hero", "card", "featured", "trending", "recommendation", "lifestyle"].map(placement => [
+    placement,
+    libraryImage(libraryDirectory, placement) || recordFor("primary", placement) || recordFor("gallery", placement) || primary
+  ]));
+  const gallery = [primary, ...library, ...records].filter(Boolean).filter((image, index, all) => all.findIndex(candidate => candidate.url === image.url) === index);
+  return { primary, hover, gallery, ...placements };
+}
+
+function categoryImageSet(category) {
+  const directory = path.join(CATEGORY_IMAGE_LIBRARY_DIR, slugify(category));
+  return {
+    hero: libraryImage(directory, "hero"),
+    cover: libraryImage(directory, "cover"),
+    featured: libraryImage(directory, "featured")
+  };
+}
+
+function homeImage(stem, fallback) {
+  return libraryImage(HOME_IMAGE_LIBRARY_DIR, stem)?.url || `/public/${fallback}`;
+}
+
+function addProductImages(productId, images, role = "gallery", placement = "default") {
+  const files = (Array.isArray(images) ? images : [images]).filter(Boolean);
+  if (!files.length) return;
+  let sortOrder = Number(db.prepare("SELECT COALESCE(MAX(sort_order), -1) AS value FROM product_images WHERE product_id = ?").get(productId).value) + 1;
+  const insert = db.prepare("INSERT INTO product_images (product_id,image_original_name,image_stored_name,image_mime,image_size,role,placement,sort_order) VALUES (?,?,?,?,?,?,?,?)");
+  for (const image of files) insert.run(productId, image.original, image.stored, image.mime, image.size, role, placement, sortOrder++);
+}
+
+function attachProductImages(products) {
+  if (!products.length) return products;
+  const ids = products.map(product => product.id).filter(Boolean);
+  if (!ids.length) return products;
+  const rows = db.prepare(`SELECT * FROM product_images WHERE product_id IN (${ids.map(() => "?").join(",")}) ORDER BY sort_order, id`).all(...ids);
+  const byProduct = new Map();
+  for (const row of rows) {
+    const images = byProduct.get(row.product_id) || [];
+    images.push(row);
+    byProduct.set(row.product_id, images);
+  }
+  return products.map(product => ({ ...product, image_assets: byProduct.get(product.id) || [] }));
+}
+const orderProductsByPriority = (products, category) => {
+  const priority = new Map((productPriorities[category] || []).map((slug, index) => [slug, index]));
+  return [...products].sort((left, right) => {
+    const leftPriority = priority.get(left.slug) ?? Number.MAX_SAFE_INTEGER;
+    const rightPriority = priority.get(right.slug) ?? Number.MAX_SAFE_INTEGER;
+    return leftPriority - rightPriority || Number(right.rating || 0) - Number(left.rating || 0) || Number(left.id || 0) - Number(right.id || 0);
+  });
+};
 
 function shippingFee(subtotal, postalCode = "") {
   if (subtotal >= 999) return 0;
@@ -539,10 +668,10 @@ function generateInvoice(orderId) {
 }
 
 function cartData(sessionId) {
-  const items = db.prepare(`
+  const items = attachProductImages(db.prepare(`
     SELECT ci.*, p.slug, p.name, p.color, p.category, p.stock, p.reserved, p.status, p.active FROM cart_items ci
     JOIN products p ON p.id = ci.product_id WHERE ci.session_id = ? ORDER BY ci.id DESC
-  `).all(sessionId);
+  `).all(sessionId));
   return {
     items,
     count: items.reduce((n, item) => n + item.quantity, 0),
@@ -605,7 +734,11 @@ function parseMultipart(buffer, boundary) {
       const name = disposition.match(/name="([^"]+)"/)?.[1];
       const filename = disposition.match(/filename="([^"]*)"/)?.[1];
       const contentType = headers.match(/content-type:\s*([^\r\n]+)/i)?.[1] || "application/octet-stream";
-      if (name && filename) files[name] = { filename, contentType, data: body };
+      if (name && filename) {
+        const file = { filename, contentType, data: body };
+        const existing = files[name];
+        files[name] = existing ? (Array.isArray(existing) ? [...existing, file] : [existing, file]) : file;
+      }
       else if (name) fields[name] = body.toString("utf8");
     }
     start = next;
@@ -645,6 +778,10 @@ function saveProductImage(file) {
   return { original, stored, mime: file.contentType, size: file.data.length };
 }
 
+function saveProductImages(files) {
+  return (Array.isArray(files) ? files : [files]).map(saveProductImage).filter(Boolean);
+}
+
 function notice(url) {
   const value = url.searchParams.get("notice");
   if (!value) return "";
@@ -657,7 +794,7 @@ function emptyState(kind, title, description, primaryHref, primaryLabel, seconda
 }
 
 function nav(session, cart) {
-  const navigationProducts = db.prepare(`SELECT name, slug, category, badge FROM products WHERE ${visibleProductCondition()} ORDER BY name`).all();
+  const navigationProducts = db.prepare(`SELECT id, name, slug, category, badge, rating FROM products WHERE ${visibleProductCondition()}`).all();
   const productsByCategory = new Map();
   for (const product of navigationProducts) {
     const products = productsByCategory.get(product.category) || [];
@@ -668,15 +805,18 @@ function nav(session, cart) {
     slug: category[0],
     name: category[1],
     description: category[2],
-    products: productsByCategory.get(category[0]) || []
+    products: orderProductsByPriority(productsByCategory.get(category[0]) || [], category[0])
   }));
   const megaMenu = (group, allProducts = false) => {
     const menuId = allProducts ? "all-products-menu" : `category-menu-${group.slug}`;
-    const featured = group.products.find(product => /best|popular|premium|new/i.test(product.badge || "")) || group.products[0];
+    const featured = group.products[0];
+    const menuProducts = group.products.slice(0, 6);
     const content = allProducts
-      ? `<div class="mega-menu-grid">${navigationGroups.map(item => `<section><h2><a href="/products?category=${encodeURIComponent(item.slug)}">${esc(item.name)}</a></h2>${item.products.length ? item.products.map(product => `<a href="/product/${encodeURIComponent(product.slug)}">${esc(product.name)}${product.badge ? `<small>${esc(product.badge)}</small>` : ""}</a>`).join("") : `<p class="mega-empty">New products coming soon.</p>`}</section>`).join("")}</div>`
-      : `<div class="mega-category-content"><section class="mega-product-list"><p>${esc(group.description)}</p>${group.products.length ? group.products.map(product => `<a href="/product/${encodeURIComponent(product.slug)}">${esc(product.name)}${product.badge ? `<small>${esc(product.badge)}</small>` : ""}</a>`).join("") : `<p class="mega-empty">New products coming soon.</p>`}</section>${featured ? `<a class="mega-featured-product" href="/product/${encodeURIComponent(featured.slug)}"><span>FEATURED PRODUCT</span><b>${esc(featured.name)}</b><small>${featured.badge ? esc(featured.badge) : "Recommended"}</small><i>Explore &rarr;</i></a>` : ""}</div>`;
-    return `<div class="mega-nav-wrap"><button class="mega-nav-trigger" type="button" data-category="${esc(group.slug)}" aria-expanded="false" aria-haspopup="true" aria-controls="${menuId}">${allProducts ? "All products" : esc(group.name)} <span aria-hidden="true">+</span></button><div class="mega-products-menu" id="${menuId}" role="region" aria-label="${allProducts ? "All products" : esc(group.name)} menu" aria-hidden="true"><div class="mega-menu-heading"><span>${allProducts ? "EXPLORE THE CATALOG" : esc(group.name.toUpperCase())}</span><a href="${allProducts ? "/products" : `/products?category=${encodeURIComponent(group.slug)}`}">${allProducts ? "View all products" : `View all ${esc(group.name)}`} &rarr;</a></div>${content}</div></div>`;
+      ? `<div class="mega-menu-grid">${navigationGroups.map(item => `<section><h2><a href="/products?category=${encodeURIComponent(item.slug)}">${esc(item.name)}</a></h2>${item.products.length ? item.products.slice(0, 3).map(product => `<a href="/product/${encodeURIComponent(product.slug)}">${esc(product.name)}${product.badge ? `<small>${esc(product.badge)}</small>` : ""}</a>`).join("") : `<p class="mega-empty">New products coming soon.</p>`}</section>`).join("")}</div>`
+      : `<div class="mega-category-content"><section class="mega-product-list"><p>${esc(group.description)}</p>${menuProducts.length ? menuProducts.map(product => `<a href="/product/${encodeURIComponent(product.slug)}">${esc(product.name)}${product.badge ? `<small>${esc(product.badge)}</small>` : ""}</a>`).join("") : `<p class="mega-empty">New products coming soon.</p>`}</section>${featured ? `<a class="mega-featured-product" href="/product/${encodeURIComponent(featured.slug)}"><span>FEATURED PRODUCT</span><b>${esc(featured.name)}</b><small>${featured.badge ? esc(featured.badge) : "Recommended"}</small><i>Explore &rarr;</i></a>` : ""}</div>`;
+    const categoryHref = allProducts ? "/products" : `/products?category=${encodeURIComponent(group.slug)}`;
+    const label = allProducts ? "All products" : esc(group.name);
+    return `<div class="mega-nav-wrap"><a class="mega-nav-trigger" href="${categoryHref}" data-category="${esc(group.slug)}">${label}</a><button class="mega-nav-toggle" type="button" aria-label="Show ${label} menu" aria-expanded="false" aria-haspopup="true" aria-controls="${menuId}"><span aria-hidden="true">+</span></button><div class="mega-products-menu" id="${menuId}" role="region" aria-label="${label} menu" aria-hidden="true"><div class="mega-menu-heading"><span>${allProducts ? "SHOP BY CATEGORY" : esc(group.name.toUpperCase())}</span></div>${content}</div></div>`;
   };
   return `
     <div class="promise">Free delivery over ₹999 · Select products ready in 4 hours</div>
@@ -727,9 +867,13 @@ function layout(title, content, session, cart, description = "Custom printing fo
   </body></html>`;
 }
 
-function productArt(product, large = false) {
-  if (product.image_stored_name) {
-    return `<div class="product-photo ${large ? "large" : ""}"><img src="/uploads/product-images/${encodeURIComponent(product.image_stored_name)}" alt="${esc(product.name)} mockup" ${large ? "fetchpriority=high" : 'loading="lazy" decoding="async"'}></div>`;
+function productArt(product, large = false, placement = "card") {
+  const images = productImageSet(product);
+  const primary = images[placement] || images.primary;
+  if (primary) {
+    const hover = images.hover && images.hover.url !== primary.url ? images.hover : null;
+    const loading = large ? "fetchpriority=high" : 'loading="lazy" decoding="async"';
+    return `<div class="product-photo ${large ? "large" : ""}" data-product-image><img class="product-photo-primary" src="${esc(primary.url)}" alt="${esc(product.name)} mockup" width="1200" height="900" ${loading}>${hover ? `<img class="product-photo-hover" src="${esc(hover.url)}" alt="" width="1200" height="900" loading="lazy" decoding="async">` : ""}</div>`;
   }
   const categoryClass = String(product.category || "products").replace(/[^a-z0-9-]/gi, "");
   return `<div class="product-art art-${categoryClass} ${esc(product.color)} ${large ? "large" : ""}" role="img" aria-label="${esc(product.name)} product mockup">
@@ -746,10 +890,10 @@ function highlightSearch(value, query = "") {
   return text.replace(expression, "<mark>$1</mark>");
 }
 
-function productCard(product, searchQuery = "") {
+function productCard(product, searchQuery = "", placement = "card") {
   const available = sellableQuantity(product);
   return `<article class="product-card">
-    <a href="/product/${product.slug}">${productArt(product)}</a>
+    <a href="/product/${product.slug}">${productArt(product, false, placement)}</a>
     <div class="product-meta">${product.badge ? `<span class="badge">${esc(product.badge)}</span>` : ""}<span>★ ${product.rating}</span></div>
     <h3><a href="/product/${product.slug}">${highlightSearch(product.name, searchQuery)}</a></h3>
     <p>From <strong>${money(product.price)}</strong> / ${product.min_qty === 1 ? "piece" : `${product.min_qty} pcs`}${available <= 0 ? ` <span class="stock-note">Out of Stock</span>` : ""}</p>
@@ -757,8 +901,15 @@ function productCard(product, searchQuery = "") {
   </article>`;
 }
 
+function productGallery(product) {
+  const images = productImageSet(product);
+  if (!images.primary) return productArt(product, true, "hero");
+  const gallery = images.gallery.length ? images.gallery : [images.primary];
+  return `<div class="product-gallery-images" data-product-gallery><div class="product-photo large product-gallery-main" data-product-image><img class="product-photo-primary" src="${esc(images.hero?.url || images.primary.url)}" alt="${esc(product.name)} mockup" width="1600" height="1200" fetchpriority="high"></div>${gallery.length > 1 ? `<div class="product-gallery-thumbnails" aria-label="${esc(product.name)} image gallery">${gallery.map((image, index) => `<button type="button" class="${image.url === (images.hero?.url || images.primary.url) ? "is-active" : ""}" data-gallery-image data-image-src="${esc(image.url)}" data-image-alt="${esc(product.name)} product view ${index + 1}" aria-label="View ${esc(product.name)} image ${index + 1}" aria-current="${image.url === (images.hero?.url || images.primary.url) ? "true" : "false"}"><img src="${esc(image.url)}" alt="" width="120" height="90" loading="lazy" decoding="async"></button>`).join("")}</div>` : ""}</div>`;
+}
+
 function homePage(session, cart) {
-  const featured = db.prepare(`SELECT * FROM products WHERE ${visibleProductCondition()} ORDER BY featured DESC, rating DESC LIMIT 8`).all();
+  const featured = attachProductImages(db.prepare(`SELECT * FROM products WHERE ${visibleProductCondition()} ORDER BY featured DESC, rating DESC LIMIT 8`).all());
   const categoryCounts = new Map(db.prepare(`SELECT category, COUNT(*) AS count FROM products WHERE ${visibleProductCondition()} GROUP BY category`).all().map(row => [row.category, row.count]));
   const testimonials = db.prepare(`
     SELECT r.name, r.rating, r.comment, r.verified_purchase, p.name AS product_name
@@ -775,9 +926,9 @@ function homePage(session, cart) {
     categories: categories.length
   };
   const heroSlides = [
-    ["PREMIUM BUSINESS CARDS", "Leave a lasting first impression.", "Exceptionally finished cards with the weight, texture and precision your brand deserves.", "/products?category=business-cards", "Explore Business Cards", "hero-business", "hero-business-cards.png", "Premium PrintOasis business cards on a modern desk"],
-    ["CUSTOM APPAREL", "Wear the work you are proud of.", "Turn team uniforms, event merchandise and everyday ideas into memorable custom apparel.", "/products?category=apparel", "Create Custom Apparel", "hero-apparel", "hero-custom-apparel.png", "PrintOasis branded premium hoodie and apparel"],
-    ["MARKETING MATERIALS", "Make every campaign impossible to miss.", "Posters, flyers, folders and campaign materials, produced with rich colour and a crisp finish.", "/products?category=marketing", "Shop Marketing Prints", "hero-marketing", "hero-marketing-materials.png", "PrintOasis branded marketing materials and presentation folders"]
+    ["PREMIUM BUSINESS CARDS", "Leave a lasting first impression.", "Exceptionally finished cards with the weight, texture and precision your brand deserves.", "/products?category=business-cards", "Explore Business Cards", "hero-business", homeImage("hero-business-cards", "hero-business-cards.png"), "Premium PrintOasis business cards on a modern desk"],
+    ["CUSTOM APPAREL", "Wear the work you are proud of.", "Turn team uniforms, event merchandise and everyday ideas into memorable custom apparel.", "/products?category=apparel", "Create Custom Apparel", "hero-apparel", homeImage("hero-custom-apparel", "hero-custom-apparel.png"), "PrintOasis branded premium hoodie and apparel"],
+    ["MARKETING MATERIALS", "Make every campaign impossible to miss.", "Posters, flyers, folders and campaign materials, produced with rich colour and a crisp finish.", "/products?category=marketing", "Shop Marketing Prints", "hero-marketing", homeImage("hero-marketing-materials", "hero-marketing-materials.png"), "PrintOasis branded marketing materials and presentation folders"]
   ];
   return layout("Online printing made brilliantly simple", `
     <section class="home-hero carousel-shell" data-carousel data-carousel-interval="4000" aria-label="PrintOasis promotions">
@@ -796,7 +947,7 @@ function homePage(session, cart) {
     </section>
     <section class="section tint featured-products reveal-on-scroll" data-product-carousel data-carousel-interval="8000">
       <div class="section-heading"><div><span class="eyebrow">CUSTOMER FAVOURITES</span><h2>Most loved prints</h2></div><a href="/products">View all →</a></div>
-      <div class="product-carousel-viewport"><div class="product-grid product-carousel-track">${featured.map(productCard).join("")}</div></div>
+      <div class="product-carousel-viewport"><div class="product-grid product-carousel-track">${featured.map(product => productCard(product, "", "featured")).join("")}</div></div>
       <div class="product-carousel-controls"><button class="carousel-arrow previous" type="button" aria-label="Previous featured products">&larr;</button><button class="carousel-arrow next" type="button" aria-label="Next featured products">&rarr;</button></div>
     </section>
     <section class="home-testimonials section reveal-on-scroll" data-carousel data-carousel-interval="8000" aria-label="Customer testimonials">
@@ -830,11 +981,15 @@ function productsPage(url, session, cart) {
   if (category) { sql += " AND category = ?"; args.push(category); }
   if (q) { sql += " AND (name LIKE ? OR description LIKE ?)"; args.push(`%${q}%`, `%${q}%`); }
   sql += sort === "price-asc" ? " ORDER BY price ASC, rating DESC" : sort === "price-desc" ? " ORDER BY price DESC, rating DESC" : sort === "newest" ? " ORDER BY id DESC" : " ORDER BY rating DESC, name";
-  const products = db.prepare(sql).all(...args);
+  let products = db.prepare(sql).all(...args);
   const categoryInfo = categories.find(c => c[0] === category);
+  if (categoryInfo && !q && sort === "recommended") products.splice(0, products.length, ...orderProductsByPriority(products, category));
+  products = attachProductImages(products);
   const categoryProduct = products[0];
+  const categoryImages = categoryInfo ? categoryImageSet(category) : null;
+  const whatsappUrl = `https://wa.me/${SUPPORT_PHONE.replace(/\D/g, "")}?text=${encodeURIComponent(`Hello PrintOasis, I would like help with ${categoryInfo ? categoryInfo[1] : "a custom print order"}.`)}`;
   const pageHero = categoryInfo
-    ? `<section class="page-hero compact category-landing category-${esc(category)}"><div><span class="eyebrow">PRINTOASIS COLLECTION</span><h1>${esc(categoryInfo[1])}</h1><p>${esc(categoryInfo[2])}</p><a class="button primary" href="#catalog-results">Explore the collection</a></div><div class="category-landing-art">${categoryProduct ? productArt(categoryProduct) : ""}</div></section>`
+    ? `<section class="page-hero compact category-landing category-${esc(category)}"><div><span class="eyebrow">PRINTOASIS COLLECTION</span><h1>${esc(categoryInfo[1])}</h1><p>${esc(categoryInfo[2])}</p><div class="category-landing-actions"><a class="button primary" href="#catalog-results">Explore the collection</a><a class="button ghost whatsapp-cta" href="${whatsappUrl}" target="_blank" rel="noopener noreferrer">Need a custom quantity? WhatsApp us</a></div></div><div class="category-landing-art">${categoryImages?.hero ? `<div class="product-photo category-cover" data-product-image><img class="product-photo-primary" src="${esc(categoryImages.hero.url)}" alt="${esc(categoryInfo[1])} collection" width="1200" height="675" loading="lazy" decoding="async"></div>` : categoryProduct ? productArt(categoryProduct, false, "hero") : ""}</div></section>`
     : `<section class="page-hero compact"><span class="eyebrow">PRINT SHOP</span><h1>${q ? `Results for “${esc(q)}”` : "All products"}</h1><p>${q ? "Browse professionally finished products for your next idea." : `${products.length} customizable products for work, events and gifting.`}</p></section>`;
   return layout(categoryInfo ? categoryInfo[1] : q ? `Search: ${q}` : "All products", `
     ${pageHero}
@@ -869,14 +1024,14 @@ function productPage(product, session, cart, url) {
     : sellable <= Math.max(product.min_qty, 5)
       ? { kind: "low", label: `Low stock: ${sellable} available` }
       : { kind: "in", label: `In stock: ${sellable} available` };
-  const recommendations = db.prepare(`SELECT * FROM products WHERE category = ? AND id != ? AND ${visibleProductCondition()} ORDER BY rating DESC LIMIT 4`).all(product.category, product.id);
+  const recommendations = attachProductImages(db.prepare(`SELECT * FROM products WHERE category = ? AND id != ? AND ${visibleProductCondition()} ORDER BY rating DESC LIMIT 4`).all(product.category, product.id));
   const wished = session.user ? db.prepare("SELECT id FROM wishlist_items WHERE user_id = ? AND product_id = ?").get(session.user.id, product.id) : null;
   const canReview = session.user ? hasDeliveredPurchase(session.user.id, product.id) : false;
   return layout(product.name, `
     <section class="breadcrumbs"><a href="/">Home</a><span>/</span><a href="/products?category=${product.category}">${esc(categories.find(c => c[0] === product.category)?.[1] || "Products")}</a><span>/</span>${esc(product.name)}</section>
     ${notice(url)}
     <section class="product-detail">
-      <div class="product-gallery">${productArt(product, true)}<div class="quality-note"><b>✓ Free artwork quality check</b><span>We review every file before printing.</span></div></div>
+      <div class="product-gallery">${productGallery(product)}<div class="quality-note"><b>✓ Free artwork quality check</b><span>We review every file before printing.</span></div></div>
       <div class="product-config">
         ${product.badge ? `<span class="badge">${esc(product.badge)}</span>` : ""}<h1>${esc(product.name)}</h1><div class="rating"><span class="rating-stars" aria-label="${product.rating} out of 5 stars">★★★★★</span><span>${product.rating} · ${reviewSummary.count ? `${reviewSummary.count} review${reviewSummary.count === 1 ? "" : "s"}` : "No reviews yet"}</span></div><p class="lead">${esc(product.description)}</p>
         <ul class="feature-list"><li>Low minimum order of ${product.min_qty}</li><li>Rich, calibrated color</li><li>Tracked delivery across India</li></ul>
@@ -931,7 +1086,7 @@ function productPage(product, session, cart, url) {
 }
       </div>
     </section>
-    ${recommendations.length ? `<section class="section tint related-products" data-product-carousel><div class="section-heading"><div><span class="eyebrow">SMART RECOMMENDATIONS</span><h2>Often ordered together</h2></div><a href="/products?category=${encodeURIComponent(product.category)}">View category &rarr;</a></div><div class="product-carousel-viewport"><div class="product-grid product-carousel-track">${recommendations.map(productCard).join("")}</div></div><div class="product-carousel-controls"><button class="carousel-arrow previous" type="button" aria-label="Previous related products">&larr;</button><button class="carousel-arrow next" type="button" aria-label="Next related products">&rarr;</button></div></section>` : ""}
+    ${recommendations.length ? `<section class="section tint related-products" data-product-carousel><div class="section-heading"><div><span class="eyebrow">SMART RECOMMENDATIONS</span><h2>Often ordered together</h2></div><a href="/products?category=${encodeURIComponent(product.category)}">View category &rarr;</a></div><div class="product-carousel-viewport"><div class="product-grid product-carousel-track">${recommendations.map(item => productCard(item, "", "recommendation")).join("")}</div></div><div class="product-carousel-controls"><button class="carousel-arrow previous" type="button" aria-label="Previous related products">&larr;</button><button class="carousel-arrow next" type="button" aria-label="Next related products">&rarr;</button></div></section>` : ""}
   `, session, cart, product.description);
 }
 
@@ -1203,6 +1358,7 @@ function adminDashboardPage(session, cart) {
 function productForm(product, session) {
   const p = product || { id: "", slug: "", name: "", category: categories[0][0], price: 399, min_qty: 1, rating: 4.8, badge: "New", description: "", sizes: "", materials: "", print_options: "", color: "cobalt", stock: 100, reserved: 0, status: "active", featured: 0, active: 1 };
   const available = productAvailable(p);
+  const imageCount = product ? db.prepare("SELECT COUNT(*) AS count FROM product_images WHERE product_id = ?").get(product.id).count : 0;
   return `<form class="admin-form" method="post" action="/admin/products/save" enctype="multipart/form-data">
     <input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="id" value="${esc(p.id)}">
     <label>Product name<input name="name" value="${esc(p.name)}" required></label>
@@ -1213,7 +1369,10 @@ function productForm(product, session) {
     <label>Rating<input name="rating" type="number" min="1" max="5" step="0.1" value="${esc(p.rating)}" required></label>
     <label>Badge<input name="badge" value="${esc(p.badge || "")}"></label>
     <label>Mockup color<select name="color">${["cobalt", "coral", "yellow", "mint", "ink"].map(c => `<option ${p.color === c ? "selected" : ""}>${c}</option>`).join("")}</select></label>
-    <label>Product image <small class="input-help">JPG, PNG or WebP up to 8 MB.</small><input type="file" name="product_image" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"></label>
+    <label>Primary product image <small class="input-help">JPG, PNG or WebP up to 8 MB. Existing single-image products remain supported.</small><input type="file" name="product_image" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"></label>
+    <label>Hover image <small class="input-help">Optional alternate card view.</small><input type="file" name="hover_image" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"></label>
+    <label class="full">Gallery images <small class="input-help">Optional additional angles, details or lifestyle images. ${imageCount ? `${imageCount} additional image${imageCount === 1 ? "" : "s"} already attached.` : ""}</small><input type="file" name="gallery_images" multiple accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"></label>
+    <label>Gallery placement <select name="gallery_placement"><option value="default">Product gallery</option><option value="featured">Featured products</option><option value="trending">Trending products</option><option value="recommendation">Recommendations</option></select><small class="input-help">Applies to newly added gallery images.</small></label>
     <label class="full">Description<textarea name="description" rows="3" required>${esc(p.description)}</textarea></label>
     <label>Sizes <small class="input-help">Separate with |</small><input name="sizes" value="${esc(p.sizes)}" required></label>
     <label>Materials <small class="input-help">Separate with |</small><input name="materials" value="${esc(p.materials)}" required></label>
@@ -1241,13 +1400,13 @@ function adminProductsPage(url, session, cart) {
   if (query) { where.push("(name LIKE ? OR slug LIKE ? OR category LIKE ?)"); params.push(`%${query}%`, `%${query}%`, `%${query}%`); }
   if (status) { where.push("status = ?"); params.push(status); }
   const productSql = `SELECT * FROM products${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY status = 'hidden', category, name`;
-  const products = db.prepare(productSql).all(...params).filter(product => {
+  const products = attachProductImages(db.prepare(productSql).all(...params).filter(product => {
     const available = productAvailable(product);
     if (inventory === "out") return available <= 0;
     if (inventory === "low") return available > 0 && available <= Math.max(5, product.min_qty);
     if (inventory === "in") return available > Math.max(5, product.min_qty);
     return true;
-  });
+  }));
   return adminPage("Product manager", "Products", `
     <div class="section-heading compact-heading"><div><span class="eyebrow">CATALOG CRUD</span><h2>${editing ? `Edit ${esc(editing.name)}` : "Add product"}</h2></div></div>
     ${productForm(editing, session)}
@@ -1374,7 +1533,7 @@ function adminNotificationsPage(session, cart) {
 }
 
 function wishlistPage(session, cart) {
-  const products = db.prepare(`SELECT p.*, w.saved_price FROM wishlist_items w JOIN products p ON p.id = w.product_id WHERE w.user_id = ? AND ${visibleProductCondition("p")} ORDER BY w.id DESC`).all(session.user.id);
+  const products = attachProductImages(db.prepare(`SELECT p.*, w.saved_price FROM wishlist_items w JOIN products p ON p.id = w.product_id WHERE w.user_id = ? AND ${visibleProductCondition("p")} ORDER BY w.id DESC`).all(session.user.id));
   return layout("Wishlist", `<section class="page-hero compact"><span class="eyebrow">SAVED PRINTS</span><h1>Your wishlist</h1><p>Keep client favourites and repeat-order ideas close.</p></section><section class="section wishlist-section">${products.length ? `<div class="product-grid wishlist-grid">${products.map(product => { const available = sellableQuantity(product); const priceChanged = Number(product.price) !== Number(product.saved_price); const priceNote = Number(product.price) < Number(product.saved_price) ? "Price dropped" : Number(product.price) > Number(product.saved_price) ? "Price increased" : "Price unchanged"; const stockKind = available <= 0 ? "out" : available <= Math.max(5, product.min_qty) ? "low" : "in"; const stockNote = stockKind === "out" ? "Out of Stock" : stockKind === "low" ? "Low Stock" : "In Stock"; return `<article class="wishlist-card">${productArt(product)}<div class="wishlist-card-content"><div class="wishlist-card-meta"><span class="wishlist-price-note ${priceChanged ? "changed" : ""}">${esc(priceNote)}</span><span class="stock-state ${stockKind}">${esc(stockNote)}</span></div><h3><a href="/product/${esc(product.slug)}">${esc(product.name)}</a></h3><div class="wishlist-pricing"><strong>${money(product.price)}</strong>${priceChanged ? `<s>${money(product.saved_price)}</s>` : ""}${Number(product.price) < Number(product.saved_price) ? `<small>Save ${money(Number(product.saved_price) - Number(product.price))}</small>` : ""}</div><div class="wishlist-actions"><a class="button ghost" href="/product/${esc(product.slug)}">View product</a><form method="post" action="/wishlist/move-to-cart"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}"><button class="button primary" type="submit" ${available <= 0 ? "disabled" : ""}>Add to cart</button></form><form method="post" action="/wishlist/toggle"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}"><input type="hidden" name="next" value="/wishlist"><button class="button ghost" type="submit" aria-label="Remove ${esc(product.name)} from wishlist">Remove</button></form></div></div></article>`; }).join("")}</div>` : emptyState("wishlist", "Save products for later", "Keep client favourites and repeat-order ideas ready to revisit.", "/products", "Browse products", "/account", "View account")}</section>`, session, cart);
 }
 
@@ -1619,7 +1778,7 @@ function servePublic(req, res, url) {
   const file = path.join(ROOT, url.pathname);
   if (!file.startsWith(path.join(ROOT, "public")) || !fs.existsSync(file)) return send(res, 404, "Not found", "text/plain"), true;
   const ext = path.extname(file);
-  const types = { ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".png": "image/png", ".svg": "image/svg+xml" };
+  const types = { ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".avif": "image/avif", ".svg": "image/svg+xml" };
   send(res, 200, fs.readFileSync(file), types[ext] || "application/octet-stream");
   return true;
 }
@@ -1629,8 +1788,7 @@ function serveProductImage(req, res, url) {
   const file = path.join(PRODUCT_IMAGE_DIR, name);
   if (!file.startsWith(PRODUCT_IMAGE_DIR) || !fs.existsSync(file)) return send(res, 404, "Not found", "text/plain"), true;
   const ext = path.extname(file).toLowerCase();
-  const types = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" };
-  send(res, 200, fs.readFileSync(file), types[ext] || "application/octet-stream");
+  send(res, 200, fs.readFileSync(file), imageMimeType(ext));
   return true;
 }
 
@@ -1641,6 +1799,7 @@ const app = {
   RAZORPAY_KEY_ID,
   RAZORPAY_KEY_SECRET,
   addCartItem,
+  addProductImages,
   accountPage,
   addressesPage,
   adminDashboardPage,
@@ -1685,6 +1844,7 @@ const app = {
   restoreOrderInventory,
   saveArtwork,
   saveProductImage,
+  saveProductImages,
   sendContactEnquiry,
   send,
   sendJson,

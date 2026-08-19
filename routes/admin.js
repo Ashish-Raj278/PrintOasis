@@ -32,6 +32,9 @@ module.exports = async function adminRoutes(ctx) {
 
   if (url.pathname === "/admin/products/save") {
     const image = app.saveProductImage(data.files?.product_image);
+    const hoverImage = app.saveProductImage(data.files?.hover_image);
+    const galleryImages = app.saveProductImages(data.files?.gallery_images);
+    const galleryPlacement = ["default", "featured", "trending", "recommendation"].includes(data.gallery_placement) ? data.gallery_placement : "default";
     const id = Number(data.id || 0);
     const name = String(data.name || "").trim();
     const slug = app.slugify(data.slug || name);
@@ -52,6 +55,7 @@ module.exports = async function adminRoutes(ctx) {
       color: String(data.color || "cobalt").trim(),
       active: data.status === "hidden" ? 0 : 1
     };
+let productId = id;
 if (id) {
   const current = app.db.prepare("SELECT * FROM products WHERE id = ?").get(id);
   if (!current) return app.redirect(res, "/admin/products?notice=Product+not+found."), true;
@@ -81,7 +85,7 @@ if (id) {
       id
     );
 } else {
-  app.db.prepare(`INSERT INTO products (slug,name,category,price,min_qty,rating,badge,description,sizes,materials,print_options,color,stock,reserved,status,featured,active,image_original_name,image_stored_name,image_mime,image_size) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+  const result = app.db.prepare(`INSERT INTO products (slug,name,category,price,min_qty,rating,badge,description,sizes,materials,print_options,color,stock,reserved,status,featured,active,image_original_name,image_stored_name,image_mime,image_size) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(
       values.slug,
       values.name,
@@ -105,7 +109,11 @@ if (id) {
       image?.mime || null,
       image?.size || null
     );
+  productId = Number(result.lastInsertRowid);
 }
+    if (hoverImage) app.db.prepare("DELETE FROM product_images WHERE product_id = ? AND role = 'hover' AND placement = 'default'").run(productId);
+    app.addProductImages(productId, hoverImage, "hover");
+    app.addProductImages(productId, galleryImages, "gallery", galleryPlacement);
     app.redirect(res, "/admin/products?notice=Product+saved.");
     return true;
   }
