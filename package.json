@@ -2,15 +2,17 @@
   "name": "printoasis-print-services",
   "version": "1.0.0",
   "private": true,
-  "description": "PrintOasis full-stack print services storefront with SQLite persistence.",
+  "description": "PrintOasis full-stack print services storefront with PostgreSQL persistence.",
   "scripts": {
     "start": "node server.js",
     "share": "powershell -ExecutionPolicy Bypass -File ./share-preview.ps1",
-    "check": "node --check server.js && node --check services/email.js && node --check public/app.js && node --check routes/auth.js && node --check routes/products.js && node --check routes/cart.js && node --check routes/checkout.js && node --check routes/admin.js && node --check routes/account.js && node --check routes/static.js"
+    "check": "node --check server.js && node --check services/database.js && node --check services/email.js && node --check public/app.js && node --check routes/auth.js && node --check routes/products.js && node --check routes/cart.js && node --check routes/checkout.js && node --check routes/admin.js && node --check routes/account.js && node --check routes/static.js && node --check make-admin.js && node --check scripts/postgres-smoke.js",
+    "db:smoke": "node scripts/postgres-smoke.js"
   },
   "dependencies": {
     "nodemailer": "^9.0.3",
-    "pdfkit": "^0.19.1"
+    "pdfkit": "^0.19.1",
+    "pg": "^8.13.1"
   },
   "engines": {
     "node": ">=22.5.0"

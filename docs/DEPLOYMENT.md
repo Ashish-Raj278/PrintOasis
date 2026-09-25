@@ -10,11 +10,11 @@ The project includes:
 
 - `Dockerfile` - builds the production app with Node.js 24.
 - `render.yaml` - Render Blueprint for a web service.
-- Persistent data path: `/var/data`.
+- Persistent data path: `/var/data` for uploads and email-outbox records.
+- PostgreSQL connection supplied through `DATABASE_URL`.
 - Health check path: `/healthz`.
 
-Render should attach a persistent disk at `/var/data`, because the SQLite
-database stores users, sessions, carts and orders there.
+Render should attach a persistent disk at `/var/data` for uploads and email-outbox records. Users, sessions, carts, orders, and inventory require a separately provisioned PostgreSQL database.
 
 ## Steps
 
@@ -34,7 +34,12 @@ on your laptop staying on.
 
 ## Required Environment Variables
 
-Set these before sharing the production admin link:
+Set these before sharing the production admin link. `DATABASE_URL` is required and must point to the managed PostgreSQL database:
+
+```text
+DATABASE_URL=postgresql://user:password@host:5432/printoasis
+PGSSL=true
+```
 
 ```text
 ADMIN_EMAIL=owner-or-admin@example.com
@@ -51,8 +56,7 @@ SMTP_USER=your-smtp-user
 SMTP_PASS=your-smtp-password
 ```
 
-Uploaded artwork, product images and the SQLite database live under the
-persistent disk path `/var/data`.
+Uploaded artwork, product images, and local email-outbox files live under the persistent disk path `/var/data`. PostgreSQL remains external to that disk.
 
 ## Custom Domain
 

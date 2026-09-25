@@ -9,6 +9,8 @@ GitHub Desktop, or any editor.
   checkout, Google Sign-In callback, Razorpay order creation and verification.
 - `routes/` - request handlers split by area: auth, products, cart, checkout,
   admin, account and static assets.
+- `services/database.js` - PostgreSQL pool, parameter conversion, transactions, health checks, and migration runner.
+- `migrations/001-initial.sql` - idempotent PostgreSQL schema for all application data.
 - `catalog.js` - starter seed catalog only. Use `/admin` to manage live
   products after the database is created.
 - `public/styles.css` - all visual styling and responsive layout.
@@ -37,8 +39,7 @@ The numeric values mean:
 - `100` - minimum order quantity.
 - `4.8` - rating shown on the product card.
 
-Restart the website after editing. The catalog syncs into SQLite automatically
-without deleting customers or existing orders.
+Restart the website after editing. On startup, the catalog syncs into PostgreSQL through the migration-backed database service without deleting customers or existing orders.
 
 ## Routes
 

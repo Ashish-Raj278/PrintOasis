@@ -1,24 +1,13 @@
-const { DatabaseSync } = require("node:sqlite");
-const path = require("path");
+const { createDatabaseFromEnv } = require("./services/database");
 
-const db = new DatabaseSync(path.join(__dirname, "data", "store.db"));
-
-const stmt = db.prepare(`
-UPDATE users
-SET is_admin = 1
-WHERE id = ?
-`);
-
-const result = stmt.run(1);
-
-console.log(result);
-
-const user = db.prepare(`
-SELECT id, name, email, is_admin
-FROM users
-WHERE id = ?
-`).get(1);
-
-console.log(user);
-
-db.close();
+async function main() {
+  const userId = Number(process.env.ADMIN_USER_ID || 1);
+  if (!Number.isInteger(userId) || userId < 1) throw new Error("ADMIN_USER_ID must be a positive integer.");
+  const db = createDatabaseFromEnv();
+  try {
+    const result = await db.run("UPDATE users SET is_admin = 1 WHERE id = ? RETURNING id, name, email, is_admin", userId);
+    if (!result.rows[0]) throw new Error(`User ${userId} was not found.`);
+    console.log(result.rows[0]);
+  } finally { await db.close(); }
+}
+main().catch(error => { console.error(error.message); process.exitCode = 1; });

@@ -6,7 +6,7 @@ PrintOasis is a full-stack commercial-printing storefront for discovering config
 
 The project gives customers a complete print-commerce flow: browse a searchable catalogue, configure products, upload artwork, reserve inventory in a cart, check out with cash on delivery or a configured Razorpay flow, track orders, manage addresses, save a wishlist, and leave verified-purchase reviews.
 
-Administrators use the same application to manage products, images, stock, visibility, coupons, order status, tracking details, and notification history. The application is built with native Node.js HTTP, SQLite, server-side rendered HTML, and modular route handlers.
+Administrators use the same application to manage products, images, stock, visibility, coupons, order status, tracking details, and notification history. The application is built with native Node.js HTTP, PostgreSQL, server-side rendered HTML, and modular route handlers.
 
 ## Demo and Screenshots
 
@@ -34,10 +34,10 @@ Repository screenshots have not been committed yet. Add verified product screens
 | Area | Implementation |
 | --- | --- |
 | HTTP layer | A native Node.js `http` server in `server.js`; no Express dependency. |
-| Rendering | Server-side HTML rendering helpers generate pages from SQLite-backed data. |
+| Rendering | Server-side HTML rendering helpers generate pages from PostgreSQL-backed data. |
 | Routes | Focused modules in `routes/` handle authentication, products, cart, checkout, accounts, admin, and static assets. |
-| Inventory | `available = stock - reserved`; `BEGIN IMMEDIATE` transactions protect reservation, checkout, and restock changes. |
-| Data access | SQLite through Node's built-in `node:sqlite` API with parameterized statements and foreign keys enabled. |
+| Inventory | `available = stock - reserved`; row-locked PostgreSQL transactions protect reservation, checkout, and restock changes. |
+| Data access | PostgreSQL through the official `pg` connection pool with parameterized statements, foreign keys, and explicit transactions. |
 | Security | Password hashing with `scrypt`, HTTP-only session cookies, CSRF tokens, role checks, HTML escaping, safe upload checks, and Razorpay signature verification. |
 | Images | A WebP-first library resolver supports primary, hover, gallery, category, and section-specific images while preserving legacy uploads. |
 
@@ -47,7 +47,7 @@ Repository screenshots have not been committed yet. Add verified product screens
 | --- | --- |
 | Node.js 22.5+ | Application runtime. |
 | Native Node.js HTTP | Request handling and HTTP responses without a web framework. |
-| `node:sqlite` | SQLite persistence for users, products, sessions, carts, orders, coupons, reviews, and related records. |
+| `pg` | PostgreSQL connection-pool persistence for users, products, sessions, carts, orders, coupons, reviews, and related records. |
 | HTML, CSS, JavaScript | Server-rendered UI, responsive styling, and progressive browser interactions. |
 | Server-side rendering | Generates the storefront and admin HTML on the server for every request. |
 | Nodemailer | Optional SMTP delivery for order and contact notifications. |
@@ -62,13 +62,13 @@ flowchart LR
     S --> R[Route modules<br/>routes/]
     R --> G[Session, authorization,<br/>CSRF and validation helpers]
     G --> L[Business logic and<br/>transaction helpers]
-    L --> D[(SQLite<br/>data/store.db)]
+    L --> D[(PostgreSQL<br/>connection pool)]
     L --> V[SSR rendering helpers]
     V --> B
     L --> E[Optional SMTP / Razorpay<br/>configuration]
 ```
 
-`server.js` owns application bootstrap, database initialization, shared helpers, and page-rendering functions. It dispatches requests to route modules. A route validates the request and calls shared business logic; the server queries SQLite, renders HTML, and writes the HTTP response. Static assets and uploaded product images are served by `routes/static.js`.
+`server.js` owns application bootstrap, database initialization, shared helpers, and page-rendering functions. It dispatches requests to route modules. A route validates the request and calls shared business logic; the server queries PostgreSQL, renders HTML, and writes the HTTP response. Static assets and uploaded product images are served by `routes/static.js`.
 
 ## Project Structure
 
@@ -120,7 +120,7 @@ available = stock - reserved
 - Adding to cart reserves quantity without reducing physical `stock`.
 - Increasing or decreasing cart quantity adjusts only the reservation delta.
 - Removing an item, logging out, or expiring a session releases its reservation.
-- `createLocalOrder()` runs inside `BEGIN IMMEDIATE`, creates the order, decrements both `stock` and `reserved`, records order items, applies coupon accounting, and clears the cart atomically.
+- `createLocalOrder()` runs inside one PostgreSQL transaction with `FOR UPDATE` row locks, creates the order, decrements both `stock` and `reserved`, records order items, applies coupon accounting, and clears the cart atomically.
 - Cancelling an order uses `restoreOrderInventory()` and its `inventory_restocked` guard to restore physical stock once.
 
 ### Checkout
@@ -129,13 +129,13 @@ The checkout route requires an authenticated user and a valid CSRF token. It re-
 
 ### Authentication and Sessions
 
-Accounts use `scrypt`-hashed passwords. `sessions` are stored in SQLite and represented by a random, HTTP-only, `SameSite=Lax` cookie. Each session has a CSRF token and a 30-day expiry. `requireAuth()` protects customer pages; `requireAdmin()` additionally checks `users.is_admin` for admin pages. Google sign-in is configuration-dependent and validates the ID token server-side when `GOOGLE_CLIENT_ID` is configured.
+Accounts use `scrypt`-hashed passwords. `sessions` are stored in PostgreSQL and represented by a random, HTTP-only, `SameSite=Lax` cookie. Each session has a CSRF token and a 30-day expiry. `requireAuth()` protects customer pages; `requireAdmin()` additionally checks `users.is_admin` for admin pages. Google sign-in is configuration-dependent and validates the ID token server-side when `GOOGLE_CLIENT_ID` is configured.
 
 ### Security
 
-Current protections include parameterized SQLite statements, enabled foreign keys, escaping for rendered HTML, CSRF validation on protected form submissions, authorization checks, filename/path checks for served or uploaded content, upload allowlists and size limits, HTTP-only session cookies, and Razorpay signature verification.
+Current protections include parameterized PostgreSQL statements, database-enforced foreign keys, escaping for rendered HTML, CSRF validation on protected form submissions, authorization checks, filename/path checks for served or uploaded content, upload allowlists and size limits, HTTP-only session cookies, and Razorpay signature verification.
 
-Current limitations: SQLite-backed sessions and locking are appropriate for this single-instance project but are not a horizontally scaled session store; the repository does not include rate limiting, a full CSP/security-header policy, or an automated security scanner. Live Google, Razorpay, and SMTP use require real provider credentials and production configuration.
+Current limitations: the repository does not yet include operational observability, rate limiting, a full CSP/security-header policy, or an automated security scanner. Live Google, Razorpay, and SMTP use require real provider credentials and production configuration.
 
 ### Orders, Tracking, Reviews, and Coupons
 
@@ -154,7 +154,7 @@ Browser request
   -> server.js creates/loads the session and parses POST data
   -> matching route module handles the URL and method
   -> route checks authentication, authorization, CSRF, and input
-  -> shared helpers run SQLite queries and business rules
+  -> shared helpers run PostgreSQL queries and business rules
   -> SSR helper produces HTML (or a JSON/static response)
   -> native HTTP response returns to the browser
 ```
@@ -171,7 +171,7 @@ Copy-Item .env.example .env
 npm start
 ```
 
-Open `http://localhost:3000`. On first start, the application creates the SQLite database at `data/store.db`, applies its `CREATE TABLE IF NOT EXISTS` schema, and seeds the starter catalogue.
+Create an empty PostgreSQL database, set `DATABASE_URL` in `.env`, then start the application. On first start, PrintOasis validates the connection, applies repeatable SQL migrations from `migrations/`, and seeds the starter catalogue. It fails fast if the URL is missing or PostgreSQL is unreachable.
 
 For local client previews, run:
 
@@ -187,7 +187,10 @@ Copy `.env.example` to `.env`; never commit the resulting `.env` file.
 
 | Variable | Purpose | Required locally? |
 | --- | --- | --- |
-| `BASE_URL`, `PORT`, `DATA_DIR` | Public base URL, port, and runtime-data directory. | `PORT` is optional; the defaults work locally. |
+| `DATABASE_URL` | PostgreSQL connection string used by the application. | Yes. |
+| `PGSSL`, `PGSSL_REJECT_UNAUTHORIZED`, `PGPOOL_MAX`, `PGPOOL_IDLE_TIMEOUT_MS`, `PG_CONNECT_TIMEOUT_MS` | PostgreSQL TLS and pool configuration. | Optional; defaults are supplied. |
+| `TEST_DATABASE_URL` | Isolated PostgreSQL database for `npm run db:smoke`; its Supabase project reference must differ from `DATABASE_URL`. | Required for smoke testing only. |
+| `BASE_URL`, `PORT`, `DATA_DIR` | Public base URL, port, and runtime-data directory for uploads and email outbox. | `PORT` is optional; the defaults work locally. |
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | Initial/admin account configuration. | Change for production. |
 | `EMAIL_DELIVERY_ENABLED`, `EMAIL_FROM` | Enables delivery and defines sender identity. | Optional. |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS` | Nodemailer SMTP configuration. | Optional; otherwise email is logged to the outbox. |
@@ -202,15 +205,15 @@ The repository does not use Jest, Vitest, Cypress, or a CI workflow. Its current
 
 ```powershell
 npm run check
-powershell -ExecutionPolicy Bypass -File .\smoke-test.ps1
-powershell -ExecutionPolicy Bypass -File .\inventory-smoke-test.ps1
+# Set DATABASE_URL and TEST_DATABASE_URL in the process environment first.
+npm run db:smoke
 ```
 
-`npm run check` runs Node syntax checks across the server, routes, email service, and browser JavaScript. The PowerShell smoke scripts start a local test server and exercise customer/order flow and inventory reservation behaviour. `scripts/sprint3-smoke.js` provides additional direct checks for Sprint 3 functionality when run against its configured test server.
+`npm run check` runs Node syntax checks across the server, routes, database service, email service, and browser JavaScript. `npm run db:smoke` starts the application on an ephemeral port and runs the customer, admin, inventory, rollback, and concurrency workflow exclusively against `TEST_DATABASE_URL`. The guard extracts Supabase project references from direct database hosts or Session Pooler usernames and requires the production and test references to differ. Unknown or matching references are rejected. Both variables must be set in the process environment before running the command. The PowerShell smoke entry points delegate to that same isolated workflow.
 
 ## Deployment
 
-The repository includes a [Dockerfile](Dockerfile), [Render Blueprint](render.yaml), and [deployment guide](docs/DEPLOYMENT.md). The included Render configuration mounts `/var/data` for SQLite, uploads, sessions, carts, and email outbox persistence. Configure secrets in the host's environment settings, not in Git.
+The repository includes a [Dockerfile](Dockerfile), [Render Blueprint](render.yaml), and [deployment guide](docs/DEPLOYMENT.md). The included Render configuration mounts `/var/data` for uploads and email-outbox persistence; production also requires a managed PostgreSQL `DATABASE_URL`. Configure secrets in the host's environment settings, not in Git.
 
 Google, Razorpay, and SMTP are implementation-ready but configuration-dependent; this repository does not claim a live payment deployment or a CI/CD pipeline.
 
@@ -219,7 +222,7 @@ Google, Razorpay, and SMTP are implementation-ready but configuration-dependent;
 | Decision | Why it fits this project | Trade-off |
 | --- | --- | --- |
 | Native Node HTTP, not Express | Keeps the request lifecycle explicit and dependency surface small. | More routing and middleware responsibilities are implemented manually. |
-| SQLite | Simple local persistence for a single deployed service and easy developer setup. | Not the long-term choice for high write concurrency or multi-instance deployment. |
+| PostgreSQL with `pg` pooling | Supports durable relational data, transactions, row locking, and a path to production write concurrency. | Requires a separately provisioned database and connection management. |
 | SSR plus vanilla JS | Fast first HTML response, straightforward SEO-friendly markup, and no client framework build step. | UI composition is less componentized than a framework application. |
 | Reserved inventory | Prevents a cart from reducing physical stock while still protecting available quantity. | Requires careful release paths for cart changes, logout, expiry, failure, and cancellation. |
 | Modular routes | Keeps feature request handlers separate while retaining shared rendering/business logic. | `server.js` remains the central application module. |
@@ -230,7 +233,7 @@ Google, Razorpay, and SMTP are implementation-ready but configuration-dependent;
 
 **Configuration-dependent:** live SMTP delivery, Google sign-in, Razorpay payments, public sharing, and hosted deployment require the correct credentials, approved accounts, and environment variables.
 
-**Future / production-scale improvements:** PostgreSQL, Redis, object storage, CDN delivery, background workers, stronger payment idempotency, observability, rate limiting, and CI/CD are not current implementation details.
+**Future / production-scale improvements:** Redis, object storage, CDN delivery, background workers, stronger payment idempotency, observability, rate limiting, and CI/CD are not current implementation details.
 
 ## Documentation
 
@@ -243,4 +246,4 @@ Google, Razorpay, and SMTP are implementation-ready but configuration-dependent;
 
 ## Author / Project
 
-PrintOasis is an interview-ready full-stack print-commerce project maintained as a single Node.js and SQLite application.
+PrintOasis is an interview-ready full-stack print-commerce project maintained as a single Node.js and PostgreSQL application.
