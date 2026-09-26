@@ -12,6 +12,7 @@ The project includes:
 - `render.yaml` - Render Blueprint for a web service.
 - Persistent data path: `/var/data` for uploads and email-outbox records.
 - PostgreSQL connection supplied through `DATABASE_URL`.
+- Redis connection supplied through `REDIS_URL` for shared sessions and rate limits.
 - Health check path: `/healthz`.
 
 Render should attach a persistent disk at `/var/data` for uploads and email-outbox records. Users, sessions, carts, orders, and inventory require a separately provisioned PostgreSQL database.
@@ -39,7 +40,14 @@ Set these before sharing the production admin link. `DATABASE_URL` is required a
 ```text
 DATABASE_URL=postgresql://user:password@host:5432/printoasis
 PGSSL=true
+REDIS_URL=rediss://user:password@managed-redis-host:6380
+REDIS_PREFIX=printoasis
+TRUST_PROXY_HOPS=1
 ```
+
+Redis is required at startup and is included in `/healthz`. Use a managed Redis endpoint with TLS (`rediss://`) in production. Sessions are shared in Redis while PostgreSQL retains the durable session/cart anchor used for reservation cleanup. Rate-limit counters use atomic Redis increments. Never point `TEST_REDIS_URL` at the production Redis endpoint. `TRUST_PROXY_HOPS` defaults to `0`; set it only to the exact number of trusted reverse-proxy hops after ensuring the app cannot be reached around that proxy.
+
+Initial shared rate limits (fixed windows): login 20/IP and 8/IP+account per 15 minutes; registration 10/IP per 15 minutes; Google sign-in 20/IP per 15 minutes; password changes 10/IP and 5/user+IP per 15 minutes; contact 5/IP and tracking 20/IP per 10 minutes; payment 20/IP and 20/user+IP per 10 minutes; cart writes 60/IP and 60/session-or-user+IP per minute; checkout 10/IP and 10/session-or-user+IP per 10 minutes; admin writes 60/IP and 60/user+IP per minute, with product saves/uploads limited to 10/IP and 10/user+IP per 10 minutes. Limit responses are generic `429` responses; Redis failures fail closed with `503`.
 
 ```text
 ADMIN_EMAIL=owner-or-admin@example.com
@@ -57,6 +65,8 @@ SMTP_PASS=your-smtp-password
 ```
 
 Uploaded artwork, product images, and local email-outbox files live under the persistent disk path `/var/data`. PostgreSQL remains external to that disk.
+
+For local development, run a local Redis server and set `REDIS_URL` to it. Tests require a separate `TEST_REDIS_URL` endpoint and use a run-specific `REDIS_PREFIX`; the smoke runner rejects a test endpoint that matches the configured production Redis host and port. The regression runner does not flush Redis databases.
 
 ## Custom Domain
 

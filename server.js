@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { createDatabaseFromEnv, runMigrations, databaseHealth } = require("./services/database");
+const { createRedisService, requestLimitPolicies } = require("./services/redis");
 const { URL } = require("node:url");
 const { categories, products: catalogProducts, productPriorities } = require("./catalog");
 const PDFDocument = require("pdfkit");
@@ -55,6 +56,7 @@ fs.mkdirSync(HOME_IMAGE_LIBRARY_DIR, { recursive: true });
 fs.mkdirSync(EMAIL_LOG_DIR, { recursive: true });
 const emailService = createEmailService({ enabled: EMAIL_DELIVERY_ENABLED, host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE, user: SMTP_USER, pass: SMTP_PASS, from: EMAIL_FROM });
 let db;
+let redis;
 const ORDER_STATUSES = ["Pending", "Printing", "Packed", "Shipped", "Delivered", "Cancelled"];
 const ALLOWED_ARTWORK_EXTENSIONS = new Set([".pdf", ".png", ".ai", ".psd"]);
 const ALLOWED_IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
@@ -63,6 +65,7 @@ const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_PRODUCT_IMAGE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_SEEDED_STOCK = 1000;
 let lastSessionCleanupAt = 0;
+const TRUST_PROXY_HOPS = Number(process.env.TRUST_PROXY_HOPS || 0);
 
 function requestOrigin(req) {
   if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
@@ -98,6 +101,12 @@ async function initDb() {
       `, ...product);
     }
   });
+}
+
+async function initRedis() {
+  if (!Number.isInteger(TRUST_PROXY_HOPS) || TRUST_PROXY_HOPS < 0) throw new Error("TRUST_PROXY_HOPS must be a non-negative integer.");
+  redis = createRedisService();
+  await redis.connect();
 }
 
 
@@ -269,7 +278,10 @@ async function cleanupExpiredSessions(now = Date.now(), force = false) {
   if (!force && now - lastSessionCleanupAt < 60000) return;
   lastSessionCleanupAt = now;
   const expired = await db.all("SELECT id FROM sessions WHERE expires_at <= ?", now);
-  for (const row of expired) await releaseSessionReservations(row.id);
+  for (const row of expired) {
+    await releaseSessionReservations(row.id);
+    await redis.deleteSession(row.id);
+  }
   await db.run("DELETE FROM sessions WHERE expires_at <= ?", now);
 }
 
@@ -294,13 +306,23 @@ function verifyPassword(password, stored) {
 async function getSession(req, res) {
   await cleanupExpiredSessions();
   const cookies = parseCookies(req);
-  let session = cookies.sid && await db.get("SELECT * FROM sessions WHERE id = ? AND expires_at > ?", cookies.sid, Date.now());
-  if (!session && cookies.sid) await cleanupExpiredSessions(Date.now(), true);
+  const now = Date.now();
+  const anchor = cookies.sid && await db.get("SELECT id, expires_at FROM sessions WHERE id = ? AND expires_at > ?", cookies.sid, now);
+  let session = anchor ? await redis.getSession(cookies.sid) : null;
+  if (cookies.sid && (!anchor || !session || Number(session.expires_at) !== Number(anchor.expires_at) || Number(session.expires_at) <= now || session.id !== cookies.sid || typeof session.csrf !== "string")) {
+    if (!anchor) await cleanupExpiredSessions(now, true);
+    await releaseSessionReservations(cookies.sid);
+    await redis.deleteSession(cookies.sid);
+    await db.run("DELETE FROM sessions WHERE id = ?", cookies.sid);
+    session = null;
+  }
   if (!session) {
     const id = crypto.randomBytes(24).toString("hex");
     const csrf = crypto.randomBytes(18).toString("hex");
     const expiresAt = Date.now() + 30 * 86400000;
     await db.run("INSERT INTO sessions (id, csrf, expires_at) VALUES (?, ?, ?)", id, csrf, expiresAt);
+    try { await redis.setSession({ id, user_id: null, csrf, expires_at: expiresAt }); }
+    catch (error) { await db.run("DELETE FROM sessions WHERE id = ?", id); throw error; }
     const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
     const secure = PUBLIC_BASE_URL.startsWith("https://") || forwardedProto === "https" ? "; Secure" : "";
     res.setHeader("Set-Cookie", `sid=${id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${secure}`);
@@ -308,6 +330,36 @@ async function getSession(req, res) {
   }
   const user = session.user_id ? await db.get("SELECT id,name,email,is_admin FROM users WHERE id = ?", session.user_id) : null;
   return { ...session, user };
+}
+async function updateSessionUser(sessionId, userId) {
+  const current = await redis.getSession(sessionId);
+  if (!current) throw new Error("Session is no longer valid.");
+  const previousUserId = current.user_id || null;
+  const next = { ...current, user_id: userId || null };
+  const updated = await db.run("UPDATE sessions SET user_id = ? WHERE id = ? AND expires_at > ?", next.user_id, sessionId, Date.now());
+  if (!updated.changes) throw new Error("Session is no longer valid.");
+  try { await redis.setSession(next); }
+  catch (error) {
+    try { await db.run("UPDATE sessions SET user_id = ? WHERE id = ?", previousUserId, sessionId); } catch {}
+    throw error;
+  }
+}
+
+async function applyRateLimits(policies, res) {
+  try {
+    for (const policy of policies) {
+      const result = await redis.incrementRateLimit(policy);
+      if (!result.allowed) {
+        res.setHeader("Retry-After", String(result.retryAfter));
+        send(res, 429, "Too many requests. Please try again later.", "text/plain; charset=utf-8");
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    send(res, 503, "Service temporarily unavailable. Please try again shortly.", "text/plain; charset=utf-8");
+    return false;
+  }
 }
 function isAdmin(session) {
   return Boolean(session.user && session.user.is_admin);
@@ -1478,6 +1530,9 @@ const app = {
   crypto,
   get db() { return db; },
   databaseHealth,
+  redisHealth: async () => Boolean(redis && await redis.health()),
+  redisService: () => redis,
+  updateSessionUser,
   defaultAddress,
   hashPassword,
   hasDeliveredPurchase,
@@ -1523,9 +1578,11 @@ const server = http.createServer(async (req, res) => {
   try {
     const routedUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     if (await routes[0]({ req, res, url: routedUrl, app })) return;
+    if (!await applyRateLimits(requestLimitPolicies(req, routedUrl.pathname, {}, null, "ip", TRUST_PROXY_HOPS), res)) return;
     const routedSession = await getSession(req, res);
     const routedCart = await cartData(routedSession.id);
     const routedData = req.method === "POST" ? await requestData(req) : {};
+    if (!await applyRateLimits(requestLimitPolicies(req, routedUrl.pathname, routedData, routedSession, "account", TRUST_PROXY_HOPS), res)) return;
     const routedContext = { req, res, url: routedUrl, data: routedData, session: routedSession, cart: routedCart, app };
     for (const route of routes.slice(1)) {
       if (await route(routedContext)) return;
@@ -1533,26 +1590,33 @@ const server = http.createServer(async (req, res) => {
     return send(res, 404, await layout("Page not found", `<section class="not-found section"><div class="not-found-mark" aria-hidden="true"><span>404</span></div><div><span class="eyebrow">PAGE NOT FOUND</span><h1>Looks like this page wasn't printed correctly.</h1><p>The link may have moved, expired or never made it to production. Search the catalog or head back to a fresh start.</p><form class="not-found-search" action="/products" role="search"><label class="sr-only" for="not-found-query">Search PrintOasis products</label><input id="not-found-query" name="q" placeholder="Search cards, flyers, stickers..." required><button class="button primary" type="submit">Search products</button></form><div class="not-found-actions"><a class="button primary" href="/">Return home</a><a class="button ghost" href="/products">Continue shopping</a></div></div></section>`, routedSession, routedCart));
 
   } catch (error) {
-    console.error(error);
+    if (error.code !== "REDIS_UNAVAILABLE") console.error(error);
+    if (res.headersSent) return res.destroy();
+    if (error.code === "REDIS_UNAVAILABLE") return send(res, 503, "Service temporarily unavailable. Please try again shortly.", "text/plain; charset=utf-8");
     send(res, 500, process.env.NODE_ENV === "test" ? error.stack : "Something went wrong. Please try again.", "text/plain");
   }
 });
 
 async function start() {
   try {
+    await initRedis();
     await initDb();
-    if (!await databaseHealth(db)) throw new Error("PostgreSQL health check failed");
+    if (!await databaseHealth(db) || !await redis.health()) throw new Error("Application dependency health check failed.");
     await new Promise((resolve, reject) => {
       server.once("error", reject);
       server.listen(PORT, () => { server.off("error", reject); resolve(); });
     });
     console.log(`PrintOasis running at http://localhost:${PORT}`);
   } catch (error) {
+    if (redis) {
+      try { await redis.close(); } catch {}
+      redis = undefined;
+    }
     if (db) {
       try { await db.close(); } catch (closeError) { console.error("PostgreSQL pool cleanup after startup failure failed:", closeError); }
       db = undefined;
     }
-    console.error("PrintOasis could not start because PostgreSQL is unavailable or migrations failed.", error);
+    console.error("PrintOasis could not start because a required database or shared Redis service is unavailable.", error.code === "REDIS_UNAVAILABLE" ? error.message : error);
     process.exitCode = 1;
     throw error;
   }
@@ -1566,6 +1630,10 @@ async function shutdown(signal) {
   try {
     if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   } finally {
+    if (redis) {
+      await redis.close();
+      redis = undefined;
+    }
     if (db) {
       await db.close();
       db = undefined;

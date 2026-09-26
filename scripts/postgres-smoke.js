@@ -1,27 +1,48 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawn } = require("node:child_process");
 const { assertIsolatedSupabaseTestDatabase } = require("./database-isolation");
+const { assertIsolatedRedisTestConfig } = require("../services/redis");
 const { assertSequentialOversell, runRegression } = require("./postgres-regression");
 let restoredAssertions = 0;
+const smokeSessionIds = new Set();
 
+const envPath = path.join(__dirname, "..", ".env");
+if (fs.existsSync(envPath)) process.loadEnvFile(envPath);
 const testUrl = process.env.TEST_DATABASE_URL;
 if (!testUrl) throw new Error("TEST_DATABASE_URL is required. Refusing to run PostgreSQL smoke tests without an isolated database.");
 assertIsolatedSupabaseTestDatabase({ databaseUrl: process.env.DATABASE_URL, testDatabaseUrl: testUrl });
+const productionDatabaseUrl = process.env.DATABASE_URL;
+const testRedisUrl = process.env.TEST_REDIS_URL;
+if (!testRedisUrl) throw new Error("TEST_REDIS_URL is required. Refusing to run Redis regression tests without an isolated Redis endpoint.");
+assertIsolatedRedisTestConfig({ redisUrl: process.env.REDIS_URL, testRedisUrl });
+const productionRedisUrl = process.env.REDIS_URL;
+const redisTestPrefix = process.env.TEST_REDIS_PREFIX;
+if (!redisTestPrefix || !/^[A-Za-z0-9:_-]{1,80}$/.test(redisTestPrefix)) throw new Error("TEST_REDIS_PREFIX must be configured with a safe test-only namespace.");
+const stamp = Date.now();
 process.env.DATABASE_URL = testUrl;
+process.env.REDIS_URL = testRedisUrl;
+process.env.REDIS_PREFIX = `${redisTestPrefix}:${process.pid}:${stamp}`;
 process.env.NODE_ENV = "test";
 process.env.PORT = "0";
 process.env.ADMIN_EMAIL = "postgres-smoke-admin@example.test";
 process.env.ADMIN_PASSWORD = "PostgresSmokeAdmin123!";
 process.env.EMAIL_DELIVERY_ENABLED = "false";
+process.env.GOOGLE_CLIENT_ID = "printoasis-regression-client";
 
 const { app, server, start, shutdown } = require("../server");
-const stamp = Date.now();
 const prefix = `pg-smoke-${stamp}`;
 let baseUrl = "";
+let sharedServer = null;
+let sharedBaseUrl = "";
 
 function cookieFrom(response) {
   const values = response.headers.getSetCookie ? response.headers.getSetCookie() : [response.headers.get("set-cookie")].filter(Boolean);
-  return values.map(value => value.split(";")[0]).find(value => value.startsWith("sid=")) || "";
+  const cookie = values.map(value => value.split(";")[0]).find(value => value.startsWith("sid=")) || "";
+  if (cookie) smokeSessionIds.add(sessionId(cookie));
+  return cookie;
 }
 function sessionId(cookie) { const match = String(cookie).match(/sid=([^;]+)/); return match ? decodeURIComponent(match[1]) : ""; }
 function csrf(html) {
@@ -36,6 +57,18 @@ async function get(path, cookie = "") {
 async function post(path, form, cookie) {
   const response = await fetch(`${baseUrl}${path}`, { method: "POST", redirect: "manual", headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(form) });
   return { response, html: await response.text(), cookie: cookieFrom(response) || cookie };
+}
+async function withGoogleTokenInfo(profile, work) {
+  const originalFetch = global.fetch;
+  global.fetch = async (input, options) => {
+    const requestUrl = typeof input === "string" ? input : input.url;
+    if (requestUrl.startsWith("https://oauth2.googleapis.com/tokeninfo?")) {
+      return new Response(JSON.stringify(profile), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return originalFetch(input, options);
+  };
+  try { return await work(); }
+  finally { global.fetch = originalFetch; }
 }
 async function register(name, email) {
   const page = await get("/register");
@@ -63,6 +96,41 @@ async function createProduct(adminCookie, slug, stock) {
   assert(product, "Admin-created product should exist.");
   return product;
 }
+async function startSharedServer() {
+  const child = spawn(process.execPath, [path.join(__dirname, "redis-test-server.js")], {
+    env: { ...process.env, PORT: "0", REDIS_TEST_CHILD: "1", PRODUCTION_DATABASE_URL: productionDatabaseUrl, PRODUCTION_REDIS_URL: productionRedisUrl },
+    stdio: ["ignore", "pipe", "ignore"]
+  });
+  sharedServer = child;
+  return new Promise((resolve, reject) => {
+    let output = "";
+    const timeout = setTimeout(() => { child.kill(); reject(new Error("Second app process did not become ready.")); }, 15000);
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", chunk => {
+      output += chunk;
+      const match = output.match(/REDIS_TEST_SERVER_READY:(\d+)/);
+      if (match) { clearTimeout(timeout); sharedBaseUrl = `http://127.0.0.1:${match[1]}`; resolve(); }
+    });
+    child.once("error", () => { clearTimeout(timeout); reject(new Error("Could not launch second app process.")); });
+    child.once("exit", code => { if (!sharedBaseUrl) { clearTimeout(timeout); reject(new Error(`Second app process exited before readiness (${code}).`)); } });
+  });
+}
+async function stopSharedServer() {
+  if (!sharedServer) return;
+  const child = sharedServer;
+  sharedServer = null;
+  if (child.exitCode !== null) return;
+  child.kill("SIGTERM");
+  await new Promise(resolve => { const timeout = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 5000); child.once("exit", () => { clearTimeout(timeout); resolve(); }); });
+}
+async function sharedRequest(pathname, cookie, method = "GET", form = null) {
+  const response = await fetch(`${sharedBaseUrl}${pathname}`, {
+    method,
+    headers: { ...(cookie ? { Cookie: cookie } : {}), ...(form ? { "Content-Type": "application/x-www-form-urlencoded" } : {}) },
+    ...(form ? { body: new URLSearchParams(form), redirect: "manual" } : {})
+  });
+  return { response, html: await response.text(), cookie: cookieFrom(response) || cookie };
+}
 async function cleanup() {
   await app.db.transaction(async tx => {
     const products = await tx.all("SELECT id FROM products WHERE slug LIKE ?", `${prefix}%`);
@@ -84,8 +152,18 @@ async function cleanup() {
       await tx.run(`DELETE FROM users WHERE id IN (${userIds.map(() => "?").join(",")})`, ...userIds);
     }
     await tx.run("DELETE FROM sessions WHERE id LIKE ?", `${prefix}%`);
+    if (smokeSessionIds.size) await tx.run(`DELETE FROM sessions WHERE id IN (${[...smokeSessionIds].map(() => "?").join(",")})`, ...smokeSessionIds);
     await tx.run("DELETE FROM coupons WHERE code LIKE ?", `${prefix.toUpperCase()}%`);
   });
+}
+async function cleanupRedisNamespace() {
+  const client = app.redisService().client;
+  let pending = [];
+  for await (const keys of client.scanIterator({ MATCH: `${process.env.REDIS_PREFIX}:*`, COUNT: 100 })) {
+    pending.push(...keys);
+    if (pending.length >= 100) { await client.del(pending); pending = []; }
+  }
+  if (pending.length) await client.del(pending);
 }
 
 async function main() {
@@ -97,10 +175,60 @@ async function main() {
     const listing = await get("/products"); assert.equal(listing.response.status, 200);
 
     const admin = await login("postgres-smoke-admin@example.test", "PostgresSmokeAdmin123!");
+    await startSharedServer();
     const product = await createProduct(admin, `${prefix}-card`, 2);
     const detail = await get(`/product/${product.slug}`); assert.equal(detail.response.status, 200);
 
+    const googlePage = await get("/login");
+    const googleCsrf = `google-csrf-${stamp}`;
+    const googleCookie = `${googlePage.cookie}; g_csrf_token=${googleCsrf}`;
+    const rejectedGoogle = await post("/auth/google", { csrf: csrf(googlePage.html), g_csrf_token: "mismatched-token", credential: "test-only-token" }, googleCookie);
+    assert.equal(rejectedGoogle.response.status, 303, "Google sign-in rejects a mismatched double-submit CSRF token.");
+    assert.match(rejectedGoogle.response.headers.get("location") || "", /Google%20sign-in%20could%20not%20be%20verified/, "Google CSRF rejection explains the verification failure.");
+    const googleEmail = `${prefix}-google@example.test`;
+    const googleAuth = await withGoogleTokenInfo({ aud: process.env.GOOGLE_CLIENT_ID, email_verified: "true", sub: `${prefix}-google-sub`, email: googleEmail, name: "Google Smoke User" }, () =>
+      post("/auth/google", { csrf: csrf(googlePage.html), g_csrf_token: googleCsrf, credential: "test-only-token" }, googleCookie));
+    assert.equal(googleAuth.response.status, 303, "Verified Google sign-in redirects to the account.");
+    assert(await app.db.get("SELECT id FROM users WHERE email = ? AND google_sub = ?", googleEmail, `${prefix}-google-sub`), "Verified Google profile creates a linked user.");
+    const googleAccount = await get("/account", googleAuth.cookie);
+    assert.match(googleAccount.html, new RegExp(googleEmail), "Google sign-in establishes the authenticated session.");
+    restoredAssertions += 4;
+
     const customer = await register("Postgres Smoke Customer", `${prefix}-customer@example.test`);
+    const sharedCustomer = await register("Redis Shared Session", `${prefix}-shared@example.test`);
+    const sharedAccount = await sharedRequest("/account", sharedCustomer);
+    assert.equal(sharedAccount.response.status, 200, "A second app process must load the Redis-backed authenticated session.");
+    assert.match(sharedAccount.html, new RegExp(`${prefix}-shared@example\\.test`), "Session identity must be shared across app processes.");
+    const sharedCsrf = sharedAccount.html.match(/name="csrf" value="([^"]+)"/)?.[1];
+    assert(sharedCsrf, "Shared account page should contain its session CSRF token.");
+    const rejectedCsrf = await sharedRequest("/logout", sharedCustomer, "POST", { csrf: "incorrect-token" });
+    assert.equal(rejectedCsrf.response.status, 403, "CSRF validation must remain enforced on another app process.");
+    const sharedLogout = await sharedRequest("/logout", sharedCustomer, "POST", { csrf: sharedCsrf });
+    assert.equal(sharedLogout.response.status, 303, "Logout should update the shared Redis session.");
+    const afterLogout = await get("/account", sharedCustomer);
+    assert.equal(afterLogout.response.status, 303, "Logout on one process must be visible to another process.");
+    restoredAssertions += 5;
+
+    await app.redisService().client.disconnect();
+    const unhealthy = await get("/healthz");
+    assert.equal(unhealthy.response.status, 503, "Readiness must fail when Redis is unavailable.");
+    const failClosed = await get("/");
+    assert.equal(failClosed.response.status, 503, "Requests must not fall back to process-local sessions when Redis is unavailable.");
+    await app.redisService().client.connect();
+    restoredAssertions += 2;
+
+    const rateLoginPage = await get("/login");
+    const rateCsrf = csrf(rateLoginPage.html);
+    let lastRateResponse;
+    for (let attempt = 0; attempt < 9; attempt += 1) {
+      const target = attempt % 2 ? sharedRequest : (async (p, c, m, f) => post(p, f, c));
+      const result = await target("/login", rateLoginPage.cookie, "POST", { csrf: rateCsrf, email: `${prefix}-rate@example.test`, password: "not-the-password" });
+      lastRateResponse = result.response;
+      assert.equal(lastRateResponse.status === 429, attempt === 8, "Login account limiting must be shared between app processes.");
+    }
+    assert(lastRateResponse.headers.get("retry-after"), "Rate limit response should include Retry-After.");
+    restoredAssertions += 2;
+
     await addToCart(customer, product, 2);
     let inventory = await app.db.get("SELECT stock, reserved FROM products WHERE id = ?", product.id);
     assert.deepEqual({ stock: Number(inventory.stock), reserved: Number(inventory.reserved) }, { stock: 2, reserved: 2 }, "Cart reservation must not deduct physical stock.");
@@ -173,7 +301,8 @@ async function main() {
     assert.equal(Number(reservedItems.quantity), 1, "Exactly one concurrent reservation should succeed.");
     await app.db.run("UPDATE sessions SET expires_at = 0 WHERE id IN (?, ?)", sessionId(first), sessionId(second));
     // The expired cookie intentionally triggers getSession's forced cleanup path.
-    await get("/", first);
+    const expiredFromSecondProcess = await sharedRequest("/", first);
+    assert.equal(expiredFromSecondProcess.response.status, 200);
     const released = await app.db.get("SELECT reserved FROM products WHERE id = ?", reservationProduct.id);
     assert.equal(Number(released.reserved), 0, "Expired sessions must release reservations.");
 
@@ -183,6 +312,10 @@ async function main() {
     const hiddenPage = await get(`/product/${reservationProduct.slug}`); assert.equal(hiddenPage.response.status, 404, "Hidden products must not be purchasable.");
     restoredAssertions += await runRegression({ app, get, post, csrf, prefix, admin, customer, product, deliveredOrder, register, login, addToCart, sessionId, createProduct });
     console.log(`PASS PostgreSQL smoke: existing PostgreSQL stages plus restored regression assertions (${restoredAssertions}).`);
-  } finally { await cleanup(); await shutdown("postgres smoke"); }
+  } finally {
+    await stopSharedServer();
+    try { await cleanup(); }
+    finally { try { await cleanupRedisNamespace(); } finally { await shutdown("postgres smoke"); } }
+  }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

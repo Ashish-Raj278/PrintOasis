@@ -13,7 +13,7 @@ module.exports = async function authRoutes(ctx) {
     let user = await app.db.get("SELECT * FROM users WHERE google_sub = ? OR email = ?", profile.sub, profile.email.toLowerCase());
     if (user) await app.db.run("UPDATE users SET google_sub = COALESCE(google_sub, ?) WHERE id = ?", profile.sub, user.id);
     else user = (await app.db.run("INSERT INTO users (name,email,password_hash,google_sub) VALUES (?,?,?,?) RETURNING id", profile.name || profile.email.split("@")[0], profile.email.toLowerCase(), app.hashPassword(app.crypto.randomBytes(32).toString("hex")), profile.sub)).rows[0];
-    await app.db.run("UPDATE sessions SET user_id = ? WHERE id = ?", user.id, session.id);
+    await app.updateSessionUser(session.id, user.id);
     app.redirect(res, "/account?notice=Signed+in+with+Google."); return true;
   }
   if (!app.validCsrf(data, session)) return app.send(res, 403, "Invalid form token", "text/plain"), true;
@@ -22,12 +22,12 @@ module.exports = async function authRoutes(ctx) {
     if (name.length < 2 || !email.includes("@") || password.length < 8) { app.redirect(res, `/register?notice=${encodeURIComponent("Please enter valid details. Password must be at least 8 characters.")}`); return true; }
     try {
       const result = await app.db.run("INSERT INTO users (name,email,password_hash) VALUES (?,?,?) RETURNING id", name, email, app.hashPassword(password));
-      await app.db.run("UPDATE sessions SET user_id = ? WHERE id = ?", result.rows[0].id, session.id);
+      await app.updateSessionUser(session.id, result.rows[0].id);
       const next = data.next || "/account"; app.redirect(res, `${next}${next.includes("?") ? "&" : "?"}notice=${encodeURIComponent("Account created successfully.")}`);
     } catch (error) { if (error.code === "23505") app.redirect(res, `/login?notice=${encodeURIComponent("An account with that email already exists.")}`); else throw error; }
     return true;
   }
-  if (url.pathname === "/login") { const user = await app.db.get("SELECT * FROM users WHERE email = ?", (data.email || "").trim().toLowerCase()); if (!user || !app.verifyPassword(data.password || "", user.password_hash)) { app.redirect(res, `/login?notice=${encodeURIComponent("Email or password is incorrect.")}&next=${encodeURIComponent(data.next || "/account")}`); return true; } await app.db.run("UPDATE sessions SET user_id = ? WHERE id = ?", user.id, session.id); const next = data.next || "/account"; app.redirect(res, `${next}${next.includes("?") ? "&" : "?"}notice=${encodeURIComponent("Welcome back.")}`); return true; }
-  if (url.pathname === "/logout") { await app.releaseSessionReservations(session.id); await app.db.run("UPDATE sessions SET user_id = NULL WHERE id = ?", session.id); app.redirect(res, `/?notice=${encodeURIComponent("You have been logged out.")}`); return true; }
+  if (url.pathname === "/login") { const user = await app.db.get("SELECT * FROM users WHERE email = ?", (data.email || "").trim().toLowerCase()); if (!user || !app.verifyPassword(data.password || "", user.password_hash)) { app.redirect(res, `/login?notice=${encodeURIComponent("Email or password is incorrect.")}&next=${encodeURIComponent(data.next || "/account")}`); return true; } await app.updateSessionUser(session.id, user.id); const next = data.next || "/account"; app.redirect(res, `${next}${next.includes("?") ? "&" : "?"}notice=${encodeURIComponent("Welcome back.")}`); return true; }
+  if (url.pathname === "/logout") { await app.releaseSessionReservations(session.id); await app.updateSessionUser(session.id, null); app.redirect(res, `/?notice=${encodeURIComponent("You have been logged out.")}`); return true; }
   return false;
 };

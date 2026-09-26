@@ -6,13 +6,15 @@
   "scripts": {
     "start": "node server.js",
     "share": "powershell -ExecutionPolicy Bypass -File ./share-preview.ps1",
-    "check": "node --check server.js && node --check services/database.js && node --check services/email.js && node --check public/app.js && node --check routes/auth.js && node --check routes/products.js && node --check routes/cart.js && node --check routes/checkout.js && node --check routes/admin.js && node --check routes/account.js && node --check routes/static.js && node --check make-admin.js && node --check scripts/postgres-smoke.js",
-    "db:smoke": "node scripts/postgres-smoke.js"
+    "check": "node --check server.js && node --check services/database.js && node --check services/redis.js && node --check services/email.js && node --check public/app.js && node --check routes/auth.js && node --check routes/products.js && node --check routes/cart.js && node --check routes/checkout.js && node --check routes/admin.js && node --check routes/account.js && node --check routes/static.js && node --check make-admin.js && node --check scripts/postgres-smoke.js && node --check scripts/redis-regression.js && node --check scripts/redis-test-server.js",
+    "db:smoke": "node scripts/postgres-smoke.js",
+    "redis:smoke": "node scripts/redis-regression.js"
   },
   "dependencies": {
     "nodemailer": "^9.0.3",
     "pdfkit": "^0.19.1",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "redis": "^6.2.1"
   },
   "engines": {
     "node": ">=22.5.0"

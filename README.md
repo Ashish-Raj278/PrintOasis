@@ -38,7 +38,7 @@ Repository screenshots have not been committed yet. Add verified product screens
 | Routes | Focused modules in `routes/` handle authentication, products, cart, checkout, accounts, admin, and static assets. |
 | Inventory | `available = stock - reserved`; row-locked PostgreSQL transactions protect reservation, checkout, and restock changes. |
 | Data access | PostgreSQL through the official `pg` connection pool with parameterized statements, foreign keys, and explicit transactions. |
-| Security | Password hashing with `scrypt`, HTTP-only session cookies, CSRF tokens, role checks, HTML escaping, safe upload checks, and Razorpay signature verification. |
+| Security | Password hashing with `scrypt`, Redis-shared HTTP-only sessions, atomic Redis rate limits, CSRF tokens, role checks, HTML escaping, safe upload checks, and Razorpay signature verification. |
 | Images | A WebP-first library resolver supports primary, hover, gallery, category, and section-specific images while preserving legacy uploads. |
 
 ## Tech Stack
@@ -47,7 +47,8 @@ Repository screenshots have not been committed yet. Add verified product screens
 | --- | --- |
 | Node.js 22.5+ | Application runtime. |
 | Native Node.js HTTP | Request handling and HTTP responses without a web framework. |
-| `pg` | PostgreSQL connection-pool persistence for users, products, sessions, carts, orders, coupons, reviews, and related records. |
+| `pg` | PostgreSQL connection-pool persistence for business data and durable session/cart lifecycle anchors. |
+| `redis` | Shared canonical session payloads and atomic fixed-window rate-limit counters. |
 | HTML, CSS, JavaScript | Server-rendered UI, responsive styling, and progressive browser interactions. |
 | Server-side rendering | Generates the storefront and admin HTML on the server for every request. |
 | Nodemailer | Optional SMTP delivery for order and contact notifications. |
@@ -129,13 +130,13 @@ The checkout route requires an authenticated user and a valid CSRF token. It re-
 
 ### Authentication and Sessions
 
-Accounts use `scrypt`-hashed passwords. `sessions` are stored in PostgreSQL and represented by a random, HTTP-only, `SameSite=Lax` cookie. Each session has a CSRF token and a 30-day expiry. `requireAuth()` protects customer pages; `requireAdmin()` additionally checks `users.is_admin` for admin pages. Google sign-in is configuration-dependent and validates the ID token server-side when `GOOGLE_CLIENT_ID` is configured.
+Accounts use `scrypt`-hashed passwords. A random, HTTP-only, `SameSite=Lax` `sid` cookie identifies a canonical session payload in Redis; PostgreSQL retains the durable session row referenced by carts and reservation cleanup. Sessions carry a CSRF token and 30-day expiry. `requireAuth()` protects customer pages; `requireAdmin()` additionally checks `users.is_admin` for admin pages. Google sign-in is configuration-dependent and validates the ID token server-side when `GOOGLE_CLIENT_ID` is configured.
 
 ### Security
 
-Current protections include parameterized PostgreSQL statements, database-enforced foreign keys, escaping for rendered HTML, CSRF validation on protected form submissions, authorization checks, filename/path checks for served or uploaded content, upload allowlists and size limits, HTTP-only session cookies, and Razorpay signature verification.
+Current protections include parameterized PostgreSQL statements, database-enforced foreign keys, escaping for rendered HTML, CSRF validation on protected form submissions, authorization checks, filename/path checks for served or uploaded content, upload allowlists and size limits, HTTP-only session cookies, shared Redis rate limits, and Razorpay signature verification.
 
-Current limitations: the repository does not yet include operational observability, rate limiting, a full CSP/security-header policy, or an automated security scanner. Live Google, Razorpay, and SMTP use require real provider credentials and production configuration.
+Current limitations: the repository does not yet include operational observability, a full CSP/security-header policy, or an automated security scanner. Live Google, Razorpay, SMTP, PostgreSQL, and Redis use require provider configuration and credentials.
 
 ### Orders, Tracking, Reviews, and Coupons
 
@@ -188,8 +189,13 @@ Copy `.env.example` to `.env`; never commit the resulting `.env` file.
 | Variable | Purpose | Required locally? |
 | --- | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection string used by the application. | Yes. |
+| `REDIS_URL` | Redis connection for shared sessions and rate limits (`rediss://` enables TLS). | Yes. |
+| `REDIS_PREFIX` | Namespace for this app’s session and rate-limit keys. | Optional; defaults to `printoasis`. |
+| `REDIS_CONNECT_TIMEOUT_MS` | Redis connection timeout. | Optional. |
+| `TRUST_PROXY_HOPS` | Exact trusted proxy hop count used when deriving client IPs; `0` ignores forwarded IP headers. | Optional; defaults to `0`. |
 | `PGSSL`, `PGSSL_REJECT_UNAUTHORIZED`, `PGPOOL_MAX`, `PGPOOL_IDLE_TIMEOUT_MS`, `PG_CONNECT_TIMEOUT_MS` | PostgreSQL TLS and pool configuration. | Optional; defaults are supplied. |
 | `TEST_DATABASE_URL` | Isolated PostgreSQL database for `npm run db:smoke`; its Supabase project reference must differ from `DATABASE_URL`. | Required for smoke testing only. |
+| `TEST_REDIS_URL`, `TEST_REDIS_PREFIX` | Separate Redis endpoint and test namespace used by smoke/regression checks. | Required for Redis tests; endpoint must differ from production Redis. |
 | `BASE_URL`, `PORT`, `DATA_DIR` | Public base URL, port, and runtime-data directory for uploads and email outbox. | `PORT` is optional; the defaults work locally. |
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | Initial/admin account configuration. | Change for production. |
 | `EMAIL_DELIVERY_ENABLED`, `EMAIL_FROM` | Enables delivery and defines sender identity. | Optional. |
@@ -209,7 +215,7 @@ npm run check
 npm run db:smoke
 ```
 
-`npm run check` runs Node syntax checks across the server, routes, database service, email service, and browser JavaScript. `npm run db:smoke` starts the application on an ephemeral port and runs the customer, admin, inventory, rollback, and concurrency workflow exclusively against `TEST_DATABASE_URL`. The guard extracts Supabase project references from direct database hosts or Session Pooler usernames and requires the production and test references to differ. Unknown or matching references are rejected. Both variables must be set in the process environment before running the command. The PowerShell smoke entry points delegate to that same isolated workflow.
+`npm run check` runs Node syntax checks across the server, services, routes, and browser JavaScript. `npm run db:smoke` runs customer/admin/inventory and Redis-session/rate-limit workflows against `TEST_DATABASE_URL` and `TEST_REDIS_URL`; both test endpoints are checked for separation from production configuration. `npm run redis:smoke` runs the isolated Redis service checks. No smoke runner flushes a Redis database. The PowerShell smoke entry points delegate to the PostgreSQL/Redis-isolated workflow.
 
 ## Deployment
 
@@ -229,11 +235,11 @@ Google, Razorpay, and SMTP are implementation-ready but configuration-dependent;
 
 ## Current Status
 
-**Implemented:** the core print-commerce storefront, admin workflow, reservation-based inventory, checkout and COD, configured Razorpay integration path, order tracking, reviews, coupons, image-library infrastructure, trust/support pages, Docker/Render configuration, and local smoke checks.
+**Implemented:** the core print-commerce storefront, admin workflow, reservation-based inventory, checkout and COD, configured Razorpay integration path, order tracking, reviews, coupons, image-library infrastructure, Redis-shared sessions and rate limits, trust/support pages, Docker/Render configuration, and isolated smoke checks.
 
 **Configuration-dependent:** live SMTP delivery, Google sign-in, Razorpay payments, public sharing, and hosted deployment require the correct credentials, approved accounts, and environment variables.
 
-**Future / production-scale improvements:** Redis, object storage, CDN delivery, background workers, stronger payment idempotency, observability, rate limiting, and CI/CD are not current implementation details.
+**Future / production-scale improvements:** object storage, CDN delivery, background workers, stronger payment idempotency, observability, and CI/CD remain future work.
 
 ## Documentation
 
