@@ -26,7 +26,7 @@ function createRefundService({ db, createProviderRefund, lookupProviderRefund, l
     return true;
   }
 
-  async function completeCancellationTx(tx, orderId) {
+  async function completeCancellationTx(tx, orderId, actor = {}) {
     const order = await tx.get("SELECT * FROM orders WHERE id=? FOR UPDATE", orderId);
     if (!order) throw refundError("ORDER_NOT_FOUND", "Order was not found.");
     if (order.status === "Cancelled") return false;
@@ -42,7 +42,10 @@ function createRefundService({ db, createProviderRefund, lookupProviderRefund, l
     await restoreInventoryTx(tx, orderId);
     await tx.run(`UPDATE orders SET status='Cancelled',inventory_restocked=1,cancellation_status='completed',
       status_updated_at=CURRENT_TIMESTAMP WHERE id=?`, orderId);
-    await tx.run("INSERT INTO order_status_events (order_id,status,note) VALUES (?,'Cancelled',?)", orderId, "Order cancelled after the required payment/inventory checks.");
+    const actorType = ["system", "customer", "admin", "payment", "refund"].includes(actor.actorType) ? actor.actorType : "system";
+    const actorId = Number.isSafeInteger(Number(actor.actorId)) && Number(actor.actorId) > 0 ? Number(actor.actorId) : null;
+    await tx.run(`INSERT INTO order_status_events (order_id,status,previous_status,actor_type,actor_id,note)
+      VALUES (?,'Cancelled',?,?,?,?)`, orderId, order.status, actorType, actorId, "Order cancelled after the required payment/inventory checks.");
     return true;
   }
 
@@ -57,7 +60,7 @@ function createRefundService({ db, createProviderRefund, lookupProviderRefund, l
       const pending = Number((await tx.get("SELECT COALESCE(SUM(amount_minor),0) AS amount FROM refunds WHERE payment_record_id=? AND status IN ('requested','pending','unknown')", payment.id)).amount);
       if (pending > 0) return false;
       await tx.run("UPDATE orders SET cancellation_status='refunded' WHERE id=?", order.id);
-      return completeCancellationTx(tx, order.id);
+      return completeCancellationTx(tx, order.id, { actorType: "refund" });
     });
     if (changed && onCancelled) await onCancelled(orderId);
     return changed;
@@ -214,7 +217,7 @@ function createRefundService({ db, createProviderRefund, lookupProviderRefund, l
     return result;
   }
 
-  async function cancelOrder(orderId, { providerCreate = createProviderRefund } = {}) {
+  async function cancelOrder(orderId, { providerCreate = createProviderRefund, actor = {} } = {}) {
     const decision = await db.transaction(async tx => {
       const order = await tx.get("SELECT * FROM orders WHERE id=? FOR UPDATE", orderId);
       if (!order) throw refundError("ORDER_NOT_FOUND", "Order was not found.");
@@ -222,7 +225,7 @@ function createRefundService({ db, createProviderRefund, lookupProviderRefund, l
       if (order.status === "Cancelled") return { status: "completed", reused: true };
       const payment = order.payment_record_id ? await tx.get("SELECT * FROM payments WHERE id=? FOR UPDATE", order.payment_record_id) : null;
       if (order.payment_method !== "razorpay" || (payment && ["pending", "failed"].includes(payment.status))) {
-        await completeCancellationTx(tx, orderId);
+        await completeCancellationTx(tx, orderId, actor);
         return { status: "completed", reused: false };
       }
       if (!payment) throw refundError("ORDER_CANCELLATION_PAYMENT_UNCERTAIN", "The online payment relationship must be reviewed before cancellation.");
@@ -237,7 +240,7 @@ function createRefundService({ db, createProviderRefund, lookupProviderRefund, l
       const remaining = captured - succeeded;
       if (remaining <= 0) {
         await tx.run("UPDATE orders SET cancellation_status='refunded' WHERE id=?", orderId);
-        await completeCancellationTx(tx, orderId);
+        await completeCancellationTx(tx, orderId, actor);
         return { status: "completed", reused: false };
       }
       return { status: "refund_required", payment_record_id: payment.id, payment_id: payment.provider_payment_id,
@@ -254,7 +257,7 @@ function createRefundService({ db, createProviderRefund, lookupProviderRefund, l
     if (refund.status === "succeeded") {
       const completed = await db.transaction(async tx => {
         await tx.run("UPDATE orders SET cancellation_status='refunded' WHERE id=? AND status<>'Cancelled'", orderId);
-        return completeCancellationTx(tx, orderId);
+        return completeCancellationTx(tx, orderId, actor);
       });
       if (completed && onCancelled) await onCancelled(orderId);
       return { status: "completed", refund };

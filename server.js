@@ -46,6 +46,15 @@ const EMAIL_FROM = process.env.EMAIL_FROM || "orders@printoasis.example";
 const SUPPORT_EMAIL = (process.env.SUPPORT_EMAIL || "hello@printoasis.in").trim();
 const SUPPORT_PHONE = (process.env.SUPPORT_PHONE || "+91 80 4567 8900").trim();
 const OFFICE_ADDRESS = (process.env.OFFICE_ADDRESS || "Bengaluru, Karnataka, India").trim();
+const SELLER_LEGAL_NAME = String(process.env.SELLER_LEGAL_NAME || "").trim();
+const SELLER_REGISTERED_ADDRESS = String(process.env.SELLER_REGISTERED_ADDRESS || "").trim();
+const SELLER_GSTIN = String(process.env.SELLER_GSTIN || "").trim();
+function parseGstRateBps(value = process.env.GST_RATE_BPS) {
+  const raw = value == null || value === "" ? "1800" : String(value).trim();
+  if (!/^\d{1,6}$/.test(raw) || Number(raw) > 100000) throw new Error("GST_RATE_BPS must be an integer from 0 to 100000.");
+  return Number(raw);
+}
+const GST_RATE_BPS = parseGstRateBps();
 const SMTP_HOST = process.env.SMTP_HOST || "";
 const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_USER = process.env.SMTP_USER || "";
@@ -177,6 +186,7 @@ async function initRedis() {
 
 const esc = (value = "") => String(value).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const money = value => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(value);
+const moneyMinor = value => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Number(value) / 100);
 const parseCookies = req => Object.fromEntries((req.headers.cookie || "").split(";").filter(Boolean).map(part => {
   const i = part.indexOf("=");
   return [part.slice(0, i).trim(), decodeURIComponent(part.slice(i + 1))];
@@ -284,6 +294,71 @@ function shippingFee(subtotal, postalCode = "") {
   return /^(11|40|41|56|57|60|70)/.test(pin) ? 99 : 149;
 }
 
+function sellerInvoiceSnapshot() {
+  return {
+    legal_name: SELLER_LEGAL_NAME,
+    registered_address: SELLER_REGISTERED_ADDRESS,
+    gstin: SELLER_GSTIN,
+    support_email: SUPPORT_EMAIL,
+    support_phone: SUPPORT_PHONE
+  };
+}
+
+function createInvoiceSnapshot({ subtotalMinor, discountMinor, shippingMinor, totalMinor, taxRateBps = GST_RATE_BPS, seller = sellerInvoiceSnapshot() }) {
+  const amounts = [subtotalMinor, discountMinor, shippingMinor, totalMinor].map(Number);
+  const rate = Number(taxRateBps);
+  if (!amounts.every(Number.isSafeInteger) || amounts.some(value => value < 0) ||
+      !Number.isSafeInteger(rate) || rate < 0 || rate > 100000) {
+    throw new Error("Invoice amounts or GST rate are invalid.");
+  }
+  const [subtotal, discount, shipping, total] = amounts;
+  if (subtotal - discount + shipping !== total || discount > subtotal) throw new Error("Invoice amounts do not reconcile to the order total.");
+  const divisor = BigInt(10000 + rate);
+  const gross = BigInt(total);
+  const taxable = (gross * 10000n + divisor / 2n) / divisor;
+  const tax = gross - taxable;
+  return {
+    version: 1,
+    currency: "INR",
+    tax_rate_bps: rate,
+    tax_inclusive: true,
+    shipping_tax_treatment: "included_in_aggregate_taxable_value",
+    subtotal_minor: subtotal,
+    discount_minor: discount,
+    shipping_minor: shipping,
+    taxable_minor: Number(taxable),
+    tax_minor: Number(tax),
+    total_minor: total,
+    seller: {
+      legal_name: String(seller?.legal_name || "").trim(),
+      registered_address: String(seller?.registered_address || "").trim(),
+      gstin: String(seller?.gstin || "").trim(),
+      support_email: String(seller?.support_email || "").trim(),
+      support_phone: String(seller?.support_phone || "").trim()
+    }
+  };
+}
+
+function orderInvoiceSnapshot(order) {
+  const saved = order.invoice_snapshot;
+  if (saved) {
+    const parsed = typeof saved === "string" ? JSON.parse(saved) : saved;
+    return parsed;
+  }
+  const totalMinor = Math.round(Number(order.total) * 100);
+  const shippingMinor = Math.round(Number(order.shipping_fee || 0) * 100);
+  const discountMinor = Math.round(Number(order.discount || 0) * 100);
+  const subtotalMinor = totalMinor - shippingMinor + discountMinor;
+  const taxableMinor = Math.round(Number(order.total) / 1.18) * 100;
+  return {
+    version: 1, currency: "INR", tax_rate_bps: 1800, tax_inclusive: true,
+    shipping_tax_treatment: "included_in_aggregate_taxable_value",
+    subtotal_minor: subtotalMinor, discount_minor: discountMinor, shipping_minor: shippingMinor,
+    taxable_minor: taxableMinor, tax_minor: totalMinor - taxableMinor, total_minor: totalMinor,
+    seller: { legal_name: "", registered_address: "", gstin: "", support_email: "", support_phone: "" }
+  };
+}
+
 async function couponValidation(code, subtotal, executor = db) {
   const normalized = String(code || "").trim().toUpperCase();
   if (!normalized) return { coupon: null, error: "" };
@@ -322,6 +397,44 @@ async function hasDeliveredPurchase(userId, productId) {
   return Boolean(await db.get(`SELECT 1 FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.user_id = ? AND oi.product_id = ? AND o.status = 'Delivered' LIMIT 1`, userId, productId));
 }
 async function defaultAddress(userId) { return db.get("SELECT * FROM addresses WHERE user_id = ? ORDER BY is_default DESC, id DESC LIMIT 1", userId); }
+
+async function transitionOrderStatus(orderId, requestedStatus, shipment = {}, actor = {}) {
+  if (!ORDER_STATUSES.includes(requestedStatus) || requestedStatus === "Cancelled") {
+    throw Object.assign(new Error("Requested order status is invalid."), { code: "ORDER_STATUS_INVALID" });
+  }
+  const nextByCurrent = { Pending: ["Printing"], Printing: ["Packed"], Packed: ["Shipped"], Shipped: ["Delivered"], Delivered: [], Cancelled: [] };
+  return db.transaction(async tx => {
+    const order = await tx.get("SELECT * FROM orders WHERE id=? FOR UPDATE", orderId);
+    if (!order) throw Object.assign(new Error("Order was not found."), { code: "ORDER_NOT_FOUND" });
+    const sameStatus = order.status === requestedStatus;
+    if (!sameStatus && !nextByCurrent[order.status]?.includes(requestedStatus)) {
+      throw Object.assign(new Error(`Order cannot move from ${order.status} to ${requestedStatus}.`), { code: "ORDER_TRANSITION_INVALID" });
+    }
+    if (!sameStatus && order.payment_method !== "cod") {
+      const payment = order.payment_record_id && await tx.get("SELECT status FROM payments WHERE id=? FOR UPDATE", order.payment_record_id);
+      if (!payment || !["captured", "partially_refunded"].includes(payment.status)) {
+        throw Object.assign(new Error("Online payment must be captured before fulfillment can advance."), { code: "ORDER_PAYMENT_NOT_SETTLED" });
+      }
+    }
+    const note = String(shipment.note || "").trim().slice(0, 400) || null;
+    const actorType = ["system", "customer", "admin", "payment", "refund"].includes(actor.actorType) ? actor.actorType : "system";
+    const actorId = Number.isSafeInteger(Number(actor.actorId)) && Number(actor.actorId) > 0 ? Number(actor.actorId) : null;
+    await tx.run(`UPDATE orders SET status=?,tracking_number=COALESCE(?,tracking_number),courier_name=COALESCE(?,courier_name),
+      tracking_url=COALESCE(?,tracking_url),estimated_delivery=COALESCE(?,estimated_delivery),
+      shipped_at=CASE WHEN ?='Shipped' THEN COALESCE(shipped_at,CURRENT_TIMESTAMP) ELSE shipped_at END,
+      status_updated_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE status_updated_at END WHERE id=?`,
+    requestedStatus, String(shipment.trackingNumber || "").trim().slice(0, 80) || null,
+    String(shipment.courierName || "").trim().slice(0, 80) || null,
+    String(shipment.trackingUrl || "").trim().slice(0, 500) || null,
+    String(shipment.estimatedDelivery || "").trim().slice(0, 40) || null,
+    requestedStatus, !sameStatus, orderId);
+    if (!sameStatus) {
+      await tx.run(`INSERT INTO order_status_events (order_id,status,previous_status,actor_type,actor_id,note)
+        VALUES (?,?,?,?,?,?)`, orderId, requestedStatus, order.status, actorType, actorId, note);
+    }
+    return { changed: !sameStatus, previousStatus: order.status, status: requestedStatus };
+  });
+}
 
 async function addCartItem(sessionId, product, quantity, configuration, executor = db) {
   const requested = Math.max(1, Math.floor(Number(quantity) || product.min_qty));
@@ -520,6 +633,8 @@ async function generateInvoice(orderId) {
     if (!order) return;
 
     const items = await db.all("SELECT * FROM order_items WHERE order_id = ?", orderId);
+    const invoice = orderInvoiceSnapshot(order);
+    const seller = invoice.seller || {};
 
     const invoiceDir = path.join(__dirname, "invoices");
     if (!fs.existsSync(invoiceDir)) {
@@ -533,6 +648,9 @@ async function generateInvoice(orderId) {
     doc.pipe(fs.createWriteStream(filePath));
 
     doc.fontSize(24).text("PrintOasis", { align: "center" });
+    if (seller.legal_name) doc.fontSize(11).text(seller.legal_name, { align: "center" });
+    if (seller.registered_address) doc.fontSize(9).text(seller.registered_address, { align: "center" });
+    if (seller.gstin) doc.fontSize(9).text(`GSTIN: ${seller.gstin}`, { align: "center" });
     doc.moveDown();
 
     doc.fontSize(18).text("INVOICE");
@@ -543,7 +661,9 @@ async function generateInvoice(orderId) {
     doc.text(`Order ID: ${order.id}`);
     doc.text(`Customer: ${order.customer_name}`);
     doc.text(`Phone: ${order.phone}`);
+    doc.text(`Address: ${order.address}`);
     doc.text(`City: ${order.city}`);
+    doc.text(`PIN code: ${order.postal_code}`);
     doc.text(`Status: ${order.status}`);
     doc.text(`Payment: ${order.payment_method}`);
     doc.moveDown();
@@ -559,11 +679,13 @@ async function generateInvoice(orderId) {
 
     doc.moveDown();
 
-    doc.text(`Subtotal: ₹${order.total - order.shipping_fee + order.discount}`);
-    doc.text(`Shipping: ₹${order.shipping_fee}`);
-    doc.text(`Discount: ₹${order.discount}`);
+    doc.text(`Subtotal: ${moneyMinor(invoice.subtotal_minor)}`);
+    doc.text(`Shipping: ${moneyMinor(invoice.shipping_minor)}`);
+    doc.text(`Discount: ${moneyMinor(invoice.discount_minor)}`);
     doc.font("Helvetica-Bold");
-    doc.text(`Grand Total: ₹${order.total}`);
+    doc.text(`Taxable value: ${moneyMinor(invoice.taxable_minor)}`);
+    doc.text(`GST included (${(Number(invoice.tax_rate_bps) / 100).toFixed(2)}%): ${moneyMinor(invoice.tax_minor)}`);
+    doc.text(`Grand Total: ${moneyMinor(invoice.total_minor)}`);
 
     doc.end();
 
@@ -1537,9 +1659,11 @@ ${result.tracking_url
 }
 
 async function invoicePage(order, items, session, cart) {
-  const taxable = Math.round(order.total / 1.18);
-  const gst = order.total - taxable;
-  return await layout(`Invoice ${order.order_number}`, `<section class="invoice section narrow"><div class="invoice-head"><div><span class="eyebrow">GST INVOICE</span><h1>${esc(order.order_number)}</h1><p>${new Date(order.created_at).toLocaleDateString("en-IN", { dateStyle: "long" })}</p></div><div class="invoice-actions"><a class="button ghost" href="/account/orders/${order.id}">Back to order</a><button class="button primary" onclick="window.print()">Print / Save PDF</button></div></div><div class="invoice-box"><h2>Bill to</h2><p>${esc(order.customer_name)}<br>${esc(order.address)}<br>${esc(order.city)} - ${esc(order.postal_code)}<br>Phone: ${esc(order.phone)}${order.gst_number ? `<br>GST: ${esc(order.gst_number)}` : ""}</p></div><table class="invoice-table"><caption class="sr-only">Invoice items for ${esc(order.order_number)}</caption><thead><tr><th scope="col">Item</th><th scope="col">Qty</th><th scope="col">Rate</th><th scope="col">Total</th></tr></thead><tbody>${items.map(i => `<tr><td>${esc(i.product_name)}<small>${esc(i.configuration)}</small></td><td>${i.quantity}</td><td>${money(i.unit_price)}</td><td>${money(i.quantity * i.unit_price)}</td></tr>`).join("")}</tbody></table><div class="invoice-totals"><p><span>Shipping</span><b>${money(order.shipping_fee || 0)}</b></p><p><span>Discount</span><b>${money(order.discount || 0)}</b></p><p><span>Taxable value</span><b>${money(taxable)}</b></p><p><span>GST included</span><b>${money(gst)}</b></p><p class="total"><span>Grand total</span><b>${money(order.total)}</b></p></div></section>`, session, cart);
+  const invoice = orderInvoiceSnapshot(order), seller = invoice.seller || {};
+  const sellerMissing = !seller.legal_name || !seller.registered_address;
+  const sellerBlock = `<div class="invoice-box"><h2>Seller</h2><p>${seller.legal_name ? esc(seller.legal_name) : "Seller legal name not configured"}${seller.registered_address ? `<br>${esc(seller.registered_address)}` : ""}${seller.gstin ? `<br>GSTIN: ${esc(seller.gstin)}` : ""}${seller.support_email ? `<br>${esc(seller.support_email)}` : ""}${seller.support_phone ? `<br>${esc(seller.support_phone)}` : ""}</p>${sellerMissing ? `<small>Seller identity details must be configured before production invoices are issued.</small>` : ""}</div>`;
+  const paymentStatus = order.payment_status || (order.payment_method === "cod" ? "Due on delivery" : "Not recorded");
+  return await layout(`Invoice ${order.order_number}`, `<section class="invoice section narrow"><div class="invoice-head"><div><span class="eyebrow">GST INVOICE</span><h1>${esc(order.order_number)}</h1><p>${new Date(order.created_at).toLocaleDateString("en-IN", { dateStyle: "long" })}</p></div><div class="invoice-actions"><a class="button ghost" href="/account/orders/${order.id}">Back to order</a><button class="button primary" onclick="window.print()">Print / Save PDF</button></div></div>${sellerBlock}<div class="invoice-box"><h2>Bill to / ship to</h2><p>${esc(order.customer_name)}<br>${esc(order.address)}<br>${esc(order.city)} - ${esc(order.postal_code)}<br>Phone: ${esc(order.phone)}${order.gst_number ? `<br>GSTIN: ${esc(order.gst_number)}` : ""}</p></div><table class="invoice-table"><caption class="sr-only">Invoice items for ${esc(order.order_number)}</caption><thead><tr><th scope="col">Item</th><th scope="col">Qty</th><th scope="col">Rate</th><th scope="col">Total</th></tr></thead><tbody>${items.map(i => `<tr><td>${esc(i.product_name)}<small>${esc(i.configuration)}</small></td><td>${i.quantity}</td><td>${money(i.unit_price)}</td><td>${money(i.quantity * i.unit_price)}</td></tr>`).join("")}</tbody></table><div class="invoice-totals"><p><span>Subtotal</span><b>${moneyMinor(invoice.subtotal_minor)}</b></p><p><span>Shipping</span><b>${moneyMinor(invoice.shipping_minor)}</b></p><p><span>Discount${order.coupon_code ? ` (${esc(order.coupon_code)})` : ""}</span><b>−${moneyMinor(invoice.discount_minor)}</b></p><p><span>Taxable value</span><b>${moneyMinor(invoice.taxable_minor)}</b></p><p><span>GST included (${(Number(invoice.tax_rate_bps) / 100).toFixed(2)}%)</span><b>${moneyMinor(invoice.tax_minor)}</b></p><p><span>Payment</span><b>${esc(order.payment_method)} · ${esc(paymentStatus)}</b></p><p class="total"><span>Grand total</span><b>${moneyMinor(invoice.total_minor)}</b></p></div></section>`, session, cart);
 }
 
 function requireAuth(session, res, next = "/account") {
@@ -1606,6 +1730,11 @@ async function createLocalOrder(session, cart, data, paymentMethod, paymentId = 
   if (!cart.items.length) throw new Error("Your cart is empty.");
   const totals = await cartTotals(cart, data.postal_code, data.coupon_code);
   if (data.coupon_code && totals.couponError) throw new Error(totals.couponError);
+  const subtotalMinor = Math.round(Number(totals.subtotal) * 100);
+  const discountMinor = Math.round(Number(totals.discount) * 100);
+  const shippingMinor = Math.round(Number(totals.delivery) * 100);
+  const totalMinor = Math.round(Number(totals.total) * 100);
+  const invoiceSnapshot = createInvoiceSnapshot({ subtotalMinor, discountMinor, shippingMinor, totalMinor });
   const orderNumber = `PO-${new Date().getFullYear()}-${crypto.randomInt(100000, 999999)}`;
   const orderId = await db.transaction(async tx => {
     const requestedByProduct = new Map();
@@ -1620,7 +1749,7 @@ async function createLocalOrder(session, cart, data, paymentMethod, paymentId = 
       const usage = await tx.run("UPDATE coupons SET times_used = times_used + 1 WHERE code = ? AND active = 1 AND (usage_limit IS NULL OR times_used < usage_limit) AND (expiry_date IS NULL OR expiry_date >= ?)", totals.coupon.code, new Date().toISOString().slice(0, 10));
       if (!usage.changes) throw new Error("This coupon is no longer available.");
     }
-    const order = await tx.run("INSERT INTO orders (order_number,user_id,total,status,customer_name,phone,address,city,postal_code,shipping_fee,discount,coupon_code,gst_number,payment_method,payment_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id", orderNumber, session.user.id, totals.total, "Pending", data.customer_name, data.phone, data.address, data.city, data.postal_code, totals.delivery, totals.discount, totals.coupon?.code || null, data.gst_number || null, paymentMethod, paymentId);
+    const order = await tx.run("INSERT INTO orders (order_number,user_id,total,status,customer_name,phone,address,city,postal_code,shipping_fee,discount,coupon_code,gst_number,payment_method,payment_id,invoice_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?::jsonb) RETURNING id", orderNumber, session.user.id, totals.total, "Pending", data.customer_name, data.phone, data.address, data.city, data.postal_code, totals.delivery, totals.discount, totals.coupon?.code || null, data.gst_number || null, paymentMethod, paymentId, JSON.stringify(invoiceSnapshot));
     const id = order.rows[0].id;
     for (const item of cart.items) {
       await tx.run(`INSERT INTO order_items (order_id,product_id,product_name,quantity,unit_price,configuration,artwork_original_name,artwork_stored_name,artwork_mime,artwork_size)
@@ -1630,7 +1759,7 @@ async function createLocalOrder(session, cart, data, paymentMethod, paymentId = 
       const deduction = await tx.run("UPDATE products SET stock = stock - ?, reserved = reserved - ? WHERE id = ? AND stock >= ? AND reserved >= ?", item.quantity, item.quantity, item.product_id, item.quantity, item.quantity);
       if (!deduction.changes) throw new Error(`Inventory changed for ${item.name}. Please review your cart.`);
     }
-    await tx.run("INSERT INTO order_status_events (order_id,status,note) VALUES (?,?,?)", id, "Pending", "Order confirmed and queued for artwork review.");
+    await tx.run("INSERT INTO order_status_events (order_id,status,previous_status,actor_type,actor_id,note) VALUES (?,?,NULL,'customer',?,?)", id, "Pending", session.user.id, "Order confirmed and queued for artwork review.");
     await tx.run("DELETE FROM cart_items WHERE session_id = ?", session.id);
     return id;
   });
@@ -1764,6 +1893,11 @@ async function finalizeCapturedCheckout(session, paymentId, options = {}) {
     for (const value of [subtotalMinor, discountMinor, shippingMinor, expectedAmount]) {
       if (value % 100 !== 0) throw reject("ORDER_FINALIZATION_SNAPSHOT_TOTAL_MISMATCH", "The saved checkout total is not compatible with order pricing.");
     }
+    const invoiceSnapshot = createInvoiceSnapshot({
+      subtotalMinor, discountMinor, shippingMinor, totalMinor: expectedAmount,
+      taxRateBps: shipping.invoice_tax_rate_bps == null ? 1800 : Number(shipping.invoice_tax_rate_bps),
+      seller: shipping.invoice_seller && typeof shipping.invoice_seller === "object" ? shipping.invoice_seller : sellerInvoiceSnapshot()
+    });
 
     // Cart rows are locked first so only reservations still owned by this session can be consumed.
     const cartRows = await tx.all("SELECT * FROM cart_items WHERE session_id=? ORDER BY product_id,id FOR UPDATE", sessionId);
@@ -1804,11 +1938,11 @@ async function finalizeCapturedCheckout(session, paymentId, options = {}) {
     const orderNumber = `PO-${new Date().getFullYear()}-${crypto.randomInt(100000, 1000000)}`;
     const order = await tx.get(`INSERT INTO orders
       (order_number,user_id,total,status,customer_name,phone,address,city,postal_code,shipping_fee,discount,coupon_code,gst_number,
-       payment_method,payment_id,checkout_intent_id,payment_record_id)
-      VALUES (?,?,?,'Pending',?,?,?,?,?,?,?,?,?,'razorpay',?,?,?)
+       payment_method,payment_id,checkout_intent_id,payment_record_id,invoice_snapshot)
+      VALUES (?,?,?,'Pending',?,?,?,?,?,?,?,?,?,'razorpay',?,?,?,?::jsonb)
       RETURNING id,order_number`, orderNumber, userId, expectedAmount / 100, address.customer_name, address.phone,
     address.address, address.city, address.postal_code, shippingMinor / 100, discountMinor / 100,
-    intent.coupon_code || null, address.gst_number || null, normalizedPaymentId, intent.id, binding.payment_record_id);
+    intent.coupon_code || null, address.gst_number || null, normalizedPaymentId, intent.id, binding.payment_record_id, JSON.stringify(invoiceSnapshot));
 
     for (const item of snapshot) {
       const unitPrice = Number(item.unit_price_minor) / 100;
@@ -1832,7 +1966,7 @@ async function finalizeCapturedCheckout(session, paymentId, options = {}) {
       if (changed.changes !== 1) throw reject("ORDER_FINALIZATION_RESERVATION_CHANGED", "The checkout reservation changed during order finalization.");
     }
     if (intent.coupon_code) await tx.run("UPDATE coupons SET times_used=times_used+1 WHERE code=?", intent.coupon_code);
-    await tx.run("INSERT INTO order_status_events (order_id,status,note) VALUES (?,?,?)", order.id, "Pending", "Order confirmed and queued for artwork review.");
+    await tx.run("INSERT INTO order_status_events (order_id,status,previous_status,actor_type,actor_id,note) VALUES (?,?,NULL,'payment',?,?)", order.id, "Pending", userId, "Captured payment confirmed and order queued for artwork review.");
     await tx.run("UPDATE checkout_intents SET status='completed',updated_at=CURRENT_TIMESTAMP WHERE id=?", intent.id);
     return { ...order, reused: false };
   });
@@ -1926,6 +2060,8 @@ async function createCheckoutIntent(session, data = {}) {
       subtotal_minor: Math.round(Number(totals.subtotal) * 100),
       discount_minor: Math.round(Number(totals.discount) * 100),
       shipping_minor: Math.round(Number(totals.delivery) * 100),
+      invoice_tax_rate_bps: GST_RATE_BPS,
+      invoice_seller: sellerInvoiceSnapshot(),
       coupon: couponSnapshot
     };
     const cartJson = JSON.stringify(cartSnapshot);
@@ -2702,6 +2838,7 @@ const app = {
   canonicalOrigin,
   setSecurityHeaders,
   ORDER_STATUSES,
+  GST_RATE_BPS,
   RAZORPAY_KEY_ID,
   RAZORPAY_KEY_SECRET,
   RAZORPAY_WEBHOOK_SECRET,
@@ -2718,6 +2855,7 @@ const app = {
   cartData,
   cartPage,
   cartTotals,
+  createInvoiceSnapshot,
   checkoutPage,
   couponFor,
   couponValidation,
@@ -2751,6 +2889,7 @@ const app = {
   homePage,
   infoPage,
   invoicePage,
+  orderInvoiceSnapshot,
   isAdmin,
   layout,
   notifyOrder,
@@ -2794,6 +2933,7 @@ const app = {
   servePublic,
   slugify,
   trackPage,
+  transitionOrderStatus,
   validCsrf,
   visibleProductCondition,
   verifyPassword,

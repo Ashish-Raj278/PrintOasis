@@ -45,12 +45,12 @@ module.exports = async function adminRoutes(ctx) {
   if (url.pathname === "/admin/coupons/toggle") { await app.db.run("UPDATE coupons SET active = CASE WHEN active = 1 THEN 0 ELSE 1 END WHERE code = ?", String(data.code || "").trim().toUpperCase()); app.redirect(res, "/admin/coupons?notice=Coupon+status+updated."); return true; }
   if (url.pathname === "/admin/coupons/delete") { await app.db.run("DELETE FROM coupons WHERE code = ?", String(data.code || "").trim().toUpperCase()); app.redirect(res, "/admin/coupons?notice=Coupon+deleted."); return true; }
   if (url.pathname === "/admin/orders/status") {
-    const status = app.ORDER_STATUSES.includes(data.status) ? data.status : "Pending", orderId = Number(data.order_id), note = String(data.note || "").trim().slice(0, 400), tracking = String(data.tracking_number || "").trim().slice(0, 80), courier = String(data.courier_name || "").trim().slice(0, 80), trackingUrl = String(data.tracking_url || "").trim().slice(0, 500), estimatedDelivery = String(data.estimated_delivery || "").trim().slice(0, 40);
-    const current = await app.db.get("SELECT * FROM orders WHERE id = ?", orderId); if (!current) return app.redirect(res, "/admin/orders?notice=Order+not+found."), true;
-    if (current.status === "Cancelled" && status !== "Cancelled") return app.redirect(res, "/admin/orders?notice=Cancelled+orders+cannot+be+reopened."), true;
+    const status = String(data.status || ""), orderId = Number(data.order_id), note = String(data.note || "").trim().slice(0, 400), tracking = String(data.tracking_number || "").trim().slice(0, 80), courier = String(data.courier_name || "").trim().slice(0, 80), trackingUrl = String(data.tracking_url || "").trim().slice(0, 500), estimatedDelivery = String(data.estimated_delivery || "").trim().slice(0, 40);
+    if (!Number.isSafeInteger(orderId) || orderId <= 0) return app.redirect(res, "/admin/orders?notice=Order+not+found."), true;
+    if (!app.ORDER_STATUSES.includes(status)) return app.redirect(res, "/admin/orders?notice=Select+a+valid+order+status."), true;
     if (status === "Cancelled") {
       try {
-        const result = await app.cancelOrder(orderId);
+        const result = await app.cancelOrder(orderId, { actor: { actorType: "admin", actorId: session.user.id } });
         const message = result.status === "completed" ? "Order cancelled; required refund and inventory actions are complete." : result.status === "failed" ? "Refund was rejected. The order remains open for support review." : "Refund is being confirmed. The order remains open until it succeeds.";
         app.redirect(res, `/admin/orders?notice=${encodeURIComponent(message)}`);
       } catch (error) {
@@ -59,8 +59,13 @@ module.exports = async function adminRoutes(ctx) {
       }
       return true;
     }
-    await app.db.transaction(async tx => { await tx.run(`UPDATE orders SET status=?,tracking_number=?,courier_name=?,tracking_url=?,estimated_delivery=?,status_updated_at=CURRENT_TIMESTAMP WHERE id=?`, status, tracking || null, courier || null, trackingUrl || null, estimatedDelivery || null, orderId); await tx.run("INSERT INTO order_status_events (order_id, status, note) VALUES (?, ?, ?)", orderId, status, note); });
-    if (current.status !== status) { const event = status === "Shipped" ? "shipping_update" : status === "Delivered" ? "delivered" : "status_update"; await app.notifyOrder(orderId, event, note); if (status === "Delivered") await app.notifyOrder(orderId, "review_reminder"); }
+    try {
+      const transition = await app.transitionOrderStatus(orderId, status, { note, trackingNumber: tracking, courierName: courier, trackingUrl, estimatedDelivery }, { actorType: "admin", actorId: session.user.id });
+      if (transition.changed) { const event = status === "Shipped" ? "shipping_update" : status === "Delivered" ? "delivered" : "status_update"; await app.notifyOrder(orderId, event, note); if (status === "Delivered") await app.notifyOrder(orderId, "review_reminder"); }
+    } catch (error) {
+      const message = error.code === "ORDER_NOT_FOUND" ? "Order not found." : error.code === "ORDER_PAYMENT_NOT_SETTLED" ? error.message : "That order status transition is not allowed.";
+      return app.redirect(res, `/admin/orders?notice=${encodeURIComponent(message)}`), true;
+    }
     app.redirect(res, "/admin/orders?notice=Order+status+updated."); return true;
   }
   if (url.pathname === "/admin/orders/refund") {

@@ -298,8 +298,12 @@ async function main() {
     const deliveredOrder = await app.db.get("SELECT * FROM orders WHERE user_id = (SELECT id FROM users WHERE email = ?) ORDER BY id DESC LIMIT 1", `${prefix}-customer@example.test`);
     const couponUsage = await app.db.get("SELECT times_used FROM coupons WHERE code = ?", coupon);
     assert.equal(Number(couponUsage.times_used), 1, "Coupon usage should be accounted during checkout.");
-    const statusPage = await get("/admin/orders", admin);
-    await post("/admin/orders/status", { csrf: csrf(statusPage.html), order_id: deliveredOrder.id, status: "Delivered", note: "Smoke delivery" }, statusPage.cookie);
+    for (const status of ["Printing", "Packed", "Shipped", "Delivered"]) {
+      const statusPage = await get("/admin/orders", admin);
+      const changed = await post("/admin/orders/status", { csrf: csrf(statusPage.html), order_id: deliveredOrder.id, status, note: `Smoke ${status.toLowerCase()}` }, statusPage.cookie);
+      assert.equal(changed.response.status, 303, `Valid ${status} transition should redirect.`);
+      assert.equal((await app.db.get("SELECT status FROM orders WHERE id=?", deliveredOrder.id)).status, status, `Order should transition to ${status}.`);
+    }
     const orderPage = await get(`/account/orders/${deliveredOrder.id}`, customer);
     const review = await post("/account/reviews/save", { csrf: csrf(orderPage.html), order_id: deliveredOrder.id, product_id: product.id, rating: "5", comment: "A verified PostgreSQL smoke-test review." }, orderPage.cookie);
     assert.equal(review.response.status, 303, "Verified review should redirect.");

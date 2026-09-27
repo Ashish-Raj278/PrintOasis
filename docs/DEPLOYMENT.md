@@ -44,7 +44,21 @@ REDIS_URL=rediss://user:password@managed-redis-host:6380
 REDIS_PREFIX=printoasis
 TRUST_PROXY_HOPS=1
 BASE_URL=https://your-final-domain.example
+GST_RATE_BPS=1800
+SELLER_LEGAL_NAME=
+SELLER_REGISTERED_ADDRESS=
+SELLER_GSTIN=
 ```
+
+The GST rate shown is only the compatibility default for the application's
+existing tax-inclusive invoice arithmetic; it is not confirmation of the
+correct tax rate or treatment. Checkout totals are not increased by this
+setting. Before launch, obtain business/tax review for the actual product and
+delivery tax treatment, then set the verified rate. Supply the real seller legal
+name, registered address, applicable GSTIN, and verified `SUPPORT_EMAIL` /
+`SUPPORT_PHONE` through private deployment configuration. Do not use sample
+contact/address defaults as verified legal seller identity. See
+[Invoice and Tax Configuration](INVOICES_AND_TAX.md).
 
 Redis is required at startup and is included in `/healthz`. Use a managed Redis endpoint with TLS (`rediss://`) in production. Sessions are shared in Redis while PostgreSQL retains the durable session/cart anchor used for reservation cleanup. Rate-limit counters use atomic Redis increments. Never point `TEST_REDIS_URL` at the production Redis endpoint. `TRUST_PROXY_HOPS` defaults to `0`; it is used only when deriving client IPs and should be set to the exact trusted proxy hop count after ensuring the app cannot be reached around that proxy. `BASE_URL` is required in production, must be the canonical HTTPS origin, and is used for generated links and Secure-cookie decisions; arbitrary Host and forwarded host/proto values are ignored.
 

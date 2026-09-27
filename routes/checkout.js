@@ -4,7 +4,9 @@ module.exports = async function checkoutRoutes(ctx) {
   if (req.method === "GET" && url.pathname.startsWith("/invoice/")) {
     if (!app.requireAuth(session, res, url.pathname)) return true;
     const orderNumber = decodeURIComponent(url.pathname.split("/").pop() || "");
-    const order = app.isAdmin(session) ? await app.db.get("SELECT * FROM orders WHERE order_number = ?", orderNumber) : await app.db.get("SELECT * FROM orders WHERE order_number = ? AND user_id = ?", orderNumber, session.user.id);
+    const order = app.isAdmin(session)
+      ? await app.db.get("SELECT o.*,p.status AS payment_status FROM orders o LEFT JOIN payments p ON p.id=o.payment_record_id WHERE o.order_number = ?", orderNumber)
+      : await app.db.get("SELECT o.*,p.status AS payment_status FROM orders o LEFT JOIN payments p ON p.id=o.payment_record_id WHERE o.order_number = ? AND o.user_id = ?", orderNumber, session.user.id);
     if (!order) return app.send(res, 404, await app.layout("Invoice not found", `<div class="empty section"><h1>Invoice not found</h1><a href="/account/orders">Back to orders</a></div>`, session, cart)), true;
     const items = await app.db.all("SELECT * FROM order_items WHERE order_id = ?", order.id);
     app.send(res, 200, await app.invoicePage(order, items, session, cart)); return true;

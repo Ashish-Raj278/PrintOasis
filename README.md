@@ -142,6 +142,8 @@ Current limitations: CSP permits inline scripts/styles for existing SSR/UI behav
 
 Orders progress through `Pending`, `Printing`, `Packed`, `Shipped`, `Delivered`, or `Cancelled`. Admin status updates can record courier, tracking number, URL, and estimated delivery; customers can view tracking and invoices from their account. Reviews require a delivered purchase and prevent duplicate product reviews. Coupons store active state, dates, order thresholds, maximum discounts, limits, and usage accounting, which increments only within successful order creation.
 
+Fulfillment advances only through `Pending → Printing → Packed → Shipped → Delivered`; eligible pre-shipment cancellation remains governed by the payment/refund service. Invalid, skipped, backward, or unpaid-online fulfillment transitions are rejected. Status events retain prior/new states, actor and timestamp. Invoices read saved order-item and invoice snapshots, not the mutable product catalog. See [Invoice and Tax Configuration](docs/INVOICES_AND_TAX.md) for the current inclusive-tax behavior and production review requirements.
+
 ### Image Architecture
 
 The image system is prepared for a reusable asset library rather than one image per product. It supports `primary`, `hover`, gallery, category, and placement-specific images with a WebP-first resolver and safe JPG/JPEG/PNG legacy fallback. See [IMAGE_LIBRARY.md](IMAGE_LIBRARY.md), [IMAGE_ASSET_MANIFEST.md](IMAGE_ASSET_MANIFEST.md), and [PHASE_B_IMAGE_PRODUCTION_SPEC.md](PHASE_B_IMAGE_PRODUCTION_SPEC.md).
@@ -202,6 +204,8 @@ Copy `.env.example` to `.env`; never commit the resulting `.env` file.
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS` | Nodemailer SMTP configuration. | Optional; otherwise email is logged to the outbox. |
 | `EMAIL_WEBHOOK_URL` | Optional notification webhook fallback. | Optional. |
 | `SUPPORT_EMAIL`, `SUPPORT_PHONE`, `OFFICE_ADDRESS`, `CONTACT_RECIPIENT` | Customer-facing support and contact-enquiry details. | Optional; defaults exist. |
+| `GST_RATE_BPS` | Inclusive-tax extraction rate in basis points; defaults to `1800` to preserve existing display arithmetic. | Configure only after tax review; it does not change checkout totals. |
+| `SELLER_LEGAL_NAME`, `SELLER_REGISTERED_ADDRESS`, `SELLER_GSTIN` | Seller identity snapshotted onto new invoices. | Supply real, verified business values before issuing production invoices; GSTIN only if applicable. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Google provider configuration template. | Optional; sign-in UI is configuration-dependent. |
 | `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` | Razorpay online-payment configuration. | Optional; required only for the provider flow. |
 | `RAZORPAY_WEBHOOK_SECRET` | Secret configured for the Razorpay webhook endpoint at `/webhooks/razorpay`. | Optional until webhook delivery is enabled. |
@@ -214,9 +218,12 @@ The repository does not use Jest, Vitest, Cypress, or a CI workflow. Its current
 npm run check
 # Set DATABASE_URL and TEST_DATABASE_URL in the process environment first.
 npm run db:smoke
+npm run db:order-integrity:smoke
 ```
 
 `npm run check` runs Node syntax checks across the server, services, routes, and browser JavaScript. `npm run db:smoke` runs customer/admin/inventory and Redis-session/rate-limit workflows against `TEST_DATABASE_URL` and `TEST_REDIS_URL`; both test endpoints are checked for separation from production configuration. `npm run redis:smoke` runs the isolated Redis service checks. No smoke runner flushes a Redis database. The PowerShell smoke entry points delegate to the PostgreSQL/Redis-isolated workflow.
+
+`npm run db:order-integrity:smoke` runs the Stage 5 tax/invoice/order-state regression against the isolated `TEST_DATABASE_URL`; it uses a uniquely namespaced local test Redis endpoint and does not call a live payment provider.
 
 ## Deployment
 

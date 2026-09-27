@@ -6,6 +6,7 @@ const { assertOrderFinalizationBehavior } = require("./order-finalization-regres
 const { assertRefundRecoveryBehavior } = require("./refund-recovery-regression");
 const { assertAuthSecurityBehavior } = require("./auth-security-regression");
 const { assertUploadAccessBehavior } = require("./upload-security-regression");
+const { assertOrderIntegrityBehavior } = require("./order-integrity-regression");
 
 function checks() {
   let count = 0;
@@ -737,6 +738,7 @@ async function runRegression({ app, get, post, postMultipart, csrf, prefix, admi
   const webhookReconciliationAssertions = await assertWebhookReconciliationBehavior({ app, prefix });
   const orderFinalizationAssertions = await assertOrderFinalizationBehavior({ app, prefix });
   const refundRecoveryAssertions = await assertRefundRecoveryBehavior({ app, prefix });
+  const orderIntegrityAssertions = await assertOrderIntegrityBehavior({ app, get, post, csrf, prefix, admin, customer, product, deliveredOrder, sessionId });
   const home = await get("/"); c.match(home.html, /data-carousel/, "Homepage carousel is rendered."); c.match(home.html, /hero-slide/, "Homepage has carousel slides.");
   const dashboard = await get("/admin", admin); c.equal(dashboard.response.status, 200, "Admin dashboard is accessible."); c.match(dashboard.html, /Operations dashboard/, "Admin dashboard content is rendered.");
 
@@ -776,19 +778,31 @@ async function runRegression({ app, get, post, postMultipart, csrf, prefix, admi
   c.match(filtered.html, new RegExp(deliveredOrder.order_number), "Order search and status filter match the delivered order."); c.match(filtered.html, /Filter orders/, "Order filter UI renders.");
   c.match((await get("/account/orders?status=Cancelled", customer)).html, /Cancelled/, "Cancelled-order filter renders matching data.");
 
+  const trackingOrderNumber = `${prefix.toUpperCase()}-TRACKING`;
+  const trackingOrder = await app.db.get(`INSERT INTO orders
+    (order_number,user_id,total,status,customer_name,phone,address,city,postal_code,payment_method,invoice_snapshot)
+    VALUES (?,?,100,'Pending','Postgres Smoke Customer','9876500000','1 Test Lane','Bengaluru','560001','cod',?::jsonb) RETURNING id` ,
+  trackingOrderNumber, deliveredOrder.user_id, JSON.stringify(app.createInvoiceSnapshot({ subtotalMinor: 10000, discountMinor: 0, shippingMinor: 0, totalMinor: 10000 })));
+  await app.db.run("INSERT INTO order_items (order_id,product_id,product_name,quantity,unit_price,configuration) VALUES (?,?,?,1,100,'Smoke configuration')", trackingOrder.id, product.id, product.name);
+  await app.db.run("INSERT INTO order_status_events (order_id,status,previous_status,actor_type,actor_id,note) VALUES (?,'Pending',NULL,'customer',?,'Tracking test fixture')", trackingOrder.id, deliveredOrder.user_id);
   page = await get("/admin/orders", admin);
-  c.equal((await post("/admin/orders/status", { csrf: csrf(page.html), order_id: deliveredOrder.id, status: "Shipped", courier_name: "Smoke Courier", tracking_number: `${prefix.toUpperCase()}-TRACK`, tracking_url: "https://example.test/track", estimated_delivery: "2030-12-31", note: "Smoke dispatch" }, page.cookie)).response.status, 303, "Admin updates shipment details.");
-  let notice = await app.db.get("SELECT * FROM notifications WHERE order_id=? AND event='shipping_update' ORDER BY id DESC LIMIT 1", deliveredOrder.id);
+  c.equal((await post("/admin/orders/status", { csrf: csrf(page.html), order_id: trackingOrder.id, status: "Printing" }, page.cookie)).response.status, 303, "Admin advances tracking order to Printing.");
+  page = await get("/admin/orders", admin);
+  c.equal((await post("/admin/orders/status", { csrf: csrf(page.html), order_id: trackingOrder.id, status: "Packed" }, page.cookie)).response.status, 303, "Admin advances tracking order to Packed.");
+  page = await get("/admin/orders", admin);
+  c.equal((await post("/admin/orders/status", { csrf: csrf(page.html), order_id: trackingOrder.id, status: "Shipped", courier_name: "Smoke Courier", tracking_number: `${prefix.toUpperCase()}-TRACK`, tracking_url: "https://example.test/track", estimated_delivery: "2030-12-31", note: "Smoke dispatch" }, page.cookie)).response.status, 303, "Admin advances tracking order to Shipped.");
+  let notice = await app.db.get("SELECT * FROM notifications WHERE order_id=? AND event='shipping_update' ORDER BY id DESC LIMIT 1", trackingOrder.id);
   c.ok(notice && notice.body.includes("Smoke Courier") && notice.body.includes(`${prefix.toUpperCase()}-TRACK`) && notice.body.includes("https://example.test/track"), "Shipment notification includes delivery details.");
   page = await get("/track", customer);
-  const track = await post("/track", { csrf: csrf(page.html), order_number: deliveredOrder.order_number, phone: "9876500000" }, page.cookie);
+  const track = await post("/track", { csrf: csrf(page.html), order_number: trackingOrderNumber, phone: "9876500000" }, page.cookie);
   c.equal(track.response.status, 200, "Customer tracking lookup responds."); c.match(track.html, /Shipped/, "Tracking displays current status."); c.match(track.html, new RegExp(`${prefix.toUpperCase()}-TRACK`), "Tracking displays number."); c.match(track.html, /Smoke Courier/, "Tracking displays courier."); c.match(track.html, /example\.test\/track/, "Tracking displays URL.");
-  const invoice = await get(`/invoice/${encodeURIComponent(deliveredOrder.order_number)}`, customer);
-  c.equal(invoice.response.status, 200, "Customer can view invoice."); c.match(invoice.html, /GST INVOICE/, "Invoice heading renders."); c.match(invoice.html, new RegExp(deliveredOrder.order_number), "Invoice identifies order.");
-  page = await get("/admin/orders", admin); await post("/admin/orders/status", { csrf: csrf(page.html), order_id: deliveredOrder.id, status: "Delivered", note: "Smoke delivered" }, page.cookie);
-  const delivered = await app.db.get("SELECT * FROM notifications WHERE order_id=? AND event='delivered' ORDER BY id DESC LIMIT 1", deliveredOrder.id);
-  const reminder = await app.db.get("SELECT * FROM notifications WHERE order_id=? AND event='review_reminder' ORDER BY id DESC LIMIT 1", deliveredOrder.id);
-  c.ok(delivered && delivered.body.includes(deliveredOrder.order_number), "Delivery notification is recorded."); c.ok(reminder && reminder.body.includes(product.name), "Review reminder includes purchased item.");
+  const invoice = await get(`/invoice/${encodeURIComponent(trackingOrderNumber)}`, customer);
+  c.equal(invoice.response.status, 200, "Customer can view invoice."); c.match(invoice.html, /GST INVOICE/, "Invoice heading renders."); c.match(invoice.html, new RegExp(trackingOrderNumber), "Invoice identifies order.");
+  page = await get("/admin/orders", admin);
+  c.equal((await post("/admin/orders/status", { csrf: csrf(page.html), order_id: trackingOrder.id, status: "Delivered", note: "Smoke delivered" }, page.cookie)).response.status, 303, "Admin advances tracking order to Delivered.");
+  const delivered = await app.db.get("SELECT * FROM notifications WHERE order_id=? AND event='delivered' ORDER BY id DESC LIMIT 1", trackingOrder.id);
+  const reminder = await app.db.get("SELECT * FROM notifications WHERE order_id=? AND event='review_reminder' ORDER BY id DESC LIMIT 1", trackingOrder.id);
+  c.ok(delivered && delivered.body.includes(trackingOrderNumber), "Delivery notification is recorded."); c.ok(reminder && reminder.body.includes(product.name), "Review reminder includes purchased item.");
   const faq = await get("/faq"); c.equal(faq.response.status, 200, "FAQ route succeeds."); c.match(faq.html, /Straight answers for every print order/, "FAQ heading renders."); c.match(faq.html, /How do I place an order\?/, "FAQ content renders.");
 
   const review = await app.db.get("SELECT * FROM reviews WHERE user_id=(SELECT id FROM users WHERE email=?) AND product_id=?", `${prefix}-customer@example.test`, product.id);
@@ -838,7 +852,7 @@ async function runRegression({ app, get, post, postMultipart, csrf, prefix, admi
   c.match(reviewMail.text, /Review your products/, "Review reminder email content.");
   const authSecurityAssertions = await assertAuthSecurityBehavior({ app, get, post, csrf, prefix, admin, register, createProduct });
   const uploadAssertions = await assertUploadAccessBehavior({ app, get, postMultipart, csrf, prefix, admin, customer, register, createProduct, sessionId, trackUpload });
-  return c.count + checkoutIntentAssertions + providerOrderAssertions + paymentVerificationAssertions + webhookReconciliationAssertions + orderFinalizationAssertions + refundRecoveryAssertions + authSecurityAssertions + uploadAssertions;
+  return c.count + checkoutIntentAssertions + providerOrderAssertions + paymentVerificationAssertions + webhookReconciliationAssertions + orderFinalizationAssertions + refundRecoveryAssertions + orderIntegrityAssertions + authSecurityAssertions + uploadAssertions;
 }
 
 module.exports = { assertSequentialOversell, assertPaymentSchema, assertCheckoutIntentBehavior, assertProviderOrderBehavior, assertPaymentVerificationBehavior, assertWebhookReconciliationBehavior, assertOrderFinalizationBehavior, assertRefundRecoveryBehavior, runRegression };
