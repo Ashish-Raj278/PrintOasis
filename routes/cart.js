@@ -6,11 +6,12 @@ module.exports = async function cartRoutes(ctx) {
     if (!app.validCsrf(data, session)) return app.send(res, 403, "Invalid form token", "text/plain"), true;
     const productId = Number(data.product_id);
     let product = null;
+    let artwork = null;
     try {
       await app.db.transaction(async tx => {
         product = await tx.get(`SELECT * FROM products WHERE id = ? AND ${app.visibleProductCondition()} FOR UPDATE`, productId);
         if (!product) return;
-        const artwork = app.saveArtwork(data.files?.artwork_file);
+        artwork = app.saveArtwork(data.files?.artwork_file);
         await app.addCartItem(session.id, product, data.quantity, {
           size: data.size, material: data.material, printOption: data.print_option,
           artworkNote: (data.artwork_note || "").slice(0, 500), artworkOriginalName: artwork?.original,
@@ -20,6 +21,7 @@ module.exports = async function cartRoutes(ctx) {
       if (!product) return app.send(res, 404, "Product not found", "text/plain"), true;
       app.redirect(res, "/cart?notice=Product+added+to+your+cart.");
     } catch (error) {
+      if (artwork?.stored) app.removeSavedUploads([artwork], app.uploadDirectory);
       if (product) return app.redirect(res, `/product/${product.slug}?notice=${encodeURIComponent(error.message)}`), true;
       throw error;
     }

@@ -4,10 +4,13 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { createDatabaseFromEnv, runMigrations, databaseHealth } = require("./services/database");
 const { createRedisService, requestLimitPolicies } = require("./services/redis");
+const uploadSecurity = require("./services/upload-security");
 const { URL } = require("node:url");
 const { categories, products: catalogProducts, productPriorities } = require("./catalog");
 const PDFDocument = require("pdfkit");
 const { createEmailService, orderEmailTemplate } = require("./services/email");
+const { createRefundService } = require("./services/refunds");
+const webhookRoute = require("./routes/webhooks");
 const routes = [
   require("./routes/static"),
   require("./routes/auth"),
@@ -20,10 +23,24 @@ const routes = [
 if (fs.existsSync(path.join(__dirname, ".env"))) process.loadEnvFile(path.join(__dirname, ".env"));
 
 const PORT = Number(process.env.PORT || 3000);
-const PUBLIC_BASE_URL = (process.env.BASE_URL || "").replace(/\/$/, "");
+function canonicalOrigin(value) {
+  if (!value) {
+    if (process.env.NODE_ENV === "production") throw new Error("BASE_URL must be configured with the canonical HTTPS application origin in production.");
+    return `http://localhost:${PORT}`;
+  }
+  let parsed;
+  try { parsed = new URL(value); } catch { throw new Error("BASE_URL must be a valid canonical application origin."); }
+  if (!new Set(["http:", "https:"]).has(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
+    throw new Error("BASE_URL must contain only an http(s) origin, without credentials, path, query, or fragment.");
+  }
+  if (process.env.NODE_ENV === "production" && parsed.protocol !== "https:") throw new Error("BASE_URL must use HTTPS in production.");
+  return parsed.origin;
+}
+const PUBLIC_BASE_URL = canonicalOrigin(process.env.BASE_URL);
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || "";
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || "";
+const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || "";
 const EMAIL_WEBHOOK_URL = process.env.EMAIL_WEBHOOK_URL || "";
 const EMAIL_FROM = process.env.EMAIL_FROM || "orders@printoasis.example";
 const SUPPORT_EMAIL = (process.env.SUPPORT_EMAIL || "hello@printoasis.in").trim();
@@ -57,6 +74,7 @@ fs.mkdirSync(EMAIL_LOG_DIR, { recursive: true });
 const emailService = createEmailService({ enabled: EMAIL_DELIVERY_ENABLED, host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE, user: SMTP_USER, pass: SMTP_PASS, from: EMAIL_FROM });
 let db;
 let redis;
+let refundService;
 const ORDER_STATUSES = ["Pending", "Printing", "Packed", "Shipped", "Delivered", "Cancelled"];
 const ALLOWED_ARTWORK_EXTENSIONS = new Set([".pdf", ".png", ".ai", ".psd"]);
 const ALLOWED_IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
@@ -68,16 +86,63 @@ let lastSessionCleanupAt = 0;
 const TRUST_PROXY_HOPS = Number(process.env.TRUST_PROXY_HOPS || 0);
 
 function requestOrigin(req) {
-  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
-  const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
-  const proto = forwardedProto || "http";
-  const host = req.headers["x-forwarded-host"] || req.headers.host || `localhost:${PORT}`;
-  return `${proto}://${host}`;
+  return PUBLIC_BASE_URL;
+}
+
+function safeLocalPath(value, fallback = "/") {
+  const candidate = String(value || "");
+  if (!candidate || candidate.length > 2048 || !candidate.startsWith("/") || candidate.startsWith("//") || candidate.includes("\\") || /%(?![0-9a-f]{2})/i.test(candidate) || /[\u0000-\u001f\u007f]/.test(candidate)) return fallback;
+  try {
+    const parsed = new URL(candidate, PUBLIC_BASE_URL);
+    if (parsed.origin !== PUBLIC_BASE_URL || parsed.username || parsed.password) return fallback;
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch { return fallback; }
+}
+
+function withNotice(location, notice) {
+  const parsed = new URL(safeLocalPath(location), PUBLIC_BASE_URL);
+  parsed.searchParams.set("notice", notice);
+  return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+}
+
+function setSecurityHeaders(res) {
+  const scriptSources = ["'self'", "'unsafe-inline'", "https://accounts.google.com", "https://checkout.razorpay.com"];
+  const policy = [
+    "default-src 'self'",
+    `script-src ${scriptSources.join(" ")}`,
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com data:",
+    "img-src 'self' data: blob: https:",
+    "connect-src 'self' https://accounts.google.com https://oauth2.googleapis.com https://api.razorpay.com",
+    "frame-src 'self' https://accounts.google.com https://checkout.razorpay.com https://api.razorpay.com",
+    "form-action 'self' https://accounts.google.com https://api.razorpay.com",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'"
+  ].join("; ");
+  res.setHeader("Content-Security-Policy", policy);
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  if (process.env.NODE_ENV === "production" && PUBLIC_BASE_URL.startsWith("https://")) res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+}
+
+function setSessionCookie(res, id, clear = false) {
+  const secure = PUBLIC_BASE_URL.startsWith("https://") ? "; Secure" : "";
+  res.setHeader("Set-Cookie", `sid=${clear ? "" : id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${clear ? 0 : 2592000}${secure}`);
 }
 
 async function initDb() {
   db = createDatabaseFromEnv();
   await runMigrations(db);
+  refundService = createRefundService({
+    db,
+    createProviderRefund: createRazorpayRefund,
+    lookupProviderRefund: lookupRazorpayRefund,
+    listProviderRefunds: listRazorpayRefunds,
+    onCancelled: orderId => notifyOrder(orderId, "status_update", "Order cancelled after refund confirmation.")
+  });
   await db.run("UPDATE products SET reserved = 0 WHERE reserved < 0");
   await db.run("UPDATE products SET status = 'hidden', active = 0 WHERE active = 0 AND status != 'hidden'");
   await db.run("INSERT INTO coupons (code,type,value,min_total,minimum_order,active) VALUES (?,?,?,?,?,?) ON CONFLICT (code) DO NOTHING", "WELCOME10", "percent", 10, 499, 499, 1);
@@ -118,7 +183,7 @@ const parseCookies = req => Object.fromEntries((req.headers.cookie || "").split(
 }));
 const split = value => value.split("|");
 const slugify = value => String(value || "").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-const safeFileName = value => path.basename(String(value || "artwork").replace(/[^a-zA-Z0-9._-]/g, "-"));
+const safeFileName = uploadSecurity.safeOriginalFilename;
 const statusClass = status => slugify(status || "pending");
 const imageMimeType = extension => ({ ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".avif": "image/avif" })[String(extension).toLowerCase()] || "application/octet-stream";
 
@@ -219,10 +284,10 @@ function shippingFee(subtotal, postalCode = "") {
   return /^(11|40|41|56|57|60|70)/.test(pin) ? 99 : 149;
 }
 
-async function couponValidation(code, subtotal) {
+async function couponValidation(code, subtotal, executor = db) {
   const normalized = String(code || "").trim().toUpperCase();
   if (!normalized) return { coupon: null, error: "" };
-  const coupon = await db.get("SELECT * FROM coupons WHERE code = ?", normalized);
+  const coupon = await executor.get("SELECT * FROM coupons WHERE code = ?", normalized);
   if (!coupon) return { coupon: null, error: "Coupon code is invalid." };
   if (!coupon.active) return { coupon: null, error: "This coupon is not active." };
   const expiryDate = coupon.expiry_date instanceof Date
@@ -237,8 +302,8 @@ async function couponValidation(code, subtotal) {
 
 async function couponFor(code, subtotal) { return (await couponValidation(code, subtotal)).coupon; }
 
-async function cartTotals(cart, postalCode = "", couponCode = "") {
-  const couponResult = await couponValidation(couponCode, cart.subtotal);
+async function cartTotals(cart, postalCode = "", couponCode = "", executor = db) {
+  const couponResult = await couponValidation(couponCode, cart.subtotal, executor);
   const coupon = couponResult.coupon;
   const rawDiscount = coupon ? coupon.type === "percent" ? Math.round(cart.subtotal * coupon.value / 100) : coupon.value : 0;
   const discount = coupon ? Math.min(cart.subtotal, rawDiscount, Number(coupon.maximum_discount) || Infinity) : 0;
@@ -307,9 +372,9 @@ async function getSession(req, res) {
   await cleanupExpiredSessions();
   const cookies = parseCookies(req);
   const now = Date.now();
-  const anchor = cookies.sid && await db.get("SELECT id, expires_at FROM sessions WHERE id = ? AND expires_at > ?", cookies.sid, now);
+  const anchor = cookies.sid && await db.get("SELECT id,user_id,expires_at FROM sessions WHERE id = ? AND expires_at > ?", cookies.sid, now);
   let session = anchor ? await redis.getSession(cookies.sid) : null;
-  if (cookies.sid && (!anchor || !session || Number(session.expires_at) !== Number(anchor.expires_at) || Number(session.expires_at) <= now || session.id !== cookies.sid || typeof session.csrf !== "string")) {
+  if (cookies.sid && (!anchor || !session || Number(session.expires_at) !== Number(anchor.expires_at) || Number(session.expires_at) <= now || session.id !== cookies.sid || typeof session.csrf !== "string" || Number(session.user_id || 0) !== Number(anchor.user_id || 0))) {
     if (!anchor) await cleanupExpiredSessions(now, true);
     await releaseSessionReservations(cookies.sid);
     await redis.deleteSession(cookies.sid);
@@ -323,26 +388,112 @@ async function getSession(req, res) {
     await db.run("INSERT INTO sessions (id, csrf, expires_at) VALUES (?, ?, ?)", id, csrf, expiresAt);
     try { await redis.setSession({ id, user_id: null, csrf, expires_at: expiresAt }); }
     catch (error) { await db.run("DELETE FROM sessions WHERE id = ?", id); throw error; }
-    const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
-    const secure = PUBLIC_BASE_URL.startsWith("https://") || forwardedProto === "https" ? "; Secure" : "";
-    res.setHeader("Set-Cookie", `sid=${id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${secure}`);
+    setSessionCookie(res, id);
     session = { id, user_id: null, csrf, expires_at: expiresAt };
   }
   const user = session.user_id ? await db.get("SELECT id,name,email,is_admin FROM users WHERE id = ?", session.user_id) : null;
   return { ...session, user };
 }
-async function updateSessionUser(sessionId, userId) {
-  const current = await redis.getSession(sessionId);
-  if (!current) throw new Error("Session is no longer valid.");
-  const previousUserId = current.user_id || null;
-  const next = { ...current, user_id: userId || null };
-  const updated = await db.run("UPDATE sessions SET user_id = ? WHERE id = ? AND expires_at > ?", next.user_id, sessionId, Date.now());
-  if (!updated.changes) throw new Error("Session is no longer valid.");
-  try { await redis.setSession(next); }
-  catch (error) {
-    try { await db.run("UPDATE sessions SET user_id = ? WHERE id = ?", previousUserId, sessionId); } catch {}
+async function rotateSession(req, res, session, userId) {
+  const current = await redis.getSession(session.id);
+  if (!current || current.id !== session.id || Number(current.expires_at) <= Date.now()) throw new Error("Session is no longer valid.");
+  const next = {
+    id: crypto.randomBytes(32).toString("hex"),
+    user_id: userId,
+    csrf: crypto.randomBytes(24).toString("hex"),
+    expires_at: Date.now() + 30 * 86400000
+  };
+  await redis.setSession(next);
+  try {
+    await db.transaction(async tx => {
+      const anchor = await tx.get("SELECT id FROM sessions WHERE id=? AND expires_at>? FOR UPDATE", session.id, Date.now());
+      if (!anchor) throw new Error("Session is no longer valid.");
+      await tx.run("INSERT INTO sessions (id,user_id,csrf,expires_at) VALUES (?,?,?,?)", next.id, userId, next.csrf, next.expires_at);
+      await tx.run("UPDATE cart_items SET session_id=? WHERE session_id=?", next.id, session.id);
+      await tx.run("DELETE FROM sessions WHERE id=?", session.id);
+    });
+  } catch (error) {
+    await redis.deleteSession(next.id);
     throw error;
   }
+  setSessionCookie(res, next.id);
+  await redis.deleteSession(session.id);
+  return next;
+}
+
+async function revokeSession(sessionId, { releaseCart = true } = {}) {
+  if (releaseCart) await releaseSessionReservations(sessionId);
+  await db.run("DELETE FROM sessions WHERE id=?", sessionId);
+  await redis.deleteSession(sessionId);
+}
+
+async function revokeUserSessions(userId, exceptSessionId = null) {
+  const sessions = await db.transaction(async tx => {
+    const rows = await tx.all("SELECT id FROM sessions WHERE user_id=? AND id<>COALESCE(?, '') FOR UPDATE", userId, exceptSessionId);
+    await tx.run("UPDATE sessions SET expires_at=0 WHERE user_id=? AND id<>COALESCE(?, '')", userId, exceptSessionId);
+    return rows;
+  });
+  let redisError;
+  for (const row of sessions) {
+    await releaseSessionReservations(row.id);
+    await db.run("DELETE FROM sessions WHERE id=?", row.id);
+    try { await redis.deleteSession(row.id); } catch (error) { redisError ||= error; }
+  }
+  if (redisError) throw redisError;
+  return sessions.length;
+}
+
+function accountTokenHash(token) {
+  return crypto.createHash("sha256").update(String(token)).digest("hex");
+}
+
+async function issueAccountToken(user, purpose, send = message => emailService.send(message)) {
+  if (!new Set(["email_verification", "password_reset"]).has(purpose)) throw new Error("Unsupported account token purpose.");
+  const token = crypto.randomBytes(32).toString("base64url");
+  const expiresAt = new Date(Date.now() + (purpose === "password_reset" ? 60 : 24 * 60) * 60000);
+  await db.transaction(async tx => {
+    await tx.run("UPDATE account_tokens SET used_at=COALESCE(used_at,CURRENT_TIMESTAMP) WHERE user_id=? AND purpose=? AND used_at IS NULL", user.id, purpose);
+    await tx.run("INSERT INTO account_tokens (user_id,purpose,token_hash,expires_at) VALUES (?,?,?,?)", user.id, purpose, accountTokenHash(token), expiresAt);
+  });
+  const action = purpose === "password_reset" ? "password/reset" : "account/verify-email";
+  const link = `${PUBLIC_BASE_URL}/${action}?token=${encodeURIComponent(token)}`;
+  const subject = purpose === "password_reset" ? "Reset your PrintOasis password" : "Verify your PrintOasis email";
+  const text = `Use this one-time link to ${purpose === "password_reset" ? "reset your password" : "verify your email"}:\n${link}\n\nThis link expires ${purpose === "password_reset" ? "in one hour" : "in 24 hours"}. If you did not request this, you can ignore this email.`;
+  const html = `<p>Use this one-time link to ${purpose === "password_reset" ? "reset your password" : "verify your email"}:</p><p><a href="${esc(link)}">Continue to PrintOasis</a></p><p>This link expires ${purpose === "password_reset" ? "in one hour" : "in 24 hours"}. If you did not request this, you can ignore this email.</p>`;
+  return send({ to: user.email, subject, text, html });
+}
+
+async function consumeEmailVerification(token) {
+  const hash = accountTokenHash(token);
+  return db.transaction(async tx => {
+    const record = await tx.get("SELECT id,user_id FROM account_tokens WHERE token_hash=? AND purpose='email_verification' AND used_at IS NULL AND expires_at>CURRENT_TIMESTAMP FOR UPDATE", hash);
+    if (!record) return false;
+    await tx.run("UPDATE users SET email_verified=1 WHERE id=?", record.user_id);
+    await tx.run("UPDATE account_tokens SET used_at=CURRENT_TIMESTAMP WHERE id=? AND used_at IS NULL", record.id);
+    return true;
+  });
+}
+
+async function resetPasswordWithToken(token, password) {
+  const hash = accountTokenHash(token);
+  const result = await db.transaction(async tx => {
+    const record = await tx.get("SELECT id,user_id FROM account_tokens WHERE token_hash=? AND purpose='password_reset' AND used_at IS NULL AND expires_at>CURRENT_TIMESTAMP FOR UPDATE", hash);
+    if (!record) return null;
+    await tx.run("UPDATE users SET password_hash=? WHERE id=?", hashPassword(password), record.user_id);
+    await tx.run("UPDATE account_tokens SET used_at=CURRENT_TIMESTAMP WHERE id=? AND used_at IS NULL", record.id);
+    const sessions = await tx.all("SELECT id FROM sessions WHERE user_id=? FOR UPDATE", record.user_id);
+    await tx.run("UPDATE sessions SET expires_at=0 WHERE user_id=?", record.user_id);
+    return { userId: record.user_id, sessions };
+  });
+  if (!result) return false;
+  let redisError;
+  for (const row of result.sessions) {
+    await releaseSessionReservations(row.id);
+    await db.run("DELETE FROM sessions WHERE id=?", row.id);
+    try { await redis.deleteSession(row.id); } catch (error) { redisError ||= error; }
+  }
+  if (redisError) throw redisError;
+  return true;
 }
 
 async function applyRateLimits(policies, res) {
@@ -424,12 +575,14 @@ async function cartData(sessionId) {
   return { items, count: items.reduce((n, item) => n + item.quantity, 0), subtotal: items.reduce((n, item) => n + item.quantity * item.unit_price, 0) };
 }
 function redirect(res, location) {
-  res.writeHead(303, { Location: location });
+  setSecurityHeaders(res);
+  res.writeHead(303, { Location: safeLocalPath(location) });
   res.end();
 }
 
 function send(res, status, body, type = "text/html; charset=utf-8") {
-  res.writeHead(status, { "Content-Type": type, "X-Content-Type-Options": "nosniff" });
+  setSecurityHeaders(res);
+  res.writeHead(status, { "Content-Type": type });
   res.end(body);
 }
 
@@ -447,12 +600,17 @@ async function formBody(req) {
 }
 
 async function requestBuffer(req, limit = MAX_UPLOAD_BYTES + 1_000_000) {
+  try { uploadSecurity.assertRequestSize(req.headers["content-length"], limit); }
+  catch (error) {
+    req.resume();
+    throw error;
+  }
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     chunks.push(chunk);
     size += chunk.length;
-    if (size > limit) throw new Error("Request too large");
+    if (size > limit) throw Object.assign(new Error("Request too large"), { code: "UPLOAD_TOO_LARGE" });
   }
   return Buffer.concat(chunks);
 }
@@ -495,35 +653,45 @@ async function requestData(req) {
   if (type.includes("multipart/form-data")) {
     const boundary = type.match(/boundary=(?:"([^"]+)"|([^;]+))/)?.[1] || type.match(/boundary=(?:"([^"]+)"|([^;]+))/)?.[2];
     if (!boundary) throw new Error("Upload boundary missing");
-    return parseMultipart(await requestBuffer(req), boundary);
+    const pathname = new URL(req.url, PUBLIC_BASE_URL).pathname;
+    const limit = pathname === "/admin/products/save"
+      ? uploadSecurity.PRODUCT_IMAGE_AGGREGATE_LIMIT + 1_000_000
+      : uploadSecurity.ARTWORK_LIMIT + 1_000_000;
+    const data = parseMultipart(await requestBuffer(req, limit), boundary);
+    uploadSecurity.validateMultipartFiles(data.files, pathname);
+    return data;
   }
   return formBody(req);
 }
 
 function saveArtwork(file) {
-  if (!file || !file.filename || !file.data?.length) return null;
-  const original = safeFileName(file.filename);
-  const ext = path.extname(original).toLowerCase();
-  if (!ALLOWED_ARTWORK_EXTENSIONS.has(ext)) throw new Error("Unsupported artwork file type");
-  if (file.data.length > MAX_UPLOAD_BYTES) throw new Error("Artwork file is too large");
-  const stored = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}${ext}`;
-  fs.writeFileSync(path.join(UPLOAD_DIR, stored), file.data);
-  return { original, stored, mime: file.contentType, size: file.data.length };
+  if (!file || !file.filename) return null;
+  return uploadSecurity.writeUpload(UPLOAD_DIR, uploadSecurity.validateUpload(file, "artwork", MAX_UPLOAD_BYTES));
 }
 
 function saveProductImage(file) {
-  if (!file || !file.filename || !file.data?.length) return null;
-  const original = safeFileName(file.filename);
-  const ext = path.extname(original).toLowerCase();
-  if (!ALLOWED_IMAGE_EXTENSIONS.has(ext)) throw new Error("Unsupported product image type");
-  if (file.data.length > MAX_PRODUCT_IMAGE_BYTES) throw new Error("Product image is too large");
-  const stored = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}${ext}`;
-  fs.writeFileSync(path.join(PRODUCT_IMAGE_DIR, stored), file.data);
-  return { original, stored, mime: file.contentType, size: file.data.length };
+  if (!file || !file.filename) return null;
+  return uploadSecurity.writeUpload(PRODUCT_IMAGE_DIR, uploadSecurity.validateUpload(file, "image", MAX_PRODUCT_IMAGE_BYTES));
 }
 
 function saveProductImages(files) {
-  return (Array.isArray(files) ? files : [files]).map(saveProductImage).filter(Boolean);
+  const saved = [];
+  try {
+    for (const file of (Array.isArray(files) ? files : [files])) {
+      const stored = saveProductImage(file);
+      if (stored) saved.push(stored);
+    }
+    return saved;
+  } catch (error) {
+    for (const file of saved) uploadSecurity.removeUpload(PRODUCT_IMAGE_DIR, file.stored);
+    throw error;
+  }
+}
+
+function removeSavedUploads(files, directory) {
+  for (const file of files || []) {
+    if (file?.stored) uploadSecurity.removeUpload(directory, file.stored);
+  }
 }
 
 function notice(url) {
@@ -842,6 +1010,7 @@ async function productPage(product, session, cart, url) {
 
 async function authPage(mode, url, session, cart, origin) {
   const login = mode === "login";
+  const safeNext = safeLocalPath(url.searchParams.get("next"), "/account");
   return await layout(login ? "Login" : "Create account", `
     <section class="auth-shell">
       <div class="auth-art"><span class="eyebrow">WELCOME TO PRINTOASIS</span><h1>${login ? "Your print desk is ready." : "Make ordering print effortless."}</h1><p>Save configurations, track production and reorder your favourites in seconds.</p><div class="paper-stack"><i></i><i></i><i></i></div></div>
@@ -857,10 +1026,10 @@ async function authPage(mode, url, session, cart, origin) {
           ${login ? "" : `<label>Full name<input name="name" autocomplete="name" required minlength="2"></label>`}
           <label>Email address<input type="email" name="email" autocomplete="email" required></label>
           <label>Password<input type="password" name="password" autocomplete="${login ? "current-password" : "new-password"}" required minlength="8"></label>
-          <input type="hidden" name="next" value="${esc(url.searchParams.get("next") || "/account")}">
+          <input type="hidden" name="next" value="${esc(safeNext)}">
           <button class="button primary" type="submit">${login ? "Login securely" : "Create account"}</button>
         </form>
-        <p class="auth-switch">${login ? `New here? <a href="/register">Create an account</a>` : `Already have an account? <a href="/login">Login</a>`}</p>
+        <p class="auth-switch">${login ? `New here? <a href="/register">Create an account</a><br><a href="/password/reset/request">Forgot your password?</a>` : `Already have an account? <a href="/login">Login</a>`}</p>
       </div>
     </section>
   `, session, cart);
@@ -872,7 +1041,7 @@ async function cartPage(url, session, cart) {
     <section class="page-hero compact"><span class="eyebrow">YOUR ORDER</span><h1>Shopping cart</h1><p>Review your print specifications before checkout.</p></section>
     ${notice(url)}
     <section class="cart-layout section">
-      <div>${cart.items.length ? cart.items.map(item => `<article class="cart-item">${productArt(item)}<div class="cart-copy"><h3><a href="/product/${item.slug}">${esc(item.name)}</a></h3><p>${esc(item.size)} · ${esc(item.material)} · ${esc(item.print_option)}</p>${item.artwork_note ? `<small>Artwork note: ${esc(item.artwork_note)}</small>` : ""}${item.artwork_original_name ? `<small>Uploaded file: ${esc(item.artwork_original_name)}</small>` : ""}</div><form action="/cart/update" method="post"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="item_id" value="${item.id}"><label>Qty<input name="quantity" type="number" min="0" max="${item.quantity + sellableQuantity(item)}" value="${item.quantity}"></label><small>${item.quantity + sellableQuantity(item)} max available</small><button>Update</button></form><strong>${money(item.quantity * item.unit_price)}</strong></article>`).join("") : emptyState("cart", "Your cart is waiting.", "Choose a product and make it yours when the idea is ready.", "/products", "Browse products", "/help", "Need print help?")}</div>
+      <div>${cart.items.length ? cart.items.map(item => `<article class="cart-item">${productArt(item)}<div class="cart-copy"><h3><a href="/product/${item.slug}">${esc(item.name)}</a></h3><p>${esc(item.size)} · ${esc(item.material)} · ${esc(item.print_option)}</p>${item.artwork_note ? `<small>Artwork note: ${esc(item.artwork_note)}</small>` : ""}${item.artwork_original_name ? `<small>Artwork: ${session.user ? `<a href="/artwork/${encodeURIComponent(item.artwork_stored_name)}">${esc(item.artwork_original_name)}</a>` : esc(item.artwork_original_name)}</small>` : ""}</div><form action="/cart/update" method="post"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="item_id" value="${item.id}"><label>Qty<input name="quantity" type="number" min="0" max="${item.quantity + sellableQuantity(item)}" value="${item.quantity}"></label><small>${item.quantity + sellableQuantity(item)} max available</small><button>Update</button></form><strong>${money(item.quantity * item.unit_price)}</strong></article>`).join("") : emptyState("cart", "Your cart is waiting.", "Choose a product and make it yours when the idea is ready.", "/products", "Browse products", "/help", "Need print help?")}</div>
       ${cart.items.length ? `<aside class="order-summary"><h2>Order summary</h2><p><span>Subtotal</span><b>${money(totals.subtotal)}</b></p><p><span>Delivery estimate</span><b>${totals.delivery === 0 ? "FREE" : money(totals.delivery)}</b></p><p class="total"><span>Total</span><b>${money(totals.total)}</b></p><small>Taxes included. Exact shipping updates by PIN code at checkout.</small><a class="button primary" href="/checkout">Proceed to checkout</a><a href="/products">Continue shopping</a></aside>` : ""}
     </section>
   `, session, cart);
@@ -1017,7 +1186,7 @@ async function orderDetailsPage(order, session, cart) {
       <div class="order-review-actions">
         ${items.map(item => `
           <div class="review-item" id="review-${item.product_id}">
-            <span>${esc(item.product_name)} <small>Qty: ${item.quantity}</small></span>
+            <span>${esc(item.product_name)} <small>Qty: ${item.quantity}</small>${item.artwork_stored_name ? `<small>Artwork: <a href="/artwork/${encodeURIComponent(item.artwork_stored_name)}">${esc(item.artwork_original_name || "Download artwork")}</a></small>` : ""}</span>
             ${order.status === "Delivered" ? `<form class="review-form order-review-form" method="post" action="/account/reviews/save"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="order_id" value="${order.id}"><input type="hidden" name="product_id" value="${item.product_id}"><label>Rating<select name="rating">${[5, 4, 3, 2, 1].map(rating => `<option value="${rating}" ${item.review?.rating === rating ? "selected" : ""}>${rating}</option>`).join("")}</select></label><label>Comment<textarea name="comment" rows="3" minlength="8" required>${esc(item.review?.comment || "")}</textarea></label><button class="button primary" type="submit">${item.review ? "Update review" : "Submit review"}</button></form>${item.review ? `<form method="post" action="/account/reviews/delete" onsubmit="return confirm('Delete this review?');"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="order_id" value="${order.id}"><input type="hidden" name="review_id" value="${item.review.id}"><button class="button ghost" type="submit">Delete review</button></form>` : ""}` : `<small>Reviews unlock after this order is delivered.</small>`}
           </div>
         `).join("")}
@@ -1247,6 +1416,8 @@ function adminOrderRows(orders, session, editable = true) {
              href="/invoice/${encodeURIComponent(o.order_number)}">
              Invoice
           </a>
+          ${o.payment_method === "razorpay" && ["captured", "partially_refunded"].includes(o.payment_status) && !["Shipped", "Delivered", "Cancelled"].includes(o.status)
+    ? `<form method="post" action="/admin/orders/refund" class="admin-refund-form"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="order_id" value="${o.id}"><label>Refund amount <input name="amount" type="number" min="0.01" step="0.01" max="${Number(o.total).toFixed(2)}" required></label><label>Reason <input name="reason" maxlength="240"></label><button class="button ghost" type="submit">Issue refund</button></form>` : ""}
         `
             : ""
         }
@@ -1263,7 +1434,8 @@ async function adminOrdersPage(url, session, cart) {
   const params = [];
   if (query) { where.push("(o.order_number ILIKE ? OR o.customer_name ILIKE ? OR u.email ILIKE ?)"); params.push(`%${query}%`, `%${query}%`, `%${query}%`); }
   if (status) { where.push("o.status = ?"); params.push(status); }
-  const orders = await db.all(`SELECT o.*, u.email FROM orders o JOIN users u ON u.id = o.user_id${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY o.id DESC`, ...params);
+  const orders = await db.all(`SELECT o.*, u.email, p.status AS payment_status FROM orders o JOIN users u ON u.id = o.user_id
+    LEFT JOIN payments p ON p.id=o.payment_record_id${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY o.id DESC`, ...params);
   return await adminPage("Order manager", "Orders", `<div class="admin-table-heading"><div><span class="eyebrow">FULFILMENT</span><h2>Order operations</h2></div><form class="admin-list-filters" method="get" action="/admin/orders"><input name="q" value="${esc(query)}" placeholder="Order number, customer or email"><select name="status"><option value="">All statuses</option>${ORDER_STATUSES.map(item => `<option ${status === item ? "selected" : ""}>${item}</option>`).join("")}</select><button class="button ghost" type="submit">Filter</button></form></div><p class="lead">Update statuses through Pending, Printing, Packed, Shipped, Delivered and Cancelled. Cancelled orders automatically restore deducted stock once.</p>${adminOrderRows(orders, session, true)}`, session, cart);
 }
 
@@ -1371,7 +1543,7 @@ async function invoicePage(order, items, session, cart) {
 }
 
 function requireAuth(session, res, next = "/account") {
-  if (!session.user) { redirect(res, `/login?next=${encodeURIComponent(next)}&notice=${encodeURIComponent("Please login to continue.")}`); return false; }
+  if (!session.user) { redirect(res, `/login?next=${encodeURIComponent(safeLocalPath(next, "/account"))}&notice=${encodeURIComponent("Please login to continue.")}`); return false; }
   return true;
 }
 function requireAdmin(session, res) {
@@ -1430,7 +1602,7 @@ async function sendContactEnquiry(enquiry) {
   return delivery;
 }
 
-async function createLocalOrder(session, cart, data, paymentMethod, paymentId = null) {
+async function createLocalOrder(session, cart, data, paymentMethod, paymentId = null, options = {}) {
   if (!cart.items.length) throw new Error("Your cart is empty.");
   const totals = await cartTotals(cart, data.postal_code, data.coupon_code);
   if (data.coupon_code && totals.couponError) throw new Error(totals.couponError);
@@ -1451,7 +1623,10 @@ async function createLocalOrder(session, cart, data, paymentMethod, paymentId = 
     const order = await tx.run("INSERT INTO orders (order_number,user_id,total,status,customer_name,phone,address,city,postal_code,shipping_fee,discount,coupon_code,gst_number,payment_method,payment_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id", orderNumber, session.user.id, totals.total, "Pending", data.customer_name, data.phone, data.address, data.city, data.postal_code, totals.delivery, totals.discount, totals.coupon?.code || null, data.gst_number || null, paymentMethod, paymentId);
     const id = order.rows[0].id;
     for (const item of cart.items) {
-      await tx.run("INSERT INTO order_items (order_id,product_id,product_name,quantity,unit_price,configuration) VALUES (?,?,?,?,?,?)", id, item.product_id, item.name, item.quantity, item.unit_price, `${item.size} · ${item.material} · ${item.print_option}${item.artwork_original_name ? ` · Artwork: ${item.artwork_original_name}` : ""}`);
+      await tx.run(`INSERT INTO order_items (order_id,product_id,product_name,quantity,unit_price,configuration,artwork_original_name,artwork_stored_name,artwork_mime,artwork_size)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`, id, item.product_id, item.name, item.quantity, item.unit_price,
+      `${item.size} · ${item.material} · ${item.print_option}${item.artwork_original_name ? ` · Artwork: ${item.artwork_original_name}` : ""}`,
+      item.artwork_original_name || null, item.artwork_stored_name || null, item.artwork_mime || null, item.artwork_size || null);
       const deduction = await tx.run("UPDATE products SET stock = stock - ?, reserved = reserved - ? WHERE id = ? AND stock >= ? AND reserved >= ?", item.quantity, item.quantity, item.product_id, item.quantity, item.quantity);
       if (!deduction.changes) throw new Error(`Inventory changed for ${item.name}. Please review your cart.`);
     }
@@ -1459,8 +1634,326 @@ async function createLocalOrder(session, cart, data, paymentMethod, paymentId = 
     await tx.run("DELETE FROM cart_items WHERE session_id = ?", session.id);
     return id;
   });
-  notifyOrder(orderId, "order_confirmation").catch(console.error);
+  if (options.notify !== false) notifyOrder(orderId, "order_confirmation").catch(console.error);
   return orderNumber;
+}
+
+async function finalizeCapturedCheckout(session, paymentId, options = {}) {
+  const reject = (code, message) => providerOrderError(code, message);
+  const sessionId = String(session?.id || "");
+  const userId = session?.user?.id == null ? null : Number(session.user.id);
+  const normalizedPaymentId = String(paymentId || "").trim();
+  if (!sessionId || !userId || !/^\w[\w-]{0,127}$/.test(normalizedPaymentId)) {
+    throw reject("ORDER_FINALIZATION_OWNERSHIP", "This checkout cannot be finalized for the current account.");
+  }
+
+  const result = await db.transaction(async tx => {
+    const intent = await tx.get("SELECT * FROM checkout_intents WHERE session_id=? AND user_id=? AND id=(SELECT checkout_intent_id FROM payments WHERE provider='razorpay' AND provider_payment_id=?) FOR UPDATE",
+      sessionId, userId, normalizedPaymentId);
+    if (!intent) throw reject("ORDER_FINALIZATION_INTENT_NOT_FOUND", "The captured payment is not linked to this checkout session.");
+
+    const anchor = options.recovery ? null : await tx.get("SELECT user_id,expires_at FROM sessions WHERE id=? FOR UPDATE", sessionId);
+    if ((!options.recovery && (!anchor || Number(anchor.expires_at) <= Date.now() || Number(anchor.user_id) !== userId)) || Number(intent.user_id) !== userId) {
+      throw reject("ORDER_FINALIZATION_OWNERSHIP", "This checkout cannot be finalized for the current account.");
+    }
+
+    const binding = await tx.get(`
+      SELECT p.id AS payment_record_id, p.provider_payment_id, p.provider, p.status AS payment_status,
+        p.expected_amount_minor, p.verified_amount_minor, p.currency AS payment_currency,
+        po.id AS provider_order_record_id, po.provider_order_id, po.provider AS order_provider,
+        po.status AS provider_order_status, po.expected_amount_minor AS order_amount_minor,
+        po.provider_amount_minor, po.currency AS order_currency, po.provider_currency,
+        ci.id AS checkout_intent_id, ci.session_id, ci.user_id,
+        ci.amount_minor AS intent_amount_minor, ci.currency AS intent_currency,
+        ci.status AS intent_status, ci.expires_at
+      FROM payments p
+      JOIN provider_orders po ON po.id=p.provider_order_record_id
+      JOIN checkout_intents ci ON ci.id=p.checkout_intent_id
+      WHERE p.provider='razorpay' AND p.provider_payment_id=? AND ci.id=?
+      FOR UPDATE OF p, po, ci`, normalizedPaymentId, intent.id);
+    if (!binding || binding.provider !== "razorpay" || binding.order_provider !== "razorpay" ||
+        Number(binding.checkout_intent_id) !== Number(intent.id) || String(binding.session_id) !== sessionId ||
+        Number(binding.user_id) !== userId || binding.payment_status !== "captured" ||
+        binding.provider_order_status !== "created" || !binding.provider_order_id ||
+        Number(binding.expected_amount_minor) !== Number(intent.amount_minor) ||
+        Number(binding.verified_amount_minor) !== Number(intent.amount_minor) ||
+        Number(binding.order_amount_minor) !== Number(intent.amount_minor) ||
+        Number(binding.provider_amount_minor) !== Number(intent.amount_minor) ||
+        binding.payment_currency !== intent.currency || binding.order_currency !== intent.currency ||
+        binding.provider_currency !== intent.currency) {
+      throw reject("ORDER_FINALIZATION_PAYMENT_INVALID", "A confirmed captured payment is required for this checkout.");
+    }
+
+    const existing = await tx.get(`SELECT o.id,o.order_number,o.user_id,o.checkout_intent_id,o.payment_record_id,
+        p.provider_payment_id,p.status AS payment_status
+      FROM orders o LEFT JOIN payments p ON p.id=o.payment_record_id
+      WHERE o.checkout_intent_id=? FOR UPDATE OF o`, intent.id);
+    if (existing) {
+      if (Number(existing.user_id) !== userId || Number(existing.checkout_intent_id) !== Number(intent.id) ||
+          Number(existing.payment_record_id) !== Number(binding.payment_record_id) ||
+          existing.provider_payment_id !== normalizedPaymentId || existing.payment_status !== "captured") {
+        throw reject("ORDER_FINALIZATION_LINK_MISMATCH", "The existing order is not linked to this captured checkout.");
+      }
+      return { id: existing.id, order_number: existing.order_number, reused: true };
+    }
+    if ((!options.recovery && !["pending", "payment_pending"].includes(intent.status)) ||
+        (!options.recovery && new Date(intent.expires_at).getTime() <= Date.now()) ||
+        (options.recovery && !["pending", "payment_pending", "expired"].includes(intent.status))) {
+      throw reject("ORDER_FINALIZATION_INTENT_EXPIRED", "This checkout attempt is no longer eligible for order creation.");
+    }
+
+    let snapshot;
+    let shipping;
+    try {
+      snapshot = JSON.parse(typeof intent.cart_snapshot === "string" ? intent.cart_snapshot : JSON.stringify(intent.cart_snapshot));
+      shipping = JSON.parse(typeof intent.shipping_input === "string" ? intent.shipping_input : JSON.stringify(intent.shipping_input));
+    } catch {
+      throw reject("ORDER_FINALIZATION_SNAPSHOT_INVALID", "The saved checkout snapshot could not be verified.");
+    }
+    if (!Array.isArray(snapshot) || snapshot.length === 0 || !shipping || typeof shipping !== "object") {
+      throw reject("ORDER_FINALIZATION_SNAPSHOT_INVALID", "The saved checkout snapshot could not be verified.");
+    }
+    const cleanField = (value, max) => String(value || "").trim().slice(0, max);
+    const address = {
+      customer_name: cleanField(shipping.customer_name, 120),
+      phone: cleanField(shipping.phone, 30),
+      address: cleanField(shipping.address, 500),
+      city: cleanField(shipping.city, 120),
+      postal_code: cleanField(shipping.postal_code, 16),
+      gst_number: cleanField(shipping.gst_number, 40)
+    };
+    if (!address.customer_name || !address.phone || !address.address || !address.city || !/^\d{6}$/.test(address.postal_code)) {
+      throw reject("ORDER_FINALIZATION_ADDRESS_INVALID", "The saved delivery details are incomplete. Please contact support.");
+    }
+
+    const lineKey = item => JSON.stringify([
+      Number(item.cart_item_id ?? item.id), Number(item.product_id), item.size ?? null, item.material ?? null, item.print_option ?? null,
+      item.artwork_note ?? null, item.artwork_original_name ?? null, item.artwork_stored_name ?? null,
+      item.artwork_mime ?? null, item.artwork_size == null ? null : Number(item.artwork_size)
+    ]);
+    const requiredByLine = new Map();
+    const productQuantities = new Map();
+    let subtotalMinor = 0;
+    for (const item of snapshot) {
+      const productId = Number(item.product_id);
+      const quantity = Number(item.quantity);
+      const unitPriceMinor = Number(item.unit_price_minor);
+      const lineTotalMinor = Number(item.line_total_minor);
+      if (!Number.isSafeInteger(productId) || productId <= 0 || !Number.isSafeInteger(quantity) || quantity <= 0 ||
+          !Number.isSafeInteger(unitPriceMinor) || unitPriceMinor < 0 ||
+          !Number.isSafeInteger(lineTotalMinor) || lineTotalMinor !== quantity * unitPriceMinor ||
+          unitPriceMinor % 100 !== 0) {
+        throw reject("ORDER_FINALIZATION_SNAPSHOT_INVALID", "The saved checkout item details could not be verified.");
+      }
+      const key = lineKey(item);
+      requiredByLine.set(key, (requiredByLine.get(key) || 0) + quantity);
+      productQuantities.set(productId, (productQuantities.get(productId) || 0) + quantity);
+      subtotalMinor += lineTotalMinor;
+    }
+    const discountMinor = Number(shipping.discount_minor);
+    const recordedSubtotalMinor = Number(shipping.subtotal_minor);
+    const shippingMinor = Number(shipping.shipping_minor);
+    const expectedAmount = Number(intent.amount_minor);
+    if (!Number.isSafeInteger(recordedSubtotalMinor) || recordedSubtotalMinor !== subtotalMinor ||
+        !Number.isSafeInteger(discountMinor) || discountMinor < 0 || discountMinor > subtotalMinor ||
+        !Number.isSafeInteger(shippingMinor) || shippingMinor < 0 ||
+        !Number.isSafeInteger(expectedAmount) || subtotalMinor - discountMinor + shippingMinor !== expectedAmount ||
+        Number(binding.intent_amount_minor) !== expectedAmount || intent.currency !== "INR") {
+      throw reject("ORDER_FINALIZATION_SNAPSHOT_TOTAL_MISMATCH", "The saved checkout total could not be verified.");
+    }
+    for (const value of [subtotalMinor, discountMinor, shippingMinor, expectedAmount]) {
+      if (value % 100 !== 0) throw reject("ORDER_FINALIZATION_SNAPSHOT_TOTAL_MISMATCH", "The saved checkout total is not compatible with order pricing.");
+    }
+
+    // Cart rows are locked first so only reservations still owned by this session can be consumed.
+    const cartRows = await tx.all("SELECT * FROM cart_items WHERE session_id=? ORDER BY product_id,id FOR UPDATE", sessionId);
+    const productIds = [...productQuantities.keys()].sort((a, b) => a - b);
+    const products = await tx.all(`SELECT id,name,stock,reserved FROM products WHERE id IN (${productIds.map(() => "?").join(",")}) ORDER BY id FOR UPDATE`, ...productIds);
+    if (products.length !== productIds.length) throw reject("ORDER_FINALIZATION_INVENTORY_MISSING", "A checkout item is no longer available for fulfillment.");
+
+    const sessionRowsByLine = new Map();
+    for (const row of cartRows) {
+      const key = lineKey(row);
+      if (!sessionRowsByLine.has(key)) sessionRowsByLine.set(key, []);
+      sessionRowsByLine.get(key).push(row);
+    }
+    const consumeRows = [];
+    for (const [key, required] of requiredByLine) {
+      const rows = sessionRowsByLine.get(key) || [];
+      const ownedQuantity = rows.reduce((sum, row) => sum + Number(row.quantity), 0);
+      if (ownedQuantity < required) throw reject("ORDER_FINALIZATION_RESERVATION_MISSING", "The checkout reservation is no longer held by this session.");
+      let remaining = required;
+      for (const row of rows) {
+        if (!remaining) break;
+        const take = Math.min(remaining, Number(row.quantity));
+        consumeRows.push({ row, take });
+        remaining -= take;
+      }
+    }
+
+    const globalReservations = await tx.all(`SELECT product_id,COALESCE(SUM(quantity),0) AS quantity FROM cart_items
+      WHERE product_id IN (${productIds.map(() => "?").join(",")}) GROUP BY product_id`, ...productIds);
+    const reservedByProduct = new Map(globalReservations.map(row => [Number(row.product_id), Number(row.quantity)]));
+    for (const product of products) {
+      const id = Number(product.id), quantity = productQuantities.get(id), reserved = Number(product.reserved), stock = Number(product.stock);
+      if (!Number.isSafeInteger(quantity) || stock < quantity || reserved < quantity || reserved !== (reservedByProduct.get(id) || 0) || reserved > stock) {
+        throw reject("ORDER_FINALIZATION_INVENTORY_CONFLICT", `Inventory reservation for ${product.name} is inconsistent. Please contact support.`);
+      }
+    }
+
+    const orderNumber = `PO-${new Date().getFullYear()}-${crypto.randomInt(100000, 1000000)}`;
+    const order = await tx.get(`INSERT INTO orders
+      (order_number,user_id,total,status,customer_name,phone,address,city,postal_code,shipping_fee,discount,coupon_code,gst_number,
+       payment_method,payment_id,checkout_intent_id,payment_record_id)
+      VALUES (?,?,?,'Pending',?,?,?,?,?,?,?,?,?,'razorpay',?,?,?)
+      RETURNING id,order_number`, orderNumber, userId, expectedAmount / 100, address.customer_name, address.phone,
+    address.address, address.city, address.postal_code, shippingMinor / 100, discountMinor / 100,
+    intent.coupon_code || null, address.gst_number || null, normalizedPaymentId, intent.id, binding.payment_record_id);
+
+    for (const item of snapshot) {
+      const unitPrice = Number(item.unit_price_minor) / 100;
+      const configuration = `${item.size || ""} · ${item.material || ""} · ${item.print_option || ""}${item.artwork_original_name ? ` · Artwork: ${item.artwork_original_name}` : ""}`;
+      await tx.run(`INSERT INTO order_items (order_id,product_id,product_name,quantity,unit_price,configuration,artwork_original_name,artwork_stored_name,artwork_mime,artwork_size)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`, order.id, Number(item.product_id), String(item.product_name || "Printed product"),
+      Number(item.quantity), unitPrice, configuration, item.artwork_original_name || null, item.artwork_stored_name || null,
+      item.artwork_mime || null, item.artwork_size == null ? null : Number(item.artwork_size));
+    }
+    for (const productId of productIds) {
+      const quantity = productQuantities.get(productId);
+      const changed = await tx.run(`UPDATE products SET stock=stock-?, reserved=reserved-?
+        WHERE id=? AND stock>=? AND reserved>=?`, quantity, quantity, productId, quantity, quantity);
+      if (!changed.changes) throw reject("ORDER_FINALIZATION_INVENTORY_CONFLICT", "Inventory changed during order finalization.");
+    }
+    for (const { row, take } of consumeRows) {
+      const remaining = Number(row.quantity) - take;
+      const changed = remaining === 0
+        ? await tx.run("DELETE FROM cart_items WHERE id=? AND session_id=?", row.id, sessionId)
+        : await tx.run("UPDATE cart_items SET quantity=? WHERE id=? AND session_id=?", remaining, row.id, sessionId);
+      if (changed.changes !== 1) throw reject("ORDER_FINALIZATION_RESERVATION_CHANGED", "The checkout reservation changed during order finalization.");
+    }
+    if (intent.coupon_code) await tx.run("UPDATE coupons SET times_used=times_used+1 WHERE code=?", intent.coupon_code);
+    await tx.run("INSERT INTO order_status_events (order_id,status,note) VALUES (?,?,?)", order.id, "Pending", "Order confirmed and queued for artwork review.");
+    await tx.run("UPDATE checkout_intents SET status='completed',updated_at=CURRENT_TIMESTAMP WHERE id=?", intent.id);
+    return { ...order, reused: false };
+  });
+
+  if (!result.reused && options.notify !== false) notifyOrder(result.id, "order_confirmation").catch(console.error);
+  return result.order_number;
+}
+
+async function createCheckoutIntent(session, data = {}) {
+  const invalid = message => Object.assign(new Error(message), { code: "CHECKOUT_INVALID" });
+  const sessionId = String(session?.id || "");
+  if (!sessionId) throw invalid("Your session is no longer valid. Please refresh checkout.");
+  const userId = session.user?.id || null;
+  const postalCode = String(data.postal_code || "").trim().slice(0, 16);
+  const couponCode = String(data.coupon_code || "").trim().toUpperCase();
+  if (!/^\d{6}$/.test(postalCode)) throw invalid("Enter a valid 6-digit PIN code.");
+  if (couponCode.length > 24) throw invalid("Coupon code is invalid.");
+
+  return db.transaction(async tx => {
+    const items = await tx.all(`
+      SELECT ci.id, ci.product_id, ci.quantity, ci.size, ci.material, ci.print_option,
+        ci.artwork_note, ci.artwork_original_name, ci.artwork_stored_name, ci.artwork_mime,
+        ci.artwork_size, ci.unit_price, p.name, p.stock, p.reserved, p.status, p.active
+      FROM cart_items ci
+      JOIN products p ON p.id = ci.product_id
+      WHERE ci.session_id = ?
+      ORDER BY ci.product_id, ci.id
+      FOR UPDATE OF ci, p`, sessionId);
+    if (!items.length) throw invalid("Your cart is empty.");
+
+    const quantitiesByProduct = new Map();
+    for (const item of items) {
+      if (!item.active || item.status === "hidden") throw invalid(`${item.name} is no longer available.`);
+      quantitiesByProduct.set(item.product_id, (quantitiesByProduct.get(item.product_id) || 0) + Number(item.quantity));
+    }
+    for (const [productId, ownedQuantity] of quantitiesByProduct) {
+      const product = items.find(item => Number(item.product_id) === Number(productId));
+      const cartReservation = await tx.get("SELECT COALESCE(SUM(quantity),0) AS quantity FROM cart_items WHERE product_id = ?", productId);
+      const totalCartQuantity = Number(cartReservation.quantity);
+      const reserved = Number(product.reserved);
+      const stock = Number(product.stock);
+      if (!Number.isSafeInteger(ownedQuantity) || ownedQuantity <= 0 || ownedQuantity > stock || reserved !== totalCartQuantity || reserved > stock) {
+        throw invalid(`The reservation for ${product.name} could not be verified. Please review your cart.`);
+      }
+    }
+
+    if (couponCode) await tx.get("SELECT code FROM coupons WHERE code = ? FOR UPDATE", couponCode);
+    const subtotal = items.reduce((sum, item) => sum + Number(item.quantity) * Number(item.unit_price), 0);
+    const totals = await cartTotals({ items, subtotal }, postalCode, couponCode, tx);
+    if (couponCode && totals.couponError) throw invalid(totals.couponError);
+    const amountMinor = Math.round(Number(totals.total) * 100);
+    if (!Number.isSafeInteger(amountMinor) || amountMinor < 0) throw invalid("Checkout total is invalid.");
+
+    const cartSnapshot = items.map(item => ({
+      cart_item_id: Number(item.id),
+      product_id: Number(item.product_id),
+      product_name: item.name,
+      quantity: Number(item.quantity),
+      unit_price: Number(item.unit_price),
+      unit_price_minor: Math.round(Number(item.unit_price) * 100),
+      line_total_minor: Math.round(Number(item.quantity) * Number(item.unit_price) * 100),
+      size: item.size,
+      material: item.material,
+      print_option: item.print_option,
+      artwork_note: item.artwork_note,
+      artwork_original_name: item.artwork_original_name,
+      artwork_stored_name: item.artwork_stored_name,
+      artwork_mime: item.artwork_mime,
+      artwork_size: item.artwork_size
+    }));
+    const couponExpiry = totals.coupon?.expiry_date instanceof Date
+      ? `${totals.coupon.expiry_date.getFullYear()}-${String(totals.coupon.expiry_date.getMonth() + 1).padStart(2, "0")}-${String(totals.coupon.expiry_date.getDate()).padStart(2, "0")}`
+      : totals.coupon?.expiry_date ? String(totals.coupon.expiry_date).slice(0, 10) : null;
+    const couponSnapshot = totals.coupon ? {
+      code: totals.coupon.code,
+      type: totals.coupon.type,
+      value: Number(totals.coupon.value),
+      minimum_order: Number(totals.coupon.minimum_order || totals.coupon.min_total || 0),
+      maximum_discount: totals.coupon.maximum_discount == null ? null : Number(totals.coupon.maximum_discount),
+      usage_limit: totals.coupon.usage_limit == null ? null : Number(totals.coupon.usage_limit),
+      times_used: Number(totals.coupon.times_used || 0),
+      expiry_date: couponExpiry
+    } : null;
+    const shippingInput = {
+      postal_code: postalCode,
+      customer_name: String(data.customer_name || "").trim().slice(0, 120),
+      phone: String(data.phone || "").trim().slice(0, 30),
+      address: String(data.address || "").trim().slice(0, 500),
+      city: String(data.city || "").trim().slice(0, 120),
+      gst_number: String(data.gst_number || "").trim().slice(0, 40),
+      subtotal_minor: Math.round(Number(totals.subtotal) * 100),
+      discount_minor: Math.round(Number(totals.discount) * 100),
+      shipping_minor: Math.round(Number(totals.delivery) * 100),
+      coupon: couponSnapshot
+    };
+    const cartJson = JSON.stringify(cartSnapshot);
+    const shippingJson = JSON.stringify(shippingInput);
+
+    await tx.run(`UPDATE checkout_intents SET status = 'expired', updated_at = CURRENT_TIMESTAMP
+      WHERE session_id = ? AND status IN ('pending', 'payment_pending') AND expires_at <= CURRENT_TIMESTAMP`, sessionId);
+    const existing = await tx.get(`
+      SELECT id, idempotency_key, amount_minor, currency, status, expires_at
+      FROM checkout_intents
+      WHERE session_id = ? AND user_id IS NOT DISTINCT FROM ?
+        AND status IN ('pending', 'payment_pending') AND expires_at > CURRENT_TIMESTAMP
+        AND cart_snapshot = ?::jsonb AND amount_minor = ? AND currency = 'INR'
+        AND coupon_code IS NOT DISTINCT FROM ? AND shipping_input = ?::jsonb
+      ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+    sessionId, userId, cartJson, amountMinor, couponCode || null, shippingJson);
+    if (existing) return { ...existing, reused: true };
+
+    const idempotencyKey = crypto.randomBytes(32).toString("hex");
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
+    const created = await tx.get(`
+      INSERT INTO checkout_intents
+        (idempotency_key,session_id,user_id,cart_snapshot,amount_minor,currency,coupon_code,shipping_input,status,expires_at)
+      VALUES (?,?,?,?::jsonb,?,'INR',?,?::jsonb,'pending',?)
+      RETURNING id, idempotency_key, amount_minor, currency, status, expires_at`,
+    idempotencyKey, sessionId, userId, cartJson, amountMinor, couponCode || null, shippingJson, expiresAt);
+    return { ...created, reused: false };
+  });
 }
 
 async function restoreOrderInventory(orderId) {
@@ -1473,21 +1966,681 @@ async function restoreOrderInventory(orderId) {
     return true;
   });
 }
-async function createRazorpayOrder(amount, receipt) {
+function providerOrderError(code, message) {
+  return Object.assign(new Error(message), { code });
+}
+
+async function createRazorpayOrder(amountMinor, currency, receipt) {
   const authorization = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
-  const response = await fetch("https://api.razorpay.com/v1/orders", {
-    method: "POST",
-    headers: { Authorization: `Basic ${authorization}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ amount: Math.round(amount * 100), currency: "INR", receipt })
-  });
-  const value = await response.json();
-  if (!response.ok) throw new Error(value.error?.description || "Razorpay order creation failed");
+  let response;
+  try {
+    response = await fetch("https://api.razorpay.com/v1/orders", {
+      method: "POST",
+      headers: { Authorization: `Basic ${authorization}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ amount: amountMinor, currency, receipt }),
+      signal: AbortSignal.timeout(10000)
+    });
+  } catch {
+    throw providerOrderError("PROVIDER_ORDER_OUTCOME_UNKNOWN", "The provider order result is unknown. Please retry later.");
+  }
+  let value;
+  try { value = await response.json(); }
+  catch { throw providerOrderError("PROVIDER_ORDER_OUTCOME_UNKNOWN", "The provider order result is unknown. Please retry later."); }
+  if (!response.ok) {
+    if (response.status >= 400 && response.status < 500) {
+      throw providerOrderError("PROVIDER_ORDER_REJECTED", "The payment provider rejected the order request.");
+    }
+    throw providerOrderError("PROVIDER_ORDER_OUTCOME_UNKNOWN", "The provider order result is unknown. Please retry later.");
+  }
   return value;
 }
 
+async function lookupRazorpayPayment(paymentId) {
+  const authorization = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
+  let response;
+  try {
+    response = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(paymentId)}`, {
+      headers: { Authorization: `Basic ${authorization}` },
+      signal: AbortSignal.timeout(10000)
+    });
+  } catch {
+    throw providerOrderError("PAYMENT_LOOKUP_UNAVAILABLE", "Payment verification is temporarily unavailable. Please retry.");
+  }
+  if (response.status === 404) throw providerOrderError("PAYMENT_NOT_FOUND", "The payment could not be found at the provider.");
+  if (!response.ok) {
+    if (response.status >= 400 && response.status < 500) {
+      throw providerOrderError("PAYMENT_LOOKUP_REJECTED", "The provider could not verify this payment.");
+    }
+    throw providerOrderError("PAYMENT_LOOKUP_UNAVAILABLE", "Payment verification is temporarily unavailable. Please retry.");
+  }
+  try { return await response.json(); }
+  catch { throw providerOrderError("PAYMENT_LOOKUP_UNAVAILABLE", "Payment verification is temporarily unavailable. Please retry."); }
+}
+
+async function lookupRazorpayOrderPayments(orderId) {
+  const authorization = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
+  let response;
+  try {
+    response = await fetch(`https://api.razorpay.com/v1/orders/${encodeURIComponent(orderId)}/payments?count=100`, {
+      headers: { Authorization: `Basic ${authorization}` },
+      signal: AbortSignal.timeout(10000)
+    });
+  } catch {
+    throw providerOrderError("PAYMENT_LOOKUP_UNAVAILABLE", "Payment reconciliation is temporarily unavailable.");
+  }
+  if (!response.ok) throw providerOrderError("PAYMENT_LOOKUP_UNAVAILABLE", "Payment reconciliation is temporarily unavailable.");
+  let value;
+  try { value = await response.json(); }
+  catch { throw providerOrderError("PAYMENT_LOOKUP_UNAVAILABLE", "Payment reconciliation is temporarily unavailable."); }
+  if (!value || !Array.isArray(value.items)) throw providerOrderError("PAYMENT_LOOKUP_UNAVAILABLE", "Payment reconciliation response is invalid.");
+  return value.items;
+}
+
+async function createRazorpayRefund(paymentId, amountMinor, currency, idempotencyKey) {
+  const authorization = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
+  let response;
+  try {
+    response = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(paymentId)}/refund`, {
+      method: "POST",
+      headers: { Authorization: `Basic ${authorization}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ amount: amountMinor, notes: { printoasis_refund_key: idempotencyKey } }),
+      signal: AbortSignal.timeout(10000)
+    });
+  } catch {
+    throw providerOrderError("REFUND_PROVIDER_OUTCOME_UNKNOWN", "The refund result is not yet known.");
+  }
+  let value;
+  try { value = await response.json(); }
+  catch { throw providerOrderError("REFUND_PROVIDER_OUTCOME_UNKNOWN", "The refund result is not yet known."); }
+  if (!response.ok) {
+    const definitive = response.status >= 400 && response.status < 500;
+    const error = providerOrderError(definitive ? "REFUND_PROVIDER_REJECTED" : "REFUND_PROVIDER_OUTCOME_UNKNOWN",
+      definitive ? "The payment provider rejected the refund request." : "The refund result is not yet known.");
+    error.definitive = definitive;
+    throw error;
+  }
+  return value;
+}
+
+async function lookupRazorpayRefund(refundId) {
+  const authorization = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
+  let response;
+  try {
+    response = await fetch(`https://api.razorpay.com/v1/refunds/${encodeURIComponent(refundId)}`, {
+      headers: { Authorization: `Basic ${authorization}` }, signal: AbortSignal.timeout(10000)
+    });
+  } catch { throw providerOrderError("REFUND_LOOKUP_UNAVAILABLE", "Refund reconciliation is temporarily unavailable."); }
+  if (!response.ok) throw providerOrderError("REFUND_LOOKUP_UNAVAILABLE", "Refund reconciliation is temporarily unavailable.");
+  try { return await response.json(); }
+  catch { throw providerOrderError("REFUND_LOOKUP_UNAVAILABLE", "Refund reconciliation response is invalid."); }
+}
+
+async function listRazorpayRefunds(paymentId) {
+  const authorization = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
+  let response;
+  try {
+    response = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(paymentId)}/refunds?count=100`, {
+      headers: { Authorization: `Basic ${authorization}` }, signal: AbortSignal.timeout(10000)
+    });
+  } catch { throw providerOrderError("REFUND_LOOKUP_UNAVAILABLE", "Refund reconciliation is temporarily unavailable."); }
+  if (!response.ok) throw providerOrderError("REFUND_LOOKUP_UNAVAILABLE", "Refund reconciliation is temporarily unavailable.");
+  let value;
+  try { value = await response.json(); }
+  catch { throw providerOrderError("REFUND_LOOKUP_UNAVAILABLE", "Refund reconciliation response is invalid."); }
+  if (!Array.isArray(value?.items)) throw providerOrderError("REFUND_LOOKUP_UNAVAILABLE", "Refund reconciliation response is invalid.");
+  return value.items;
+}
+
+async function createProviderOrder(session, data = {}, providerCreator = createRazorpayOrder) {
+  const intent = await createCheckoutIntent(session, data);
+  const provider = "razorpay";
+  const amountMinor = Number(intent.amount_minor);
+  const currency = String(intent.currency || "").toUpperCase();
+  if (!Number.isSafeInteger(amountMinor) || amountMinor < 0 || !/^[A-Z]{3}$/.test(currency)) {
+    throw providerOrderError("PROVIDER_ORDER_INTENT_INVALID", "The checkout amount could not be verified.");
+  }
+  const receipt = `po_${intent.id}`;
+  const claimLeaseSeconds = 30;
+  const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+  async function claim(retryFailed) {
+    return db.transaction(async tx => {
+      const lockedIntent = await tx.get(`
+        SELECT id, amount_minor, currency, status, expires_at
+        FROM checkout_intents WHERE id = ? FOR UPDATE`, intent.id);
+      if (!lockedIntent || Number(lockedIntent.amount_minor) !== amountMinor || lockedIntent.currency !== currency ||
+          !["pending", "payment_pending"].includes(lockedIntent.status) || new Date(lockedIntent.expires_at).getTime() <= Date.now()) {
+        throw providerOrderError("PROVIDER_ORDER_INTENT_UNAVAILABLE", "This checkout attempt is no longer available.");
+      }
+
+      let row = await tx.get("SELECT * FROM provider_orders WHERE checkout_intent_id = ? AND provider = ? FOR UPDATE", intent.id, provider);
+      if (!row) {
+        const claimToken = crypto.randomBytes(24).toString("hex");
+        row = await tx.get(`
+          INSERT INTO provider_orders
+            (checkout_intent_id, provider, provider_order_id, provider_receipt, expected_amount_minor, currency,
+             status, attempt_count, claim_token, lease_expires_at)
+          VALUES (?, ?, NULL, ?, ?, ?, 'creating', 1, ?, CURRENT_TIMESTAMP + (? * INTERVAL '1 second'))
+          RETURNING *`, intent.id, provider, receipt, amountMinor, currency, claimToken, claimLeaseSeconds);
+        return { kind: "claimed", row, claimToken };
+      }
+
+      if (Number(row.expected_amount_minor) !== amountMinor || row.currency !== currency || row.provider_receipt !== receipt) {
+        throw providerOrderError("PROVIDER_ORDER_INTEGRITY_ERROR", "The saved provider order does not match this checkout.");
+      }
+      if (row.status === "created") {
+        if (Number(row.provider_amount_minor) !== amountMinor || row.provider_currency !== currency || !row.provider_order_id) {
+          throw providerOrderError("PROVIDER_ORDER_INTEGRITY_ERROR", "The saved provider order does not match this checkout.");
+        }
+        return { kind: "ready", row };
+      }
+      if (row.status === "creating") {
+        if (new Date(row.lease_expires_at).getTime() <= Date.now()) {
+          await tx.run(`UPDATE provider_orders SET status='unknown', claim_token=NULL, lease_expires_at=NULL,
+            last_error='claim_lease_expired', updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='creating'`, row.id);
+          return { kind: "unknown" };
+        }
+        return { kind: "waiting" };
+      }
+      if (row.status === "unknown" || row.status === "rejected") return { kind: row.status };
+      if (row.status === "failed" && !retryFailed) return { kind: "failed" };
+      if (row.status !== "failed") throw providerOrderError("PROVIDER_ORDER_STATE_INVALID", "The provider order cannot be created in its current state.");
+
+      const claimToken = crypto.randomBytes(24).toString("hex");
+      row = await tx.get(`UPDATE provider_orders SET status='creating', attempt_count=attempt_count+1,
+        claim_token=?, lease_expires_at=CURRENT_TIMESTAMP + (? * INTERVAL '1 second'), last_error=NULL,
+        updated_at=CURRENT_TIMESTAMP WHERE id=? RETURNING *`, claimToken, claimLeaseSeconds, row.id);
+      return { kind: "claimed", row, claimToken };
+    });
+  }
+
+  let retryFailed = true;
+  const waitUntil = Date.now() + 12000;
+  while (true) {
+    const decision = await claim(retryFailed);
+    if (decision.kind === "ready") return decision.row;
+    if (decision.kind === "unknown") throw providerOrderError("PROVIDER_ORDER_OUTCOME_UNKNOWN", "The provider order result is unknown. Please contact support before retrying.");
+    if (decision.kind === "rejected") throw providerOrderError("PROVIDER_ORDER_REJECTED", "The provider order was rejected because its details did not match checkout.");
+    if (decision.kind === "failed") throw providerOrderError("PROVIDER_ORDER_FAILED", "The payment provider rejected the order request. Please retry.");
+    if (decision.kind === "waiting") {
+      retryFailed = false;
+      if (Date.now() >= waitUntil) throw providerOrderError("PROVIDER_ORDER_IN_PROGRESS", "Your payment order is still being prepared. Please retry shortly.");
+      await sleep(25);
+      continue;
+    }
+
+    let providerResult;
+    try {
+      providerResult = await providerCreator(amountMinor, currency, receipt);
+    } catch (error) {
+      const rejected = error.code === "PROVIDER_ORDER_REJECTED";
+      await db.run(`UPDATE provider_orders SET status=?, claim_token=NULL, lease_expires_at=NULL,
+        last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='creating' AND claim_token=?`,
+      rejected ? "failed" : "unknown", rejected ? "provider_rejected" : "provider_outcome_unknown", decision.row.id, decision.claimToken);
+      throw providerOrderError(rejected ? "PROVIDER_ORDER_FAILED" : "PROVIDER_ORDER_OUTCOME_UNKNOWN",
+        rejected ? "The payment provider rejected the order request. Please retry." : "The provider order result is unknown. Please contact support before retrying.");
+    }
+
+    const providerOrderId = typeof providerResult?.id === "string" ? providerResult.id.trim() : "";
+    if (!providerOrderId) {
+      await db.run(`UPDATE provider_orders SET status='unknown', claim_token=NULL, lease_expires_at=NULL,
+        last_error='provider_response_missing_order_id', updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='creating' AND claim_token=?`,
+      decision.row.id, decision.claimToken);
+      throw providerOrderError("PROVIDER_ORDER_OUTCOME_UNKNOWN", "The provider order result is unknown. Please contact support before retrying.");
+    }
+
+    const returnedAmount = Number(providerResult.amount);
+    const returnedCurrency = typeof providerResult.currency === "string" ? providerResult.currency.toUpperCase() : "";
+    const receiptMismatch = providerResult.receipt != null && providerResult.receipt !== receipt;
+    if (!Number.isSafeInteger(returnedAmount) || returnedAmount !== amountMinor || returnedCurrency !== currency || receiptMismatch) {
+      try {
+        await db.run(`UPDATE provider_orders SET status='rejected', provider_order_id=?, provider_amount_minor=?, provider_currency=?,
+          claim_token=NULL, lease_expires_at=NULL, last_error='provider_response_mismatch', updated_at=CURRENT_TIMESTAMP,
+          completed_at=CURRENT_TIMESTAMP WHERE id=? AND status='creating' AND claim_token=?`,
+        providerOrderId, Number.isSafeInteger(returnedAmount) ? returnedAmount : null, returnedCurrency || null, decision.row.id, decision.claimToken);
+      } catch (error) {
+        if (error.code !== "23505") throw error;
+        await db.run(`UPDATE provider_orders SET status='unknown', claim_token=NULL, lease_expires_at=NULL,
+          last_error='provider_order_id_already_mapped', updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='creating' AND claim_token=?`,
+        decision.row.id, decision.claimToken);
+      }
+      throw providerOrderError("PROVIDER_ORDER_MISMATCH", "The payment provider returned order details that do not match checkout.");
+    }
+
+    try {
+      const saved = await db.transaction(async tx => tx.get(`UPDATE provider_orders SET status='created', provider_order_id=?,
+        provider_amount_minor=?, provider_currency=?, claim_token=NULL, lease_expires_at=NULL, last_error=NULL,
+        updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP
+        WHERE id=? AND status='creating' AND claim_token=? RETURNING *`,
+      providerOrderId, returnedAmount, returnedCurrency, decision.row.id, decision.claimToken));
+      if (!saved) throw providerOrderError("PROVIDER_ORDER_OUTCOME_UNKNOWN", "The provider order result could not be persisted safely.");
+      return saved;
+    } catch (error) {
+      if (error.code === "23505") {
+        await db.run(`UPDATE provider_orders SET status='unknown', claim_token=NULL, lease_expires_at=NULL,
+          last_error='provider_order_id_already_mapped', updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='creating' AND claim_token=?`,
+        decision.row.id, decision.claimToken);
+        throw providerOrderError("PROVIDER_ORDER_ID_CONFLICT", "The provider order could not be safely associated with this checkout.");
+      }
+      throw error;
+    }
+  }
+}
+
+function paymentStateFromProvider(payment) {
+  const status = String(payment?.status || "").toLowerCase();
+  const captured = payment?.captured === true;
+  if (status === "captured" && captured) return "captured";
+  if (status === "authorized" && !captured) return "authorized";
+  if ((status === "created" || status === "pending") && !captured) return "pending";
+  if (status === "failed" && !captured) return "failed";
+  throw providerOrderError("PAYMENT_STATUS_UNACCEPTABLE", "The provider has not confirmed an acceptable payment state.");
+}
+
+function paymentTransitionAllowed(current, next) {
+  const transitions = {
+    pending: new Set(["pending", "authorized", "captured", "failed"]),
+    authorized: new Set(["authorized", "captured", "failed"]),
+    failed: new Set(["failed", "captured"]),
+    captured: new Set(["captured"]),
+    partially_refunded: new Set(["partially_refunded"]),
+    refunded: new Set(["refunded"])
+  };
+  return Boolean(transitions[current]?.has(next));
+}
+
+async function persistVerifiedPaymentTx(tx, binding, providerPayment, nextStatus, source) {
+  const provider = binding.provider || "razorpay";
+  const paymentId = String(providerPayment.id);
+  const expectedAmount = Number(binding.intent_amount_minor);
+  const expectedCurrency = String(binding.intent_currency || "").toUpperCase();
+  const verifiedAmount = Number(providerPayment.amount);
+  const verifiedCurrency = String(providerPayment.currency || "").toUpperCase();
+  const locked = await tx.get(`
+    SELECT po.id AS provider_order_record_id, po.provider, po.provider_order_id,
+      po.expected_amount_minor, po.provider_amount_minor, po.provider_currency, po.currency AS provider_expected_currency,
+      po.status AS provider_order_status, ci.id AS checkout_intent_id, ci.session_id, ci.user_id,
+      ci.amount_minor AS intent_amount_minor, ci.currency AS intent_currency
+    FROM provider_orders po
+    JOIN checkout_intents ci ON ci.id = po.checkout_intent_id
+    WHERE po.id = ? AND ci.id = ?
+    FOR UPDATE OF po, ci`, binding.provider_order_record_id, binding.checkout_intent_id);
+  if (!locked || locked.provider_order_status !== "created" || locked.provider !== provider ||
+      String(locked.provider_order_id) !== String(binding.provider_order_id) ||
+      Number(locked.expected_amount_minor) !== expectedAmount || Number(locked.provider_amount_minor) !== expectedAmount ||
+      locked.provider_expected_currency !== expectedCurrency || locked.provider_currency !== expectedCurrency ||
+      Number(locked.intent_amount_minor) !== expectedAmount || locked.intent_currency !== expectedCurrency ||
+      (binding.session_id != null && String(locked.session_id) !== String(binding.session_id)) ||
+      (binding.user_id != null && Number(locked.user_id) !== Number(binding.user_id))) {
+    throw providerOrderError("PAYMENT_BINDING_CHANGED", "The checkout payment binding changed during verification.");
+  }
+
+  let existing = await tx.get("SELECT * FROM payments WHERE provider = ? AND provider_payment_id = ? FOR UPDATE", provider, paymentId);
+  if (existing) {
+    if (Number(existing.checkout_intent_id) !== Number(binding.checkout_intent_id) ||
+        Number(existing.provider_order_record_id) !== Number(binding.provider_order_record_id) ||
+        Number(existing.expected_amount_minor) !== expectedAmount || Number(existing.verified_amount_minor) !== verifiedAmount ||
+        existing.currency !== expectedCurrency) {
+      throw providerOrderError("PAYMENT_ID_ALREADY_BOUND", "This provider payment is already bound to another checkout.");
+    }
+    if (!paymentTransitionAllowed(existing.status, nextStatus)) {
+      throw providerOrderError("PAYMENT_STATE_TRANSITION_REJECTED", "The verified payment state cannot replace its saved state.");
+    }
+    if (existing.status === nextStatus) return { ...existing, reused: true };
+    existing = await tx.get(`UPDATE payments SET status=?, verified_amount_minor=?, verified_at=CURRENT_TIMESTAMP,
+      captured_at=CASE WHEN ?='captured' THEN COALESCE(captured_at,CURRENT_TIMESTAMP) ELSE captured_at END,
+      provider_reference=?, updated_at=CURRENT_TIMESTAMP WHERE id=? RETURNING *`,
+    nextStatus, verifiedAmount, nextStatus, source, existing.id);
+    return { ...existing, reused: true };
+  }
+
+  const inserted = await tx.get(`INSERT INTO payments
+    (checkout_intent_id,provider_order_record_id,provider,provider_payment_id,expected_amount_minor,
+     verified_amount_minor,currency,status,provider_reference,verified_at,captured_at)
+    VALUES (?,?,?,?,?,?,?, ?, ?,CURRENT_TIMESTAMP,
+      CASE WHEN ?='captured' THEN CURRENT_TIMESTAMP ELSE NULL END)
+    RETURNING *`, binding.checkout_intent_id, binding.provider_order_record_id, provider, paymentId,
+  expectedAmount, verifiedAmount, expectedCurrency, nextStatus, source, nextStatus);
+  return { ...inserted, reused: false };
+}
+
+async function verifyProviderPayment(session, data = {}, providerLookup = lookupRazorpayPayment) {
+  const invalid = (code, message) => providerOrderError(code, message);
+  const provider = "razorpay";
+  const orderId = String(data.razorpay_order_id || "").trim();
+  const paymentId = String(data.razorpay_payment_id || "").trim();
+  const signature = String(data.razorpay_signature || "").trim();
+  const suppliedIntentId = String(data.checkout_intent_id || "").trim();
+  const sessionId = String(session?.id || "");
+  const userId = session?.user?.id == null ? null : Number(session.user.id);
+  if (!sessionId || !/^\w[\w-]{0,127}$/.test(orderId) || !/^\w[\w-]{0,127}$/.test(paymentId)) {
+    throw invalid("PAYMENT_REQUEST_INVALID", "Payment details are invalid.");
+  }
+
+  const binding = await db.get(`
+    SELECT po.id AS provider_order_record_id, po.provider, po.provider_order_id, po.expected_amount_minor,
+      po.provider_amount_minor, po.provider_currency, po.currency AS provider_expected_currency, po.status AS provider_order_status,
+      ci.id AS checkout_intent_id, ci.session_id, ci.user_id, ci.amount_minor AS intent_amount_minor,
+      ci.currency AS intent_currency, s.user_id AS session_user_id, s.expires_at AS session_expires_at
+    FROM provider_orders po
+    JOIN checkout_intents ci ON ci.id = po.checkout_intent_id
+    JOIN sessions s ON s.id = ci.session_id
+    WHERE po.provider = ? AND po.provider_order_id = ?`, provider, orderId);
+  if (!binding || binding.provider !== provider || binding.provider_order_status !== "created" ||
+      String(binding.provider_order_id) !== orderId) {
+    throw invalid("PAYMENT_ORDER_NOT_FOUND", "The payment order is not available for this session.");
+  }
+  const now = Date.now();
+  if (String(binding.session_id) !== sessionId || Number(binding.session_expires_at) <= now ||
+      (binding.user_id == null ? userId != null || binding.session_user_id != null :
+        userId == null || Number(binding.user_id) !== userId || Number(binding.session_user_id) !== userId)) {
+    throw invalid("PAYMENT_OWNERSHIP_MISMATCH", "This payment does not belong to the current checkout session.");
+  }
+  if (suppliedIntentId && suppliedIntentId !== String(binding.checkout_intent_id)) {
+    throw invalid("PAYMENT_INTENT_MISMATCH", "This payment does not belong to the supplied checkout attempt.");
+  }
+  const expectedAmount = Number(binding.intent_amount_minor);
+  const expectedCurrency = String(binding.intent_currency || "").toUpperCase();
+  if (!Number.isSafeInteger(expectedAmount) || expectedAmount < 0 || !/^[A-Z]{3}$/.test(expectedCurrency) ||
+      Number(binding.expected_amount_minor) !== expectedAmount || Number(binding.provider_amount_minor) !== expectedAmount ||
+      binding.provider_expected_currency !== expectedCurrency || binding.provider_currency !== expectedCurrency) {
+    throw invalid("PAYMENT_ORDER_INTEGRITY_ERROR", "The saved payment order does not match its checkout amount.");
+  }
+
+  const expectedSignature = crypto.createHmac("sha256", RAZORPAY_KEY_SECRET)
+    .update(`${binding.provider_order_id}|${paymentId}`).digest("hex");
+  if (!/^[a-f0-9]{64}$/i.test(signature) || signature.length !== expectedSignature.length ||
+      !crypto.timingSafeEqual(Buffer.from(expectedSignature, "hex"), Buffer.from(signature, "hex"))) {
+    throw invalid("PAYMENT_INVALID_SIGNATURE", "Payment verification failed. No provider state was changed.");
+  }
+
+  // The network lookup deliberately happens before the PostgreSQL transaction.
+  const providerPayment = await providerLookup(paymentId);
+  if (!providerPayment || String(providerPayment.id || "") !== paymentId ||
+      String(providerPayment.order_id || "") !== String(binding.provider_order_id)) {
+    throw invalid("PAYMENT_PROVIDER_BINDING_MISMATCH", "The provider payment does not belong to this payment order.");
+  }
+  const verifiedAmount = Number(providerPayment.amount);
+  const verifiedCurrency = String(providerPayment.currency || "").toUpperCase();
+  if (!Number.isSafeInteger(verifiedAmount) || verifiedAmount !== expectedAmount) {
+    throw invalid("PAYMENT_AMOUNT_MISMATCH", "The provider payment amount does not match checkout.");
+  }
+  if (verifiedCurrency !== expectedCurrency) {
+    throw invalid("PAYMENT_CURRENCY_MISMATCH", "The provider payment currency does not match checkout.");
+  }
+  const nextStatus = paymentStateFromProvider(providerPayment);
+
+  try {
+    return await db.transaction(tx => persistVerifiedPaymentTx(tx, binding, providerPayment, nextStatus, "server_api_verified"));
+  } catch (error) {
+    if (error.code !== "23505") throw error;
+    const duplicate = await db.get("SELECT * FROM payments WHERE provider=? AND provider_payment_id=?", provider, paymentId);
+    if (duplicate && Number(duplicate.checkout_intent_id) === Number(binding.checkout_intent_id) &&
+        Number(duplicate.provider_order_record_id) === Number(binding.provider_order_record_id) &&
+        Number(duplicate.expected_amount_minor) === expectedAmount && Number(duplicate.verified_amount_minor) === verifiedAmount &&
+        duplicate.currency === expectedCurrency && duplicate.status === nextStatus) return { ...duplicate, reused: true };
+    throw invalid("PAYMENT_ID_ALREADY_BOUND", "This provider payment is already bound to another checkout.");
+  }
+}
+
+function razorpayWebhookPayload(rawBody, signature, secret) {
+  const invalid = (code, message) => providerOrderError(code, message);
+  if (!secret) throw invalid("WEBHOOK_NOT_CONFIGURED", "The payment webhook is not configured.");
+  const raw = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody || "");
+  const supplied = String(signature || "").trim();
+  const expected = crypto.createHmac("sha256", secret).update(raw).digest("hex");
+  if (!/^[a-f0-9]{64}$/i.test(supplied) || supplied.length !== expected.length ||
+      !crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(supplied, "hex"))) {
+    throw invalid("WEBHOOK_INVALID_SIGNATURE", "Webhook signature is invalid.");
+  }
+  let payload;
+  try { payload = JSON.parse(raw.toString("utf8")); }
+  catch { throw invalid("WEBHOOK_MALFORMED", "Webhook body is not valid JSON."); }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload) || typeof payload.event !== "string" || !payload.event.trim()) {
+    throw invalid("WEBHOOK_MALFORMED", "Webhook event is missing or invalid.");
+  }
+  return payload;
+}
+
+function safeRazorpayEvent(eventType, payload) {
+  const paymentEvent = new Set(["payment.authorized", "payment.captured", "payment.failed"]);
+  if (paymentEvent.has(eventType)) {
+    const entity = payload.payload?.payment?.entity;
+    const id = String(entity?.id || "");
+    const orderId = String(entity?.order_id || "");
+    const amount = Number(entity?.amount);
+    const currency = String(entity?.currency || "").toUpperCase();
+    if (!/^\w[\w-]{0,127}$/.test(id) || !/^\w[\w-]{0,127}$/.test(orderId) ||
+        !Number.isSafeInteger(amount) || amount < 0 || !/^[A-Z]{3}$/.test(currency) || typeof entity.status !== "string") {
+      throw providerOrderError("WEBHOOK_MALFORMED", "Payment webhook is missing required payment fields.");
+    }
+    return {
+      provider_order_id: orderId,
+      provider_payment_id: id,
+      safe_metadata: { payment_id: id, order_id: orderId, amount_minor: amount, currency, status: entity.status.toLowerCase(), captured: entity.captured === true }
+    };
+  }
+
+  if (["refund.created", "refund.processed", "refund.failed"].includes(eventType)) {
+    const entity = payload.payload?.refund?.entity;
+    const id = String(entity?.id || "");
+    const paymentId = String(entity?.payment_id || "");
+    if (!/^\w[\w-]{0,127}$/.test(id) || !/^\w[\w-]{0,127}$/.test(paymentId)) {
+      throw providerOrderError("WEBHOOK_MALFORMED", "Refund webhook is missing required reference fields.");
+    }
+    return {
+      provider_order_id: entity.order_id == null ? null : String(entity.order_id),
+      provider_payment_id: paymentId,
+      safe_metadata: {
+        refund_id: id,
+        payment_id: paymentId,
+        order_id: entity.order_id == null ? null : String(entity.order_id),
+        amount_minor: Number.isSafeInteger(Number(entity.amount)) ? Number(entity.amount) : null,
+        currency: typeof entity.currency === "string" ? entity.currency.toUpperCase() : null,
+        status: typeof entity.status === "string" ? entity.status.toLowerCase() : null
+      }
+    };
+  }
+  return { provider_order_id: null, provider_payment_id: null, safe_metadata: {} };
+}
+
+async function applyRazorpayWebhookEventTx(tx, event) {
+  const metadata = event.safe_metadata || {};
+  const invalid = async reason => {
+    const safeMetadata = JSON.stringify({ ...metadata, processing_error: reason });
+    await tx.run(`UPDATE payment_webhook_events SET processing_status='failed', processed_at=CURRENT_TIMESTAMP,
+      safe_metadata=?::jsonb WHERE id=?`, safeMetadata, event.id);
+    return { status: "failed", duplicate: false };
+  };
+  if (!["payment.authorized", "payment.captured", "payment.failed"].includes(event.event_type)) {
+    await tx.run("UPDATE payment_webhook_events SET processing_status='ignored', processed_at=CURRENT_TIMESTAMP WHERE id=?", event.id);
+    return { status: "ignored", duplicate: false };
+  }
+  const paymentId = String(event.provider_payment_id || "");
+  const orderId = String(event.provider_order_id || "");
+  const providerPayment = {
+    id: paymentId,
+    order_id: orderId,
+    amount: metadata.amount_minor,
+    currency: metadata.currency,
+    status: metadata.status,
+    captured: metadata.captured === true
+  };
+  const expectedEventState = {
+    "payment.authorized": providerPayment.status === "authorized" && !providerPayment.captured,
+    "payment.captured": providerPayment.status === "captured" && providerPayment.captured,
+    "payment.failed": providerPayment.status === "failed" && !providerPayment.captured
+  }[event.event_type];
+  if (!expectedEventState) return invalid("event_status_mismatch");
+
+  const binding = await tx.get(`
+    SELECT po.id AS provider_order_record_id, po.provider, po.provider_order_id, po.expected_amount_minor,
+      po.provider_amount_minor, po.provider_currency, po.currency AS provider_expected_currency, po.status AS provider_order_status,
+      ci.id AS checkout_intent_id, ci.session_id, ci.user_id, ci.amount_minor AS intent_amount_minor, ci.currency AS intent_currency
+    FROM provider_orders po JOIN checkout_intents ci ON ci.id=po.checkout_intent_id
+    WHERE po.provider='razorpay' AND po.provider_order_id=?`, orderId);
+  if (!binding || binding.provider_order_status !== "created" || String(binding.provider_order_id) !== orderId ||
+      String(metadata.payment_id || "") !== paymentId) return invalid("provider_order_or_payment_unknown");
+
+  const expectedAmount = Number(binding.intent_amount_minor);
+  const expectedCurrency = String(binding.intent_currency || "").toUpperCase();
+  if (!Number.isSafeInteger(expectedAmount) || Number(metadata.amount_minor) !== expectedAmount ||
+      Number(binding.expected_amount_minor) !== expectedAmount || Number(binding.provider_amount_minor) !== expectedAmount) {
+    return invalid("amount_mismatch");
+  }
+  if (String(metadata.currency || "").toUpperCase() !== expectedCurrency || binding.provider_currency !== expectedCurrency ||
+      binding.provider_expected_currency !== expectedCurrency) return invalid("currency_mismatch");
+
+  let nextStatus;
+  try { nextStatus = paymentStateFromProvider(providerPayment); }
+  catch { return invalid("unsupported_payment_status"); }
+  try {
+    await persistVerifiedPaymentTx(tx, binding, providerPayment, nextStatus, "signed_webhook");
+  } catch (error) {
+    if (!String(error.code || "").startsWith("PAYMENT_")) throw error;
+    return invalid(error.code.toLowerCase());
+  }
+  await tx.run("UPDATE payment_webhook_events SET processing_status='processed', processed_at=CURRENT_TIMESTAMP WHERE id=?", event.id);
+  return { status: "processed", duplicate: false };
+}
+
+async function processRazorpayWebhookEvent(eventId) {
+  return db.transaction(async tx => {
+    const event = await tx.get("SELECT * FROM payment_webhook_events WHERE provider='razorpay' AND provider_event_id=? FOR UPDATE", eventId);
+    if (!event) throw providerOrderError("WEBHOOK_EVENT_NOT_FOUND", "Webhook event was not found.");
+    if (["processed", "ignored", "failed"].includes(event.processing_status)) {
+      return { status: event.processing_status, duplicate: true };
+    }
+    return applyRazorpayWebhookEventTx(tx, event);
+  });
+}
+
+async function receiveRazorpayWebhook(rawBody, signature, eventId, options = {}) {
+  const secret = options.secret === undefined ? RAZORPAY_WEBHOOK_SECRET : String(options.secret);
+  const payload = razorpayWebhookPayload(rawBody, signature, secret);
+  const normalizedEventId = String(eventId || "").trim();
+  if (!/^[\w:.-]{1,200}$/.test(normalizedEventId)) {
+    throw providerOrderError("WEBHOOK_MALFORMED", "Webhook event ID is missing or invalid.");
+  }
+  const eventType = payload.event.trim().slice(0, 120);
+  const safe = safeRazorpayEvent(eventType, payload);
+  const inserted = await db.transaction(tx => tx.get(`
+    INSERT INTO payment_webhook_events
+      (provider,provider_event_id,event_type,provider_order_id,provider_payment_id,safe_metadata)
+    VALUES ('razorpay',?,?,?,?,?::jsonb)
+    ON CONFLICT (provider,provider_event_id) DO NOTHING
+    RETURNING id`, normalizedEventId, eventType, safe.provider_order_id, safe.provider_payment_id, JSON.stringify(safe.safe_metadata)));
+  const existing = inserted || await db.get("SELECT id FROM payment_webhook_events WHERE provider='razorpay' AND provider_event_id=?", normalizedEventId);
+  if (!existing) throw providerOrderError("WEBHOOK_PERSISTENCE_FAILED", "Webhook event could not be recorded.");
+  const result = await processRazorpayWebhookEvent(normalizedEventId);
+  return { ...result, duplicate: !inserted || result.duplicate };
+}
+
+async function reconcileProviderPayments(options = {}) {
+  const providerLookup = options.providerLookup || lookupRazorpayPayment;
+  const orderPaymentsLookup = options.providerOrderPaymentsLookup || lookupRazorpayOrderPayments;
+  const requestedLimit = Number(options.limit || 100);
+  const limit = Math.max(1, Math.min(500, Number.isInteger(requestedLimit) ? requestedLimit : 100));
+  const intentIds = Array.isArray(options.checkoutIntentIds)
+    ? [...new Set(options.checkoutIntentIds.map(Number).filter(Number.isSafeInteger))] : [];
+  const intentFilter = intentIds.length ? `AND provider_order_id IN
+    (SELECT provider_order_id FROM provider_orders WHERE checkout_intent_id IN (${intentIds.map(() => "?").join(",")}))` : "";
+  const pendingEvents = await db.all(`SELECT provider_event_id FROM payment_webhook_events
+    WHERE provider='razorpay' AND processing_status='received' ${intentFilter}
+    ORDER BY received_at ASC, id ASC LIMIT ?`, ...intentIds, limit);
+  const result = { checked: 0, updated: 0, unchanged: 0, failed: 0, orders_checked: 0, webhook_events: 0, unresolved_provider_orders: 0 };
+  for (const event of pendingEvents) {
+    try {
+      const processed = await processRazorpayWebhookEvent(event.provider_event_id);
+      if (processed.status === "processed" || processed.status === "ignored") result.webhook_events += 1;
+      else result.failed += 1;
+    } catch {
+      result.failed += 1;
+    }
+  }
+  const candidates = await db.all(`
+    SELECT p.provider_payment_id, p.status AS payment_status, p.provider_order_record_id, p.checkout_intent_id,
+      po.provider, po.provider_order_id, po.expected_amount_minor, po.provider_amount_minor, po.provider_currency,
+      po.currency AS provider_expected_currency, po.status AS provider_order_status,
+      ci.amount_minor AS intent_amount_minor, ci.currency AS intent_currency, ci.session_id, ci.user_id
+    FROM payments p
+    JOIN provider_orders po ON po.id=p.provider_order_record_id
+    JOIN checkout_intents ci ON ci.id=p.checkout_intent_id
+    WHERE p.provider='razorpay' AND p.status IN ('pending','authorized','failed') AND po.status='created'
+      ${intentIds.length ? `AND p.checkout_intent_id IN (${intentIds.map(() => "?").join(",")})` : ""}
+    ORDER BY p.updated_at ASC, p.id ASC LIMIT ?`, ...(intentIds.length ? [...intentIds, limit] : [limit]));
+  const unresolvedOrders = await db.get(`SELECT COUNT(*) AS count FROM provider_orders
+    WHERE provider='razorpay' AND (status='unknown' OR (status='creating' AND lease_expires_at <= CURRENT_TIMESTAMP))`);
+  result.unresolved_provider_orders = Number(unresolvedOrders.count);
+  for (const candidate of candidates) {
+    result.checked += 1;
+    try {
+      const payment = await providerLookup(candidate.provider_payment_id);
+      if (!payment || String(payment.id || "") !== String(candidate.provider_payment_id) ||
+          String(payment.order_id || "") !== String(candidate.provider_order_id) ||
+          Number(payment.amount) !== Number(candidate.intent_amount_minor) ||
+          String(payment.currency || "").toUpperCase() !== String(candidate.intent_currency).toUpperCase()) {
+        result.failed += 1;
+        continue;
+      }
+      const status = paymentStateFromProvider(payment);
+      const saved = await db.transaction(tx => persistVerifiedPaymentTx(tx, candidate, payment, status, "reconciliation_api"));
+      if (saved.reused) result.unchanged += 1;
+      else result.updated += 1;
+    } catch {
+      result.failed += 1;
+    }
+  }
+
+  const ordersWithoutPayments = await db.all(`
+    SELECT po.id AS provider_order_record_id, po.provider, po.provider_order_id, po.expected_amount_minor,
+      po.provider_amount_minor, po.provider_currency, po.currency AS provider_expected_currency,
+      po.status AS provider_order_status, ci.id AS checkout_intent_id, ci.session_id, ci.user_id,
+      ci.amount_minor AS intent_amount_minor, ci.currency AS intent_currency
+    FROM provider_orders po JOIN checkout_intents ci ON ci.id=po.checkout_intent_id
+    WHERE po.provider='razorpay' AND po.status='created'
+      AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.provider_order_record_id=po.id)
+      ${intentIds.length ? `AND ci.id IN (${intentIds.map(() => "?").join(",")})` : ""}
+    ORDER BY po.created_at ASC, po.id ASC LIMIT ?`, ...(intentIds.length ? [...intentIds, limit] : [limit]));
+  for (const order of ordersWithoutPayments) {
+    result.orders_checked += 1;
+    try {
+      const providerPayments = await orderPaymentsLookup(order.provider_order_id);
+      if (!Array.isArray(providerPayments)) throw new Error("Invalid provider payment list.");
+      for (const payment of providerPayments) {
+        if (!payment || !/^\w[\w-]{0,127}$/.test(String(payment.id || "")) ||
+            String(payment.order_id || "") !== String(order.provider_order_id) ||
+            !Number.isSafeInteger(Number(payment.amount)) || Number(payment.amount) !== Number(order.intent_amount_minor) ||
+            String(payment.currency || "").toUpperCase() !== String(order.intent_currency).toUpperCase() ||
+            Number(order.expected_amount_minor) !== Number(order.intent_amount_minor) ||
+            Number(order.provider_amount_minor) !== Number(order.intent_amount_minor) ||
+            order.provider_currency !== order.intent_currency || order.provider_expected_currency !== order.intent_currency) {
+          result.failed += 1;
+          continue;
+        }
+        try {
+          const status = paymentStateFromProvider(payment);
+          const saved = await db.transaction(tx => persistVerifiedPaymentTx(tx, order, payment, status, "reconciliation_order_lookup"));
+          if (saved.reused) result.unchanged += 1;
+          else result.updated += 1;
+        } catch {
+          result.failed += 1;
+        }
+      }
+    } catch {
+      result.failed += 1;
+    }
+  }
+  return result;
+}
+
 function servePublic(req, res, url) {
-  const file = path.join(ROOT, url.pathname);
-  if (!file.startsWith(path.join(ROOT, "public")) || !fs.existsSync(file)) return send(res, 404, "Not found", "text/plain"), true;
+  let decoded;
+  try { decoded = decodeURIComponent(url.pathname); } catch { return send(res, 404, "Not found", "text/plain"), true; }
+  const publicRoot = path.resolve(ROOT, "public");
+  const file = path.resolve(ROOT, `.${decoded}`);
+  const relative = path.relative(publicRoot, file);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative) || !fs.existsSync(file) || !fs.statSync(file).isFile()) return send(res, 404, "Not found", "text/plain"), true;
   const ext = path.extname(file);
   const types = { ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".avif": "image/avif", ".svg": "image/svg+xml" };
   send(res, 200, fs.readFileSync(file), types[ext] || "application/octet-stream");
@@ -1495,20 +2648,63 @@ function servePublic(req, res, url) {
 }
 
 function serveProductImage(req, res, url) {
-  const name = path.basename(decodeURIComponent(url.pathname.split("/").pop() || ""));
-  const file = path.join(PRODUCT_IMAGE_DIR, name);
-  if (!file.startsWith(PRODUCT_IMAGE_DIR) || !fs.existsSync(file)) return send(res, 404, "Not found", "text/plain"), true;
-  const ext = path.extname(file).toLowerCase();
-  send(res, 200, fs.readFileSync(file), imageMimeType(ext));
+  let name;
+  try { name = decodeURIComponent(url.pathname.split("/").pop() || ""); } catch { return send(res, 404, "Not found", "text/plain"), true; }
+  if (!uploadSecurity.GENERATED_FILE.test(name) || !ALLOWED_IMAGE_EXTENSIONS.has(path.extname(name).toLowerCase())) return send(res, 404, "Not found", "text/plain"), true;
+  const file = uploadSecurity.resolveContained(PRODUCT_IMAGE_DIR, name);
+  if (!fs.existsSync(file) || !fs.statSync(file).isFile()) return send(res, 404, "Not found", "text/plain"), true;
+  const bytes = fs.readFileSync(file), detected = uploadSecurity.detectFile(bytes, path.extname(name).toLowerCase());
+  if (!detected || detected.kind !== "image") return send(res, 404, "Not found", "text/plain"), true;
+  send(res, 200, bytes, detected.mime);
+  return true;
+}
+
+async function serveArtwork(req, res, url, session) {
+  let name;
+  try { name = decodeURIComponent(url.pathname.slice("/artwork/".length)); } catch { return send(res, 404, "Not found", "text/plain"), true; }
+  if (!uploadSecurity.GENERATED_FILE.test(name) || !ALLOWED_ARTWORK_EXTENSIONS.has(path.extname(name).toLowerCase())) return send(res, 404, "Not found", "text/plain"), true;
+  const admin = isAdmin(session);
+  let allowed = false;
+  if (admin) {
+    allowed = Boolean(await db.get(`SELECT 1 FROM cart_items WHERE artwork_stored_name=?
+      UNION ALL SELECT 1 FROM order_items WHERE artwork_stored_name=? LIMIT 1`, name, name));
+  } else if (session?.user?.id) {
+    allowed = Boolean(await db.get(`SELECT 1 FROM cart_items WHERE artwork_stored_name=? AND session_id=?
+      UNION ALL SELECT 1 FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE oi.artwork_stored_name=? AND o.user_id=? LIMIT 1`, name, session.id, name, session.user.id));
+  }
+  if (!allowed) return send(res, 404, "Not found", "text/plain"), true;
+  const file = uploadSecurity.resolveContained(UPLOAD_DIR, name);
+  if (!fs.existsSync(file) || !fs.statSync(file).isFile()) return send(res, 404, "Not found", "text/plain"), true;
+  const bytes = fs.readFileSync(file), extension = path.extname(name).toLowerCase();
+  const detected = uploadSecurity.detectFile(bytes, extension);
+  if (!detected || detected.kind !== "document" && detected.kind !== "image") return send(res, 404, "Not found", "text/plain"), true;
+  const referenced = await db.get(`SELECT artwork_original_name AS name FROM cart_items WHERE artwork_stored_name=?
+    UNION ALL SELECT artwork_original_name AS name FROM order_items WHERE artwork_stored_name=? LIMIT 1`, name, name);
+  const original = safeFileName(referenced?.name || name).replace(/["\\]/g, "_");
+  setSecurityHeaders(res);
+  res.writeHead(200, {
+    "Content-Type": detected.mime,
+    "Content-Disposition": `attachment; filename="${original.replace(/[^\x20-\x7e]/g, "_")}"; filename*=UTF-8''${encodeURIComponent(original)}`,
+    "Cache-Control": "private, no-store",
+    "X-Content-Type-Options": "nosniff"
+  });
+  res.end(bytes);
   return true;
 }
 
 const app = {
   ADMIN_EMAIL,
+  uploadDirectory: UPLOAD_DIR,
+  productImageDirectory: PRODUCT_IMAGE_DIR,
+  uploadSecurity,
   GOOGLE_CLIENT_ID,
+  PUBLIC_BASE_URL,
+  canonicalOrigin,
+  setSecurityHeaders,
   ORDER_STATUSES,
   RAZORPAY_KEY_ID,
   RAZORPAY_KEY_SECRET,
+  RAZORPAY_WEBHOOK_SECRET,
   addCartItem,
   addProductImages,
   accountPage,
@@ -1526,13 +2722,29 @@ const app = {
   couponFor,
   couponValidation,
   createLocalOrder,
+  finalizeCapturedCheckout,
+  createCheckoutIntent,
+  createProviderOrder,
+  verifyProviderPayment,
+  receiveRazorpayWebhook,
+  processRazorpayWebhookEvent,
+  reconcileProviderPayments,
+  requestPaymentRefund: (...args) => refundService.requestPaymentRefund(...args),
+  reconcileRefund: (...args) => refundService.reconcileRefund(...args),
+  reconcileRefunds: (...args) => refundService.reconcileRefunds(...args),
+  cancelOrder: (...args) => refundService.cancelOrder(...args),
+  recoverCapturedCheckout: (...args) => refundService.recoverCapturedCheckout(...args),
   createRazorpayOrder,
+  createRazorpayRefund,
+  lookupRazorpayPayment,
+  lookupRazorpayOrderPayments,
+  lookupRazorpayRefund,
+  listRazorpayRefunds,
   crypto,
   get db() { return db; },
   databaseHealth,
   redisHealth: async () => Boolean(redis && await redis.health()),
   redisService: () => redis,
-  updateSessionUser,
   defaultAddress,
   hashPassword,
   hasDeliveredPurchase,
@@ -1554,12 +2766,26 @@ const app = {
   releaseReservedQuantity,
   releaseSessionReservations,
   requestOrigin,
+  safeLocalPath,
+  withNotice,
+  rotateSession,
+  revokeSession,
+  revokeUserSessions,
+  clearSessionCookie: res => setSessionCookie(res, "", true),
+  issueAccountToken,
+  consumeEmailVerification,
+  resetPasswordWithToken,
+  esc,
   requireAdmin,
   requireAuth,
   restoreOrderInventory,
   saveArtwork,
   saveProductImage,
   saveProductImages,
+  requestBuffer,
+  removeSavedUploads,
+  cleanupOrphanedUploads: (options = {}) => uploadSecurity.cleanupOrphanedUploads({ uploadDir: UPLOAD_DIR, productImageDir: PRODUCT_IMAGE_DIR, ...options }),
+  serveArtwork,
   sendContactEnquiry,
   send,
   sendJson,
@@ -1576,7 +2802,10 @@ const app = {
 
 const server = http.createServer(async (req, res) => {
   try {
-    const routedUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    setSecurityHeaders(res);
+    const routedUrl = new URL(req.url, PUBLIC_BASE_URL);
+    if (routedUrl.origin !== PUBLIC_BASE_URL) return send(res, 400, "Invalid request target.", "text/plain; charset=utf-8");
+    if (await webhookRoute({ req, res, url: routedUrl, app })) return;
     if (await routes[0]({ req, res, url: routedUrl, app })) return;
     if (!await applyRateLimits(requestLimitPolicies(req, routedUrl.pathname, {}, null, "ip", TRUST_PROXY_HOPS), res)) return;
     const routedSession = await getSession(req, res);
@@ -1593,6 +2822,8 @@ const server = http.createServer(async (req, res) => {
     if (error.code !== "REDIS_UNAVAILABLE") console.error(error);
     if (res.headersSent) return res.destroy();
     if (error.code === "REDIS_UNAVAILABLE") return send(res, 503, "Service temporarily unavailable. Please try again shortly.", "text/plain; charset=utf-8");
+    if (error.code === "UPLOAD_TOO_LARGE") return send(res, 413, "Upload exceeds the allowed request size.", "text/plain; charset=utf-8");
+    if (error.code === "UPLOAD_INVALID") return send(res, 400, error.message, "text/plain; charset=utf-8");
     send(res, 500, process.env.NODE_ENV === "test" ? error.stack : "Something went wrong. Please try again.", "text/plain");
   }
 });
@@ -1601,6 +2832,7 @@ async function start() {
   try {
     await initRedis();
     await initDb();
+    await app.cleanupOrphanedUploads();
     if (!await databaseHealth(db) || !await redis.health()) throw new Error("Application dependency health check failed.");
     await new Promise((resolve, reject) => {
       server.once("error", reject);

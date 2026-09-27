@@ -3,17 +3,20 @@ module.exports = async function adminRoutes(ctx) {
   const pages = { "/admin": () => app.adminDashboardPage(session, cart), "/admin/products": () => app.adminProductsPage(url, session, cart), "/admin/coupons": () => app.adminCouponsPage(url, session, cart), "/admin/orders": () => app.adminOrdersPage(url, session, cart), "/admin/notifications": () => app.adminNotificationsPage(session, cart) };
   if (req.method === "GET" && pages[url.pathname]) { if (!app.requireAdmin(session, res)) return true; app.send(res, 200, await pages[url.pathname]()); return true; }
   if (req.method !== "POST") return false;
-  const posts = ["/admin/products/save", "/admin/products/delete", "/admin/orders/status", "/admin/coupons/save", "/admin/coupons/toggle", "/admin/coupons/delete"];
+  const posts = ["/admin/products/save", "/admin/products/delete", "/admin/orders/status", "/admin/orders/refund", "/admin/coupons/save", "/admin/coupons/toggle", "/admin/coupons/delete"];
   if (!posts.includes(url.pathname)) return false;
   if (!app.requireAdmin(session, res)) return true;
   if (!app.validCsrf(data, session)) return app.send(res, 403, "Invalid form token", "text/plain"), true;
   if (url.pathname === "/admin/products/save") {
-    const image = app.saveProductImage(data.files?.product_image), hoverImage = app.saveProductImage(data.files?.hover_image), galleryImages = app.saveProductImages(data.files?.gallery_images);
-    const galleryPlacement = ["default", "featured", "trending", "recommendation"].includes(data.gallery_placement) ? data.gallery_placement : "default";
-    const id = Number(data.id || 0), name = String(data.name || "").trim(), slug = app.slugify(data.slug || name);
-    if (!name || !slug) return app.redirect(res, "/admin/products?notice=Product+name+is+required."), true;
-    const values = { slug, name, category: data.category, price: Math.max(1, Number(data.price) || 1), min_qty: Math.max(1, Number(data.min_qty) || 1), rating: Math.max(1, Math.min(5, Number(data.rating) || 4.8)), stock: Math.max(0, Number(data.stock) || 0), status: data.status === "hidden" ? "hidden" : "active", featured: data.featured ? 1 : 0, badge: String(data.badge || "").trim(), description: String(data.description || "").trim(), sizes: String(data.sizes || "").trim(), materials: String(data.materials || "").trim(), print_options: String(data.print_options || "").trim(), color: String(data.color || "cobalt").trim(), active: data.status === "hidden" ? 0 : 1 };
+    let image, hoverImage, galleryImages = [];
     try {
+      image = app.saveProductImage(data.files?.product_image);
+      hoverImage = app.saveProductImage(data.files?.hover_image);
+      galleryImages = app.saveProductImages(data.files?.gallery_images);
+      const galleryPlacement = ["default", "featured", "trending", "recommendation"].includes(data.gallery_placement) ? data.gallery_placement : "default";
+      const id = Number(data.id || 0), name = String(data.name || "").trim(), slug = app.slugify(data.slug || name);
+      if (!name || !slug) throw new Error("Product name is required.");
+      const values = { slug, name, category: data.category, price: Math.max(1, Number(data.price) || 1), min_qty: Math.max(1, Number(data.min_qty) || 1), rating: Math.max(1, Math.min(5, Number(data.rating) || 4.8)), stock: Math.max(0, Number(data.stock) || 0), status: data.status === "hidden" ? "hidden" : "active", featured: data.featured ? 1 : 0, badge: String(data.badge || "").trim(), description: String(data.description || "").trim(), sizes: String(data.sizes || "").trim(), materials: String(data.materials || "").trim(), print_options: String(data.print_options || "").trim(), color: String(data.color || "cobalt").trim(), active: data.status === "hidden" ? 0 : 1 };
       await app.db.transaction(async tx => {
         let productId = id;
         if (id) {
@@ -26,7 +29,10 @@ module.exports = async function adminRoutes(ctx) {
         await app.addProductImages(productId, hoverImage, "hover", "default", tx); await app.addProductImages(productId, galleryImages, "gallery", galleryPlacement, tx);
       });
       app.redirect(res, "/admin/products?notice=Product+saved.");
-    } catch (error) { app.redirect(res, `/admin/products?notice=${encodeURIComponent(error.message)}`); }
+    } catch (error) {
+      app.removeSavedUploads([image, hoverImage, ...galleryImages], app.productImageDirectory);
+      app.redirect(res, `/admin/products?notice=${encodeURIComponent(error.message)}`);
+    }
     return true;
   }
   if (url.pathname === "/admin/products/delete") { await app.db.run("UPDATE products SET status = 'hidden', active = 0 WHERE id = ?", Number(data.id)); app.redirect(res, "/admin/products?notice=Product+hidden+from+storefront."); return true; }
@@ -42,10 +48,39 @@ module.exports = async function adminRoutes(ctx) {
     const status = app.ORDER_STATUSES.includes(data.status) ? data.status : "Pending", orderId = Number(data.order_id), note = String(data.note || "").trim().slice(0, 400), tracking = String(data.tracking_number || "").trim().slice(0, 80), courier = String(data.courier_name || "").trim().slice(0, 80), trackingUrl = String(data.tracking_url || "").trim().slice(0, 500), estimatedDelivery = String(data.estimated_delivery || "").trim().slice(0, 40);
     const current = await app.db.get("SELECT * FROM orders WHERE id = ?", orderId); if (!current) return app.redirect(res, "/admin/orders?notice=Order+not+found."), true;
     if (current.status === "Cancelled" && status !== "Cancelled") return app.redirect(res, "/admin/orders?notice=Cancelled+orders+cannot+be+reopened."), true;
-    if (status === "Cancelled" && current.status !== "Cancelled") await app.restoreOrderInventory(orderId);
+    if (status === "Cancelled") {
+      try {
+        const result = await app.cancelOrder(orderId);
+        const message = result.status === "completed" ? "Order cancelled; required refund and inventory actions are complete." : result.status === "failed" ? "Refund was rejected. The order remains open for support review." : "Refund is being confirmed. The order remains open until it succeeds.";
+        app.redirect(res, `/admin/orders?notice=${encodeURIComponent(message)}`);
+      } catch (error) {
+        const message = error.code === "ORDER_CANCELLATION_NOT_ALLOWED" ? error.message : "The order could not be cancelled safely.";
+        app.redirect(res, `/admin/orders?notice=${encodeURIComponent(message)}`);
+      }
+      return true;
+    }
     await app.db.transaction(async tx => { await tx.run(`UPDATE orders SET status=?,tracking_number=?,courier_name=?,tracking_url=?,estimated_delivery=?,status_updated_at=CURRENT_TIMESTAMP WHERE id=?`, status, tracking || null, courier || null, trackingUrl || null, estimatedDelivery || null, orderId); await tx.run("INSERT INTO order_status_events (order_id, status, note) VALUES (?, ?, ?)", orderId, status, note); });
     if (current.status !== status) { const event = status === "Shipped" ? "shipping_update" : status === "Delivered" ? "delivered" : "status_update"; await app.notifyOrder(orderId, event, note); if (status === "Delivered") await app.notifyOrder(orderId, "review_reminder"); }
     app.redirect(res, "/admin/orders?notice=Order+status+updated."); return true;
+  }
+  if (url.pathname === "/admin/orders/refund") {
+    const orderId = Number(data.order_id), amountText = String(data.amount || "").trim(), reason = String(data.reason || "").trim().slice(0, 240);
+    if (!Number.isSafeInteger(orderId) || !/^\d{1,8}(?:\.\d{1,2})?$/.test(amountText)) return app.redirect(res, "/admin/orders?notice=Enter+a+valid+refund+amount."), true;
+    const amountMinor = Math.round(Number(amountText) * 100);
+    const order = await app.db.get("SELECT payment_record_id FROM orders WHERE id=?", orderId);
+    if (!order?.payment_record_id || amountMinor <= 0) return app.redirect(res, "/admin/orders?notice=This+order+has+no+refundable+online+payment."), true;
+    try {
+      const refund = await app.requestPaymentRefund({
+        paymentRecordId: order.payment_record_id, orderId, amountMinor, reason,
+        operationKey: `admin-order-refund:${orderId}:${amountMinor}:${reason}`
+      });
+      const message = refund.status === "succeeded" ? "Refund completed." : refund.status === "failed" ? "Refund was rejected; no automatic retry was made." : "Refund status is uncertain or pending; reconcile before retrying.";
+      app.redirect(res, `/admin/orders?notice=${encodeURIComponent(message)}`);
+    } catch (error) {
+      const message = error.code?.startsWith("REFUND_") ? error.message : "The refund could not be processed safely.";
+      app.redirect(res, `/admin/orders?notice=${encodeURIComponent(message)}`);
+    }
+    return true;
   }
   return false;
 };

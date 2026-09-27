@@ -130,13 +130,13 @@ The checkout route requires an authenticated user and a valid CSRF token. It re-
 
 ### Authentication and Sessions
 
-Accounts use `scrypt`-hashed passwords. A random, HTTP-only, `SameSite=Lax` `sid` cookie identifies a canonical session payload in Redis; PostgreSQL retains the durable session row referenced by carts and reservation cleanup. Sessions carry a CSRF token and 30-day expiry. `requireAuth()` protects customer pages; `requireAdmin()` additionally checks `users.is_admin` for admin pages. Google sign-in is configuration-dependent and validates the ID token server-side when `GOOGLE_CLIENT_ID` is configured.
+Accounts use `scrypt`-hashed passwords. A random, HTTP-only, `SameSite=Lax` `sid` cookie identifies a canonical session payload in Redis; PostgreSQL retains the durable session row referenced by carts and reservation cleanup. Successful registration/login rotates the session ID while transferring that session's cart rows without changing reservations. Logout revokes the old ID. Password changes and resets revoke other sessions. Password-reset and email-verification links use hashed, expiring, single-use tokens delivered through configured SMTP. Google sign-in is configuration-dependent and validates the ID token server-side when `GOOGLE_CLIENT_ID` is configured.
 
 ### Security
 
-Current protections include parameterized PostgreSQL statements, database-enforced foreign keys, escaping for rendered HTML, CSRF validation on protected form submissions, authorization checks, filename/path checks for served or uploaded content, upload allowlists and size limits, HTTP-only session cookies, shared Redis rate limits, and Razorpay signature verification.
+Current protections include parameterized PostgreSQL statements, database-enforced foreign keys, escaping for rendered HTML, CSRF validation on protected form submissions, authorization checks, safe-local redirects, a configured canonical origin, response security headers, HTTP-only session cookies, shared Redis rate limits, Razorpay signature verification, server-side upload signature/structure checks, bounded multipart uploads, private customer-artwork authorization, and safe MIME/disposition headers.
 
-Current limitations: the repository does not yet include operational observability, a full CSP/security-header policy, or an automated security scanner. Live Google, Razorpay, SMTP, PostgreSQL, and Redis use require provider configuration and credentials.
+Current limitations: CSP permits inline scripts/styles for existing SSR/UI behavior; uploads are format-validated but are not malware-scanned; final unreferenced files are retained for manual review because older order rows did not preserve artwork references; and the repository does not include operational observability or an automated security scanner. Email verification does not block an otherwise valid account session. Live Google, Razorpay, SMTP, PostgreSQL, and Redis use require provider configuration and credentials. Production must configure an HTTPS `BASE_URL`; request Host and forwarded host/proto do not define the canonical origin.
 
 ### Orders, Tracking, Reviews, and Coupons
 
@@ -196,7 +196,7 @@ Copy `.env.example` to `.env`; never commit the resulting `.env` file.
 | `PGSSL`, `PGSSL_REJECT_UNAUTHORIZED`, `PGPOOL_MAX`, `PGPOOL_IDLE_TIMEOUT_MS`, `PG_CONNECT_TIMEOUT_MS` | PostgreSQL TLS and pool configuration. | Optional; defaults are supplied. |
 | `TEST_DATABASE_URL` | Isolated PostgreSQL database for `npm run db:smoke`; its Supabase project reference must differ from `DATABASE_URL`. | Required for smoke testing only. |
 | `TEST_REDIS_URL`, `TEST_REDIS_PREFIX` | Separate Redis endpoint and test namespace used by smoke/regression checks. | Required for Redis tests; endpoint must differ from production Redis. |
-| `BASE_URL`, `PORT`, `DATA_DIR` | Public base URL, port, and runtime-data directory for uploads and email outbox. | `PORT` is optional; the defaults work locally. |
+| `BASE_URL`, `PORT`, `DATA_DIR` | Canonical public origin, port, and runtime-data directory for uploads and email outbox. | `BASE_URL` defaults to localhost only outside production; HTTPS origin is required in production. `PORT` is optional. |
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | Initial/admin account configuration. | Change for production. |
 | `EMAIL_DELIVERY_ENABLED`, `EMAIL_FROM` | Enables delivery and defines sender identity. | Optional. |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS` | Nodemailer SMTP configuration. | Optional; otherwise email is logged to the outbox. |
@@ -204,6 +204,7 @@ Copy `.env.example` to `.env`; never commit the resulting `.env` file.
 | `SUPPORT_EMAIL`, `SUPPORT_PHONE`, `OFFICE_ADDRESS`, `CONTACT_RECIPIENT` | Customer-facing support and contact-enquiry details. | Optional; defaults exist. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Google provider configuration template. | Optional; sign-in UI is configuration-dependent. |
 | `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` | Razorpay online-payment configuration. | Optional; required only for the provider flow. |
+| `RAZORPAY_WEBHOOK_SECRET` | Secret configured for the Razorpay webhook endpoint at `/webhooks/razorpay`. | Optional until webhook delivery is enabled. |
 
 ## Testing and Validation
 

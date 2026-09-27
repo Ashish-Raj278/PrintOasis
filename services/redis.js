@@ -62,6 +62,10 @@ function requestLimitPolicies(req, pathname, data = {}, session = null, phase = 
   else if (pathname === "/register") policies = [ipPolicy("register", 10, 900000)];
   else if (pathname === "/auth/google") policies = [ipPolicy("google-auth", 20, 900000)];
   else if (pathname === "/account/password") policies = [ipPolicy("password-change", 10, 900000), userPolicy("password-change-user", 5, 900000)];
+  else if (pathname === "/password/reset/request") policies = [ipPolicy("password-reset-request", 10, 900000), { scope: "password-reset-account", subject: `account:${accountKey(data.email)}`, limit: 5, windowMs: 900000 }];
+  else if (pathname === "/password/reset") policies = [ipPolicy("password-reset-submit", 10, 900000), { scope: "password-reset-token", subject: `token:${accountKey(data.token)}`, limit: 5, windowMs: 900000 }];
+  else if (pathname === "/account/verify-email") policies = [ipPolicy("email-verify", 10, 900000), { scope: "email-verify-token", subject: `token:${accountKey(data.token)}`, limit: 5, windowMs: 900000 }];
+  else if (pathname === "/logout") policies = [ipPolicy("logout", 30, 900000), userPolicy("logout-session", 10, 900000)];
   else if (pathname === "/contact") policies = [ipPolicy("contact", 5, 600000)];
   else if (pathname === "/track") policies = [ipPolicy("tracking", 20, 600000)];
   else if (["/payment/create", "/payment/verify", "/payment/failed"].includes(pathname)) policies = [ipPolicy("payment", 20, 600000), userPolicy("payment-user", 20, 600000)];
@@ -73,7 +77,12 @@ function requestLimitPolicies(req, pathname, data = {}, session = null, phase = 
       userPolicy(productSave ? "admin-product-upload-user" : "admin-write-user", productSave ? 10 : 60, productSave ? 600000 : 60000)
     ];
   }
-  else if (["/cart/add", "/cart/update", "/cart/remove", "/wishlist/move-to-cart", "/account/orders/reorder"].includes(pathname)) policies = [ipPolicy("cart-write", 60, 60000), userPolicy("cart-write-user", 60, 60000)];
+  else if (pathname === "/cart/add") {
+    const uploadAttempt = String(req.headers["content-type"] || "").toLowerCase().includes("multipart/form-data");
+    policies = [ipPolicy("cart-write", 60, 60000), userPolicy("cart-write-user", 60, 60000),
+      ...(uploadAttempt ? [ipPolicy("customer-artwork-upload", 5, 600000), userPolicy("customer-artwork-upload-session", 5, 600000)] : [])];
+  }
+  else if (["/cart/update", "/cart/remove", "/wishlist/move-to-cart", "/account/orders/reorder"].includes(pathname)) policies = [ipPolicy("cart-write", 60, 60000), userPolicy("cart-write-user", 60, 60000)];
   else if (pathname === "/checkout") policies = [ipPolicy("checkout", 10, 600000), userPolicy("checkout-user", 10, 600000)];
   if (phase === "ip") return policies.filter(policy => policy.subject.startsWith("ip:"));
   return policies.filter(policy => !policy.subject.startsWith("ip:"));

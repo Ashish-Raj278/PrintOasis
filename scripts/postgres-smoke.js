@@ -8,6 +8,7 @@ const { assertIsolatedRedisTestConfig } = require("../services/redis");
 const { assertSequentialOversell, runRegression } = require("./postgres-regression");
 let restoredAssertions = 0;
 const smokeSessionIds = new Set();
+const smokeUploads = [];
 
 const envPath = path.join(__dirname, "..", ".env");
 if (fs.existsSync(envPath)) process.loadEnvFile(envPath);
@@ -58,6 +59,13 @@ async function post(path, form, cookie) {
   const response = await fetch(`${baseUrl}${path}`, { method: "POST", redirect: "manual", headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(form) });
   return { response, html: await response.text(), cookie: cookieFrom(response) || cookie };
 }
+async function postMultipart(path, fields, cookie, files = []) {
+  const form = new FormData();
+  for (const [name, value] of Object.entries(fields)) form.append(name, String(value));
+  for (const entry of files) form.append(entry.name, new Blob([entry.data], { type: entry.type }), entry.filename);
+  const response = await fetch(`${baseUrl}${path}`, { method: "POST", redirect: "manual", headers: { Cookie: cookie }, body: form });
+  return { response, html: await response.text(), cookie: cookieFrom(response) || cookie };
+}
 async function withGoogleTokenInfo(profile, work) {
   const originalFetch = global.fetch;
   global.fetch = async (input, options) => {
@@ -99,12 +107,17 @@ async function createProduct(adminCookie, slug, stock) {
 async function startSharedServer() {
   const child = spawn(process.execPath, [path.join(__dirname, "redis-test-server.js")], {
     env: { ...process.env, PORT: "0", REDIS_TEST_CHILD: "1", PRODUCTION_DATABASE_URL: productionDatabaseUrl, PRODUCTION_REDIS_URL: productionRedisUrl },
-    stdio: ["ignore", "pipe", "ignore"]
+    stdio: ["ignore", "pipe", "pipe"]
   });
   sharedServer = child;
   return new Promise((resolve, reject) => {
     let output = "";
-    const timeout = setTimeout(() => { child.kill(); reject(new Error("Second app process did not become ready.")); }, 15000);
+    let errorOutput = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", chunk => { errorOutput += chunk; });
+    const startupError = () => [process.env.DATABASE_URL, process.env.TEST_DATABASE_URL, process.env.REDIS_URL, process.env.TEST_REDIS_URL]
+      .filter(Boolean).reduce((text, secret) => text.split(secret).join("[connection redacted]"), errorOutput).trim();
+    const timeout = setTimeout(() => { child.kill(); reject(new Error(`Second app process did not become ready.${startupError() ? ` ${startupError()}` : ""}`)); }, 15000);
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", chunk => {
       output += chunk;
@@ -112,7 +125,7 @@ async function startSharedServer() {
       if (match) { clearTimeout(timeout); sharedBaseUrl = `http://127.0.0.1:${match[1]}`; resolve(); }
     });
     child.once("error", () => { clearTimeout(timeout); reject(new Error("Could not launch second app process.")); });
-    child.once("exit", code => { if (!sharedBaseUrl) { clearTimeout(timeout); reject(new Error(`Second app process exited before readiness (${code}).`)); } });
+    child.once("exit", code => { if (!sharedBaseUrl) { clearTimeout(timeout); reject(new Error(`Second app process exited before readiness (${code}).${startupError() ? ` ${startupError()}` : ""}`)); } });
   });
 }
 async function stopSharedServer() {
@@ -155,6 +168,7 @@ async function cleanup() {
     if (smokeSessionIds.size) await tx.run(`DELETE FROM sessions WHERE id IN (${[...smokeSessionIds].map(() => "?").join(",")})`, ...smokeSessionIds);
     await tx.run("DELETE FROM coupons WHERE code LIKE ?", `${prefix.toUpperCase()}%`);
   });
+  for (const entry of smokeUploads.splice(0)) app.removeSavedUploads([{ stored: entry.name }], entry.directory);
 }
 async function cleanupRedisNamespace() {
   const client = app.redisService().client;
@@ -184,7 +198,7 @@ async function main() {
     const googleCookie = `${googlePage.cookie}; g_csrf_token=${googleCsrf}`;
     const rejectedGoogle = await post("/auth/google", { csrf: csrf(googlePage.html), g_csrf_token: "mismatched-token", credential: "test-only-token" }, googleCookie);
     assert.equal(rejectedGoogle.response.status, 303, "Google sign-in rejects a mismatched double-submit CSRF token.");
-    assert.match(rejectedGoogle.response.headers.get("location") || "", /Google%20sign-in%20could%20not%20be%20verified/, "Google CSRF rejection explains the verification failure.");
+    assert.equal(new URL(rejectedGoogle.response.headers.get("location") || "/", baseUrl).searchParams.get("notice"), "Google sign-in could not be verified.", "Google CSRF rejection explains the verification failure.");
     const googleEmail = `${prefix}-google@example.test`;
     const googleAuth = await withGoogleTokenInfo({ aud: process.env.GOOGLE_CLIENT_ID, email_verified: "true", sub: `${prefix}-google-sub`, email: googleEmail, name: "Google Smoke User" }, () =>
       post("/auth/google", { csrf: csrf(googlePage.html), g_csrf_token: googleCsrf, credential: "test-only-token" }, googleCookie));
@@ -310,7 +324,7 @@ async function main() {
     const hidden = await post("/admin/products/delete", { csrf: csrf(await (await get("/admin/products", admin)).html), id: reservationProduct.id }, admin);
     assert.equal(hidden.response.status, 303, "Admin hide should redirect.");
     const hiddenPage = await get(`/product/${reservationProduct.slug}`); assert.equal(hiddenPage.response.status, 404, "Hidden products must not be purchasable.");
-    restoredAssertions += await runRegression({ app, get, post, csrf, prefix, admin, customer, product, deliveredOrder, register, login, addToCart, sessionId, createProduct });
+    restoredAssertions += await runRegression({ app, get, post, postMultipart, csrf, prefix, admin, customer, product, deliveredOrder, register, login, addToCart, sessionId, createProduct, trackUpload: (name, directory) => smokeUploads.push({ name, directory }) });
     console.log(`PASS PostgreSQL smoke: existing PostgreSQL stages plus restored regression assertions (${restoredAssertions}).`);
   } finally {
     await stopSharedServer();
