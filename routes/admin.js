@@ -1,12 +1,54 @@
 module.exports = async function adminRoutes(ctx) {
   const { req, res, url, data, session, cart, app } = ctx;
-  const pages = { "/admin": () => app.adminDashboardPage(session, cart), "/admin/products": () => app.adminProductsPage(url, session, cart), "/admin/coupons": () => app.adminCouponsPage(url, session, cart), "/admin/orders": () => app.adminOrdersPage(url, session, cart), "/admin/notifications": () => app.adminNotificationsPage(session, cart) };
+  const pages = { "/admin": () => app.adminDashboardPage(session, cart), "/admin/products": () => app.adminProductsPage(url, session, cart), "/admin/coupons": () => app.adminCouponsPage(url, session, cart), "/admin/orders": () => app.adminOrdersPage(url, session, cart), "/admin/payments/recovery": () => app.adminPaymentRecoveryPage(url, session, cart), "/admin/notifications": () => app.adminNotificationsPage(session, cart) };
   if (req.method === "GET" && pages[url.pathname]) { if (!app.requireAdmin(session, res)) return true; app.send(res, 200, await pages[url.pathname]()); return true; }
   if (req.method !== "POST") return false;
-  const posts = ["/admin/products/save", "/admin/products/delete", "/admin/orders/status", "/admin/orders/refund", "/admin/coupons/save", "/admin/coupons/toggle", "/admin/coupons/delete"];
+  const posts = ["/admin/products/save", "/admin/products/delete", "/admin/orders/status", "/admin/orders/refund", "/admin/coupons/save", "/admin/coupons/toggle", "/admin/coupons/delete", "/admin/payments/recovery/reconcile", "/admin/payments/recovery/one"];
   if (!posts.includes(url.pathname)) return false;
   if (!app.requireAdmin(session, res)) return true;
   if (!app.validCsrf(data, session)) return app.send(res, 403, "Invalid form token", "text/plain"), true;
+  if (url.pathname === "/admin/payments/recovery/reconcile") {
+    const parts = [];
+    try {
+      const payments = await app.reconcileProviderPayments({ limit: 50 });
+      parts.push(`Payments: checked ${payments.checked}, updated ${payments.updated}, unchanged ${payments.unchanged}, failed ${payments.failed}, orders checked ${payments.orders_checked}, webhook events ${payments.webhook_events}, unresolved provider orders ${payments.unresolved_provider_orders}.`);
+    } catch {
+      parts.push("Payment reconciliation failed.");
+    }
+    try {
+      const refunds = await app.reconcileRefunds({ limit: 50 });
+      parts.push(`Refunds: checked ${refunds.checked}, changed ${refunds.changed}, unresolved ${refunds.unresolved}.`);
+    } catch {
+      parts.push("Refund reconciliation failed.");
+    }
+    app.redirect(res, `/admin/payments/recovery?notice=${encodeURIComponent(parts.join(" "))}`);
+    return true;
+  }
+  if (url.pathname === "/admin/payments/recovery/one") {
+    const paymentId = String(data.provider_payment_id || "").trim();
+    if (!/^\w[\w-]{0,127}$/.test(paymentId)) {
+      app.redirect(res, `/admin/payments/recovery?notice=${encodeURIComponent("Select a valid captured payment candidate.")}`);
+      return true;
+    }
+    const candidate = await app.db.get(`
+      SELECT p.provider_payment_id
+      FROM payments p JOIN checkout_intents ci ON ci.id=p.checkout_intent_id
+      LEFT JOIN orders o ON o.checkout_intent_id=ci.id
+      WHERE p.provider='razorpay' AND p.status='captured' AND p.provider_payment_id=? AND o.id IS NULL`, paymentId);
+    if (!candidate) {
+      app.redirect(res, `/admin/payments/recovery?notice=${encodeURIComponent("That payment is no longer an eligible recovery candidate.")}`);
+      return true;
+    }
+    try {
+      const result = await app.recoverCapturedCheckout(candidate.provider_payment_id, { finalize: app.finalizeCapturedCheckout });
+      const order = result.order_number ? ` Order ${result.order_number}.` : "";
+      app.redirect(res, `/admin/payments/recovery?notice=${encodeURIComponent(`Recovery result: ${result.status}.${order}`)}`);
+    } catch (error) {
+      const code = /^[A-Z0-9_]{1,80}$/.test(String(error.code || "")) ? ` (${error.code})` : "";
+      app.redirect(res, `/admin/payments/recovery?notice=${encodeURIComponent(`Recovery failed${code}. Review the payment state before retrying.`)}`);
+    }
+    return true;
+  }
   if (url.pathname === "/admin/products/save") {
     let image, hoverImage, galleryImages = [];
     try {

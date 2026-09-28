@@ -1437,7 +1437,7 @@ async function infoPage(kind, session, cart, url = new URL("/", "http://localhos
 }
 
 function adminTabs(active) {
-  const tabs = [["/admin", "Dashboard"], ["/admin/products", "Products"], ["/admin/coupons", "Coupons"], ["/admin/orders", "Orders"], ["/admin/notifications", "Notifications"]];
+  const tabs = [["/admin", "Dashboard"], ["/admin/products", "Products"], ["/admin/coupons", "Coupons"], ["/admin/orders", "Orders"], ["/admin/payments/recovery", "Payment recovery"], ["/admin/notifications", "Notifications"]];
   return `<aside aria-label="Admin navigation">${tabs.map(([href, label]) => `<a class="${active === label ? "active" : ""}" href="${href}"${active === label ? ' aria-current="page"' : ""}>${label}</a>`).join("")}</aside>`;
 }
 
@@ -1641,6 +1641,32 @@ async function adminOrdersPage(url, session, cart) {
   const orders = await db.all(`SELECT o.*, u.email, p.status AS payment_status FROM orders o JOIN users u ON u.id = o.user_id
     LEFT JOIN payments p ON p.id=o.payment_record_id${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY o.id DESC`, ...params);
   return await adminPage("Order manager", "Orders", `<div class="admin-table-heading"><div><span class="eyebrow">FULFILMENT</span><h2>Order operations</h2></div><form class="admin-list-filters" method="get" action="/admin/orders"><input name="q" value="${esc(query)}" placeholder="Order number, customer or email"><select name="status"><option value="">All statuses</option>${ORDER_STATUSES.map(item => `<option ${status === item ? "selected" : ""}>${item}</option>`).join("")}</select><button class="button ghost" type="submit">Filter</button></form></div><p class="lead">Update statuses through Pending, Printing, Packed, Shipped, Delivered and Cancelled. Cancelled orders automatically restore deducted stock once.</p>${adminOrderRows(orders, session, true)}`, session, cart);
+}
+
+async function adminPaymentRecoveryPage(url, session, cart) {
+  const candidates = await db.all(`
+    SELECT p.provider_payment_id, p.verified_amount_minor, p.currency, p.updated_at, ci.id AS checkout_intent_id
+    FROM payments p
+    JOIN checkout_intents ci ON ci.id=p.checkout_intent_id
+    LEFT JOIN orders o ON o.checkout_intent_id=ci.id
+    WHERE p.provider='razorpay' AND p.status='captured' AND o.id IS NULL
+    ORDER BY p.updated_at ASC, p.id ASC LIMIT 50`);
+  const unresolved = await db.all(`
+    SELECT id, provider_receipt, status, last_error, updated_at
+    FROM provider_orders
+    WHERE provider='razorpay' AND (status='unknown' OR (status='creating' AND lease_expires_at <= CURRENT_TIMESTAMP))
+    ORDER BY updated_at ASC, id ASC LIMIT 50`);
+  const candidateRows = candidates.length ? candidates.map(payment => `<article><div><b>${esc(payment.provider_payment_id)}</b><small>Checkout intent ${esc(payment.checkout_intent_id)} · ${moneyMinor(payment.verified_amount_minor)} · Updated ${new Date(payment.updated_at).toLocaleString("en-IN")}</small><small>Captured payment has no finalized order. Recovery may place the order or initiate the existing safeguarded refund path if fulfillment is no longer possible.</small></div><form method="post" action="/admin/payments/recovery/one"><input type="hidden" name="csrf" value="${esc(session.csrf)}"><input type="hidden" name="provider_payment_id" value="${esc(payment.provider_payment_id)}"><button class="button primary" type="submit" onclick="return confirm('Recover only this payment? If the checkout can no longer be fulfilled, the existing recovery flow may issue a refund.');">Recover this payment</button></form></article>`).join("") : `<div class="empty slim"><h3>No captured payments need order recovery</h3><p>Run reconciliation to refresh payment and refund states.</p></div>`;
+  const unresolvedRows = unresolved.length ? unresolved.map(row => `<article><div><b>${esc(row.provider_receipt || `Provider order ${row.id}`)}</b><small>${esc(row.status)} · ${esc(row.last_error || "No stored detail")} · Updated ${new Date(row.updated_at).toLocaleString("en-IN")}</small><small>Unresolved operator investigation. This operation does not attempt to resolve provider orders in this state.</small></div></article>`).join("") : `<p>No unresolved provider-order creation attempts.</p>`;
+  const noticeText = String(url.searchParams.get("notice") || "").slice(0, 500);
+  return await adminPage("Payment recovery", "Payment recovery", `
+    ${noticeText ? `<p class="notice" role="status">${esc(noticeText)}</p>` : ""}
+    <p class="lead">Reconciliation checks provider and refund state with bounded requests. It does not automatically recover captured payments or retry failed/ignored webhook events.</p>
+    <form method="post" action="/admin/payments/recovery/reconcile"><input type="hidden" name="csrf" value="${esc(session.csrf)}"><button class="button primary" type="submit">Reconcile payments and refunds</button><small>Each reconciliation is limited to 50 records per run.</small></form>
+    <section class="admin-table"><h2>Captured payments without orders</h2><div>${candidateRows}</div></section>
+    <section class="admin-table"><h2>Unresolved provider-order attempts</h2><div>${unresolvedRows}</div></section>
+    <p class="input-help">Webhook events marked failed or ignored are not treated as recovered by this page.</p>
+  `, session, cart);
 }
 
 async function adminNotificationsPage(session, cart) {
@@ -2948,6 +2974,7 @@ const app = {
   adminCouponsPage,
   adminNotificationsPage,
   adminOrdersPage,
+  adminPaymentRecoveryPage,
   adminProductsPage,
   authPage,
   cartData,
