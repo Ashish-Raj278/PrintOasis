@@ -207,7 +207,7 @@ Copy `.env.example` to `.env`; never commit the resulting `.env` file.
 | `SUPPORT_EMAIL`, `SUPPORT_PHONE`, `OFFICE_ADDRESS`, `CONTACT_RECIPIENT` | Customer-facing support and contact-enquiry details. | Optional; defaults exist. |
 | `GST_RATE_BPS` | Inclusive-tax extraction rate in basis points; defaults to `1800` to preserve existing display arithmetic. | Configure only after tax review; it does not change checkout totals. |
 | `SELLER_LEGAL_NAME`, `SELLER_REGISTERED_ADDRESS`, `SELLER_GSTIN` | Seller identity snapshotted onto new invoices. | Supply real, verified business values before issuing production invoices; GSTIN only if applicable. |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Google provider configuration template. | Optional; sign-in UI is configuration-dependent. |
+| `GOOGLE_CLIENT_ID` | Google ID-token audience used by the sign-in flow. | Optional; only needed when Google sign-in is enabled. |
 | `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` | Razorpay online-payment configuration. | Optional; required only for the provider flow. |
 | `RAZORPAY_WEBHOOK_SECRET` | Secret configured for the Razorpay webhook endpoint at `/webhooks/razorpay`. | Optional until webhook delivery is enabled. |
 
@@ -230,7 +230,7 @@ npm run db:order-integrity:smoke
 
 ## Deployment
 
-The repository includes a [Dockerfile](Dockerfile), [Render Blueprint](render.yaml), and [deployment guide](docs/DEPLOYMENT.md). The included Render configuration mounts `/var/data` for uploads and email-outbox persistence; production also requires managed PostgreSQL and Redis services. Configure secrets in the host's environment settings, not in Git.
+The repository includes a [Dockerfile](Dockerfile), [Render Blueprint](render.yaml), and [deployment guide](docs/DEPLOYMENT.md). The included Render configuration mounts `/var/data` for uploads and email-outbox persistence; production also requires managed PostgreSQL and Redis services. Configure secrets in the host's environment settings, not in Git. Use the [pre-production environment checklist](docs/PRODUCTION_ENVIRONMENT_CHECKLIST.md) to close the real deployment values and the [operations runbook](docs/OPERATIONS_RUNBOOK.md) for recovery decisions.
 
 For PostgreSQL backup/restore, local artwork recovery, SMTP failures, Redis outages, migration recovery, and payment-provider incidents, see the [operations runbook](docs/OPERATIONS_RUNBOOK.md). `/healthz` checks PostgreSQL and Redis only; it does not verify SMTP or Razorpay availability. Uploaded files remain on a single instance's persistent disk until object storage is implemented.
 
@@ -258,6 +258,7 @@ Google, Razorpay, and SMTP are implementation-ready but configuration-dependent;
 
 - [Source guide](docs/SOURCE-GUIDE.md)
 - [Deployment guide](docs/DEPLOYMENT.md)
+- [Pre-production environment checklist](docs/PRODUCTION_ENVIRONMENT_CHECKLIST.md)
 - [Operations runbook](docs/OPERATIONS_RUNBOOK.md)
 - [GitHub and client sharing guide](docs/GITHUB-AND-CLIENT.md)
 - [Image library contract](IMAGE_LIBRARY.md)

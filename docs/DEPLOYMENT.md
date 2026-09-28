@@ -35,6 +35,12 @@ on your laptop staying on.
 
 ## Required Environment Variables
 
+Use the [production environment checklist](PRODUCTION_ENVIRONMENT_CHECKLIST.md)
+as the complete variable-by-variable release checklist. The values below are
+illustrative names only: do not copy sample credentials or business identity
+into deployment settings. Configure each secret directly in the hosting
+provider's private environment settings.
+
 Set these before sharing the production admin link. `DATABASE_URL` is required and must point to the managed PostgreSQL database:
 
 ```text
@@ -73,8 +79,10 @@ transport mode. Confirm the correct `TRUST_PROXY_HOPS` for the actual network
 path instead of copying a generic value. Startup waits for PostgreSQL,
 migrations, and Redis before listening. `/healthz` returns only generic
 database-and-Redis readiness; it does not probe disk, SMTP, Razorpay, or email
-delivery. See the [operations runbook](OPERATIONS_RUNBOOK.md) for recovery
-procedures.
+delivery. `GOOGLE_CLIENT_SECRET` and `GOOGLE_REDIRECT_URI` are not consumed by
+the current server; Google sign-in uses `GOOGLE_CLIENT_ID` for ID-token
+audience validation. See the [operations runbook](OPERATIONS_RUNBOOK.md) for
+recovery procedures and project-specific backup verification.
 
 ```text
 ADMIN_EMAIL=owner-or-admin@example.com
