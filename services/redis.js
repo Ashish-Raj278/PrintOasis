@@ -1,6 +1,7 @@
 const crypto = require("node:crypto");
 const net = require("node:net");
 const { createClient } = require("redis");
+const { errorContext, logger } = require("./logger");
 
 const RATE_LIMIT_SCRIPT = `
 local count = redis.call('INCR', KEYS[1])
@@ -101,7 +102,17 @@ function createRedisService(env = process.env, clientOverride = null) {
       reconnectStrategy: retries => retries >= 5 ? new Error("Redis connection retries exhausted.") : Math.min(250 * (retries + 1), 1500)
     }
   });
-  client.on("error", () => {});
+  let connectionFailureLogged = false;
+  client.on("error", error => {
+    if (connectionFailureLogged) return;
+    connectionFailureLogged = true;
+    logger.error("redis.connection_failed", errorContext(error, "redis"));
+  });
+  client.on("ready", () => {
+    if (!connectionFailureLogged) return;
+    connectionFailureLogged = false;
+    logger.info("redis.connection_restored", { dependency: "redis" });
+  });
   const sessionKey = id => `${prefix}:session:${id}`;
   const rateKey = (scope, subject) => `${prefix}:rate:${scope}:${accountKey(subject)}`;
 

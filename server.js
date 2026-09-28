@@ -5,6 +5,7 @@ const crypto = require("node:crypto");
 const { createDatabaseFromEnv, runMigrations, databaseHealth } = require("./services/database");
 const { createRedisService, requestLimitPolicies } = require("./services/redis");
 const { createObjectStorageFromEnv, objectKey } = require("./services/object-storage");
+const { attachRequestId, errorContext, logger } = require("./services/logger");
 const uploadSecurity = require("./services/upload-security");
 const { URL } = require("node:url");
 const { categories, products: catalogProducts, productPriorities } = require("./catalog");
@@ -833,7 +834,7 @@ async function removeSavedUploads(files, directory) {
   for (const file of files || []) {
     if (!file?.stored) continue;
     try { await storage.delete({ kind, key: file.stored }); }
-    catch { console.error("Object cleanup failed after a database operation; the storage reconciliation tool may find an orphan."); }
+    catch (error) { logger.error("object_storage.compensation_failed", errorContext(error, "object_storage")); }
   }
 }
 
@@ -1714,16 +1715,17 @@ async function queueNotification(orderId, event, recipient, subject, body, html)
   fs.writeFileSync(path.join(EMAIL_LOG_DIR, `${Date.now()}-${notificationId}.txt`), `To: ${recipient}\nFrom: ${EMAIL_FROM}\nSubject: ${subject}\n\n${body}`);
   if (canSendSmtp) {
     const delivery = await emailService.send({ to: recipient, subject, text: body, html });
-    await db.run("UPDATE notifications SET status = ?, sent_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE sent_at END WHERE id = ?", delivery.delivered ? "sent" : `failed:${String(delivery.error || "SMTP delivery failed").slice(0, 80)}`, delivery.delivered, notificationId);
+    await db.run("UPDATE notifications SET status = ?, sent_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE sent_at END WHERE id = ?", delivery.delivered ? "sent" : "failed:SMTP_DELIVERY_FAILED", delivery.delivered, notificationId);
     return;
   }
-  console.info(`Email logged for ${recipient}: SMTP is not configured.`);
+  logger.info("email.delivery_skipped", { dependency: "smtp" });
   if (!EMAIL_WEBHOOK_URL) return;
   try {
     const response = await fetch(EMAIL_WEBHOOK_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ from: EMAIL_FROM, to: recipient, subject, text: body, html, event, orderId }) });
     await db.run("UPDATE notifications SET status = ?, sent_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE sent_at END WHERE id = ?", response.ok ? "sent" : `failed:${response.status}`, response.ok, notificationId);
   } catch (error) {
-    await db.run("UPDATE notifications SET status = ? WHERE id = ?", `failed:${error.message.slice(0, 80)}`, notificationId);
+    logger.error("email.webhook_delivery_failed", errorContext(error, "smtp"));
+    await db.run("UPDATE notifications SET status = ? WHERE id = ?", "failed:SMTP_DELIVERY_FAILED", notificationId);
   }
 }
 
@@ -1743,7 +1745,7 @@ async function sendContactEnquiry(enquiry) {
   const fileName = `contact-${Date.now()}-${crypto.randomBytes(5).toString("hex")}.txt`;
   fs.writeFileSync(path.join(EMAIL_LOG_DIR, fileName), `To: ${CONTACT_RECIPIENT}\nFrom: ${EMAIL_FROM}\nReply-To: ${clean(enquiry.email)}\nSubject: ${subject}\n\n${text}`);
   const delivery = await emailService.send({ to: CONTACT_RECIPIENT, replyTo: clean(enquiry.email), subject, text, html });
-  if (!delivery.delivered) console.info(`Contact enquiry logged locally for ${clean(enquiry.email)}.`);
+  if (!delivery.delivered) logger.info("contact.delivery_not_sent", { dependency: "smtp" });
   return delivery;
 }
 
@@ -1784,7 +1786,7 @@ async function createLocalOrder(session, cart, data, paymentMethod, paymentId = 
     await tx.run("DELETE FROM cart_items WHERE session_id = ?", session.id);
     return id;
   });
-  if (options.notify !== false) notifyOrder(orderId, "order_confirmation").catch(console.error);
+  if (options.notify !== false) notifyOrder(orderId, "order_confirmation").catch(error => logger.error("notification.queue_failed", errorContext(error)));
   return orderNumber;
 }
 
@@ -1992,7 +1994,7 @@ async function finalizeCapturedCheckout(session, paymentId, options = {}) {
     return { ...order, reused: false };
   });
 
-  if (!result.reused && options.notify !== false) notifyOrder(result.id, "order_confirmation").catch(console.error);
+  if (!result.reused && options.notify !== false) notifyOrder(result.id, "order_confirmation").catch(error => logger.error("notification.queue_failed", errorContext(error)));
   return result.order_number;
 }
 
@@ -2127,11 +2129,26 @@ function providerOrderError(code, message) {
   return Object.assign(new Error(message), { code });
 }
 
+async function requestRazorpay(operation, url, options) {
+  let response;
+  try { response = await fetch(url, options); }
+  catch (error) {
+    logger.error("payment_provider.request_failed", { ...errorContext(error, "payment_provider"), operation });
+    throw error;
+  }
+  if (!response.ok) {
+    const fields = { dependency: "payment_provider", operation, status: response.status };
+    if (response.status >= 500) logger.error("payment_provider.response_failed", fields);
+    else logger.warn("payment_provider.response_rejected", fields);
+  }
+  return response;
+}
+
 async function createRazorpayOrder(amountMinor, currency, receipt) {
   const authorization = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
   let response;
   try {
-    response = await fetch("https://api.razorpay.com/v1/orders", {
+    response = await requestRazorpay("order.create", "https://api.razorpay.com/v1/orders", {
       method: "POST",
       headers: { Authorization: `Basic ${authorization}`, "Content-Type": "application/json" },
       body: JSON.stringify({ amount: amountMinor, currency, receipt }),
@@ -2156,7 +2173,7 @@ async function lookupRazorpayPayment(paymentId) {
   const authorization = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
   let response;
   try {
-    response = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(paymentId)}`, {
+    response = await requestRazorpay("payment.lookup", `https://api.razorpay.com/v1/payments/${encodeURIComponent(paymentId)}`, {
       headers: { Authorization: `Basic ${authorization}` },
       signal: AbortSignal.timeout(10000)
     });
@@ -2178,7 +2195,7 @@ async function lookupRazorpayOrderPayments(orderId) {
   const authorization = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
   let response;
   try {
-    response = await fetch(`https://api.razorpay.com/v1/orders/${encodeURIComponent(orderId)}/payments?count=100`, {
+    response = await requestRazorpay("order.payments.lookup", `https://api.razorpay.com/v1/orders/${encodeURIComponent(orderId)}/payments?count=100`, {
       headers: { Authorization: `Basic ${authorization}` },
       signal: AbortSignal.timeout(10000)
     });
@@ -2197,7 +2214,7 @@ async function createRazorpayRefund(paymentId, amountMinor, currency, idempotenc
   const authorization = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
   let response;
   try {
-    response = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(paymentId)}/refund`, {
+    response = await requestRazorpay("refund.create", `https://api.razorpay.com/v1/payments/${encodeURIComponent(paymentId)}/refund`, {
       method: "POST",
       headers: { Authorization: `Basic ${authorization}`, "Content-Type": "application/json" },
       body: JSON.stringify({ amount: amountMinor, notes: { printoasis_refund_key: idempotencyKey } }),
@@ -2223,7 +2240,7 @@ async function lookupRazorpayRefund(refundId) {
   const authorization = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
   let response;
   try {
-    response = await fetch(`https://api.razorpay.com/v1/refunds/${encodeURIComponent(refundId)}`, {
+    response = await requestRazorpay("refund.lookup", `https://api.razorpay.com/v1/refunds/${encodeURIComponent(refundId)}`, {
       headers: { Authorization: `Basic ${authorization}` }, signal: AbortSignal.timeout(10000)
     });
   } catch { throw providerOrderError("REFUND_LOOKUP_UNAVAILABLE", "Refund reconciliation is temporarily unavailable."); }
@@ -2236,7 +2253,7 @@ async function listRazorpayRefunds(paymentId) {
   const authorization = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
   let response;
   try {
-    response = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(paymentId)}/refunds?count=100`, {
+    response = await requestRazorpay("payment.refunds.lookup", `https://api.razorpay.com/v1/payments/${encodeURIComponent(paymentId)}/refunds?count=100`, {
       headers: { Authorization: `Basic ${authorization}` }, signal: AbortSignal.timeout(10000)
     });
   } catch { throw providerOrderError("REFUND_LOOKUP_UNAVAILABLE", "Refund reconciliation is temporarily unavailable."); }
@@ -2971,6 +2988,20 @@ const app = {
 };
 
 const server = http.createServer(async (req, res) => {
+  const requestId = attachRequestId(req, res);
+  const startedAt = process.hrtime.bigint();
+  const logCompletion = aborted => {
+    const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    const status = aborted ? 499 : res.statusCode;
+    const fields = { request_id: requestId, method: req.method, status, duration_ms: Math.round(durationMs * 100) / 100 };
+    if (!aborted && status >= 500 && req.observabilityError) Object.assign(fields, errorContext(req.observabilityError));
+    if (aborted) logger.warn("http.request.aborted", fields);
+    else if (status >= 500) logger.error("http.request.failed", fields);
+    else if (status === 429) logger.warn("http.request.rate_limited", fields);
+    else logger.info("http.request.completed", fields);
+  };
+  res.once("finish", () => logCompletion(false));
+  res.once("close", () => { if (!res.writableFinished) logCompletion(true); });
   try {
     setSecurityHeaders(res);
     const routedUrl = new URL(req.url, PUBLIC_BASE_URL);
@@ -2989,30 +3020,39 @@ const server = http.createServer(async (req, res) => {
     return send(res, 404, await layout("Page not found", `<section class="not-found section"><div class="not-found-mark" aria-hidden="true"><span>404</span></div><div><span class="eyebrow">PAGE NOT FOUND</span><h1>Looks like this page wasn't printed correctly.</h1><p>The link may have moved, expired or never made it to production. Search the catalog or head back to a fresh start.</p><form class="not-found-search" action="/products" role="search"><label class="sr-only" for="not-found-query">Search PrintOasis products</label><input id="not-found-query" name="q" placeholder="Search cards, flyers, stickers..." required><button class="button primary" type="submit">Search products</button></form><div class="not-found-actions"><a class="button primary" href="/">Return home</a><a class="button ghost" href="/products">Continue shopping</a></div></div></section>`, routedSession, routedCart));
 
   } catch (error) {
-    if (error.code !== "REDIS_UNAVAILABLE" && error.code !== "OBJECT_STORAGE_UNAVAILABLE") console.error(error);
+    req.observabilityError = error;
     if (res.headersSent) return res.destroy();
     if (error.code === "REDIS_UNAVAILABLE") return send(res, 503, "Service temporarily unavailable. Please try again shortly.", "text/plain; charset=utf-8");
     if (error.code === "OBJECT_STORAGE_UNAVAILABLE") return send(res, 503, "File storage is temporarily unavailable. Please try again shortly.", "text/plain; charset=utf-8");
     if (error.code === "UPLOAD_TOO_LARGE") return send(res, 413, "Upload exceeds the allowed request size.", "text/plain; charset=utf-8");
     if (error.code === "UPLOAD_INVALID") return send(res, 400, error.message, "text/plain; charset=utf-8");
-    send(res, 500, process.env.NODE_ENV === "test" ? error.stack : "Something went wrong. Please try again.", "text/plain");
+    send(res, 500, "Something went wrong. Please try again.", "text/plain; charset=utf-8");
   }
 });
 
 async function start() {
+  let startupDependency = "redis";
   try {
     await initRedis();
+    startupDependency = "postgresql";
     await initDb();
     if (storage.backend === "local") {
+      startupDependency = "object_storage";
       await app.cleanupOrphanedUploads();
       await storage.cleanupStaging();
     }
-    if (!await databaseHealth(db) || !await redis.health() || !await storage.health()) throw new Error("Application dependency health check failed.");
+    startupDependency = "postgresql";
+    if (!await databaseHealth(db)) throw Object.assign(new Error("PostgreSQL health check failed."), { code: "POSTGRESQL_UNAVAILABLE" });
+    startupDependency = "redis";
+    if (!await redis.health()) throw Object.assign(new Error("Redis health check failed."), { code: "REDIS_UNAVAILABLE" });
+    startupDependency = "object_storage";
+    if (!await storage.health()) throw Object.assign(new Error("Object storage health check failed."), { code: "OBJECT_STORAGE_UNAVAILABLE" });
+    startupDependency = "http";
     await new Promise((resolve, reject) => {
       server.once("error", reject);
       server.listen(PORT, () => { server.off("error", reject); resolve(); });
     });
-    console.log(`PrintOasis running at http://localhost:${PORT}`);
+    logger.info("application.listening", { port: server.address()?.port || PORT });
   } catch (error) {
     if (redis) {
       try { await redis.close(); } catch {}
@@ -3020,11 +3060,10 @@ async function start() {
     }
     try { await storage.close(); } catch {}
     if (db) {
-      try { await db.close(); } catch (closeError) { console.error("PostgreSQL pool cleanup after startup failure failed:", closeError); }
+      try { await db.close(); } catch (closeError) { logger.error("application.startup_cleanup_failed", errorContext(closeError, "postgresql")); }
       db = undefined;
     }
-    const dependencyFailure = error.code === "REDIS_UNAVAILABLE" || error.code === "OBJECT_STORAGE_UNAVAILABLE";
-    console.error("PrintOasis could not start because a required database, Redis, or object-storage service is unavailable.", dependencyFailure ? error.message : error);
+    logger.error("application.start_failed", errorContext(error, startupDependency));
     process.exitCode = 1;
     throw error;
   }
@@ -3034,7 +3073,7 @@ let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.info(`${signal} received; closing HTTP server and PostgreSQL pool.`);
+  logger.info("application.shutdown_started", { signal });
   try {
     if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   } finally {
@@ -3049,8 +3088,8 @@ async function shutdown(signal) {
     }
   }
 }
-process.once("SIGINT", () => shutdown("SIGINT").catch(error => { console.error(error); process.exitCode = 1; }));
-process.once("SIGTERM", () => shutdown("SIGTERM").catch(error => { console.error(error); process.exitCode = 1; }));
+process.once("SIGINT", () => shutdown("SIGINT").catch(error => { logger.error("application.shutdown_failed", errorContext(error)); process.exitCode = 1; }));
+process.once("SIGTERM", () => shutdown("SIGTERM").catch(error => { logger.error("application.shutdown_failed", errorContext(error)); process.exitCode = 1; }));
 
 if (require.main === module) start().catch(() => {});
 module.exports = { app, server, start, initDb, shutdown };

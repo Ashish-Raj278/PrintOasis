@@ -1,3 +1,5 @@
+const { logger } = require("../services/logger");
+
 module.exports = async function authRoutes(ctx) {
   const { req, res, url, data, session, cart, app } = ctx;
   const nextPath = app.safeLocalPath(url.searchParams.get("next"), "/account");
@@ -85,6 +87,7 @@ module.exports = async function authRoutes(ctx) {
     const email = String(data.email || "").trim().toLowerCase();
     const user = await app.db.get("SELECT * FROM users WHERE email=?", email);
     if (!user || !app.verifyPassword(String(data.password || ""), user.password_hash)) {
+      logger.warn("auth.login_rejected", { request_id: req.requestId });
       const safeNext = app.safeLocalPath(data.next, "/account");
       app.redirect(res, `/login?notice=${encodeURIComponent("Email or password is incorrect.")}&next=${encodeURIComponent(safeNext)}`); return true;
     }

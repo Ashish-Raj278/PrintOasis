@@ -1,4 +1,5 @@
 const nodemailer = require("nodemailer");
+const { errorContext, logger } = require("./logger");
 
 function escHtml(value = "") {
   return String(value).replace(/[&<>"']/g, character => ({
@@ -6,7 +7,7 @@ function escHtml(value = "") {
   }[character]));
 }
 
-function createEmailService(config, transportFactory = nodemailer.createTransport) {
+function createEmailService(config, transportFactory = nodemailer.createTransport, log = logger) {
   const configured = config.enabled !== false && Boolean(config.host && config.from);
   const transporter = configured ? transportFactory({
     host: config.host,
@@ -21,11 +22,10 @@ function createEmailService(config, transportFactory = nodemailer.createTranspor
       if (!transporter) return { delivered: false, skipped: true, reason: "SMTP is not configured." };
       try {
         const result = await transporter.sendMail({ from: config.from, ...message });
-        console.info(`Email sent to ${message.to}: ${result.messageId}`);
         return { delivered: true, messageId: result.messageId };
       } catch (error) {
-        console.error(`Email delivery failed for ${message.to}: ${error.message}`);
-        return { delivered: false, error: error.message };
+        log.error("email.delivery_failed", errorContext(error, "smtp"));
+        return { delivered: false, error: "SMTP_DELIVERY_FAILED" };
       }
     }
   };

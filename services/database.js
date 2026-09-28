@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { Pool } = require("pg");
+const { errorContext, logger } = require("./logger");
 
 function postgresPlaceholders(sql) {
   let index = 0;
@@ -67,7 +68,7 @@ class PostgresDatabase extends QueryClient {
       try {
         await client.query("ROLLBACK");
       } catch (rollbackError) {
-        console.error("PostgreSQL rollback failed:", rollbackError);
+        logger.error("postgresql.transaction_rollback_failed", errorContext(rollbackError, "postgresql"));
       }
       throw error;
     } finally {
@@ -92,7 +93,7 @@ function createDatabaseFromEnv(env = process.env) {
     idleTimeoutMillis: Math.max(1000, Number(env.PGPOOL_IDLE_TIMEOUT_MS || 30000)),
     connectionTimeoutMillis: Math.max(1000, Number(env.PG_CONNECT_TIMEOUT_MS || 5000))
   });
-  pool.on("error", error => console.error("Unexpected idle PostgreSQL client error:", error));
+  pool.on("error", error => logger.error("postgresql.idle_client_error", errorContext(error, "postgresql")));
   return new PostgresDatabase(pool);
 }
 

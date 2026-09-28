@@ -17,6 +17,39 @@ The project includes:
 
 Render's Blueprint retains `/var/data` for local email-outbox records. Runtime artwork and admin-uploaded product images use configured shared object storage. Users, sessions, carts, orders, and inventory require PostgreSQL; sessions/rate limits use Redis.
 
+## CI and deployment flow
+
+GitHub Actions in `.github/workflows/ci.yml` runs on pull requests, pushes to
+`main`, and manual dispatch. It installs from `package-lock.json` with `npm
+ci`, then runs syntax, whitespace, a clean/repeated migration check against an
+ephemeral local PostgreSQL service, storage, upload-security, operations, and
+Redis regressions. The migration-only script requires the CI flag and exact
+local test host/database; production database variables are rejected. CI has
+read-only repository permissions and requires no production secrets. It does
+not run the destructive `db:smoke`: that existing guard is intentionally tied
+to two distinct Supabase project references, so run it only against the
+separately configured isolated test project and Redis endpoint.
+
+CI does not deploy. Render builds the Docker image using `npm ci --omit=dev`;
+the image excludes `.env`, runtime data, and Git metadata. At startup the app
+connects to PostgreSQL and Redis, applies pending numbered migrations, verifies
+object-storage readiness, and only then listens on the host-provided `PORT`.
+A migration or required dependency failure prevents readiness. Render's
+`/healthz` check uses the existing generic 200/503 response. Keep all runtime
+secrets in the Render environment settings; GitHub Actions has no deployment
+secret or production service access.
+
+Production logs are single-line JSON with timestamp, severity, event, and
+request ID. The `X-Request-Id` response header is generated or uses only a
+validated incoming ID. HTTP logs contain method/status/latency, not URL query,
+IP, session, cookie, or customer fields. Dependency failures log stable
+categories/codes without exception messages, request bodies, or credentials.
+Use Render logs and deploy/health events for HTTP failures, dependency
+outages, migration/start failures, rate limits, payment-provider errors,
+webhook failures, and SMTP delivery failures. There are no application metrics
+or auto-configured numeric alert thresholds; configure platform health/deploy
+notifications and use the incident actions in the operations runbook.
+
 ## Steps
 
 1. Upload this folder to GitHub.

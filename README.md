@@ -232,10 +232,13 @@ Copy `.env.example` to `.env`; never commit the resulting `.env` file.
 
 ## Testing and Validation
 
-The repository does not use Jest, Vitest, Cypress, or a CI workflow. Its current validation commands are:
+The repository uses focused Node regression scripts rather than Jest, Vitest, or Cypress. GitHub Actions runs the checks on pushes to `main` and pull requests using disposable PostgreSQL/Redis services where needed. The validation commands are:
 
 ```powershell
 npm run check
+npm run storage:smoke
+npm run upload:security:check
+npm run ops:check
 # Set DATABASE_URL and TEST_DATABASE_URL in the process environment first.
 npm run db:smoke
 npm run db:order-integrity:smoke
@@ -245,6 +248,8 @@ npm run db:order-integrity:smoke
 
 `npm run ops:check` tests SMTP configuration/send success/failure through a fake transport and checks generic dependency-readiness responses. It does not connect to SMTP or deliver email.
 
+The workflow is [`.github/workflows/ci.yml`](.github/workflows/ci.yml). It uses `npm ci`, read-only repository permissions, disposable PostgreSQL/Redis services, and no production secrets or external service credentials. A CI-only migration check accepts only the workflow's fixed local PostgreSQL target and verifies clean/repeated migration application. The destructive `db:smoke` remains a separately guarded operator/staging test because its current database isolation check requires distinct Supabase project references; CI does not bypass that guard or run against production.
+
 `npm run db:order-integrity:smoke` runs the Stage 5 tax/invoice/order-state regression against the isolated `TEST_DATABASE_URL`; it uses a uniquely namespaced local test Redis endpoint and does not call a live payment provider.
 
 ## Deployment
@@ -253,7 +258,7 @@ The repository includes a [Dockerfile](Dockerfile), [Render Blueprint](render.ya
 
 For PostgreSQL backup/restore, object-storage migration/recovery, SMTP failures, Redis outages, migration recovery, and payment-provider incidents, see the [operations runbook](docs/OPERATIONS_RUNBOOK.md). `/healthz` checks PostgreSQL, Redis, and object storage; it does not verify SMTP or Razorpay availability. The email outbox remains instance-local operational logging, not a delivery queue.
 
-Google, Razorpay, and SMTP are implementation-ready but configuration-dependent; this repository does not claim a live payment deployment or a CI/CD pipeline.
+Google, Razorpay, SMTP, and hosted deployment remain configuration-dependent; CI validates code but does not deploy. Render startup applies migrations and waits for the configured required dependencies.
 
 ## Design Decisions
 
@@ -271,7 +276,9 @@ Google, Razorpay, and SMTP are implementation-ready but configuration-dependent;
 
 **Configuration-dependent:** live SMTP delivery, Google sign-in, Razorpay payments, public sharing, and hosted deployment require the correct credentials, approved accounts, and environment variables.
 
-**Future / production-scale improvements:** CDN delivery, background workers, observability, and CI/CD remain future work. Runtime uploads now use configured object storage; the production provider and recovery controls still require selection and verification.
+**Implemented operations:** GitHub Actions CI, JSON request/error logs with validated request IDs, dependency classifications, `/healthz` readiness, and deployment/recovery guidance. There are no application metrics or automated alert rules; use the hosting platform's logs, deploy events, and health notifications, with manual payment/webhook reconciliation.
+
+**Future / production-scale improvements:** CDN delivery, background workers, metrics, and alert automation remain future work. Runtime uploads use configurable object storage; production provider and recovery controls still require selection and verification.
 
 ## Documentation
 

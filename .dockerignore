@@ -1,6 +1,11 @@
 .git
+.github
 .env
-data
+.env.*
 node_modules
+data
+invoices
+logs
+coverage
 *.log
 *.zip

@@ -1,4 +1,5 @@
 const MAX_WEBHOOK_BYTES = 1024 * 1024;
+const { errorContext, logger } = require("../services/logger");
 
 async function readRawBody(req) {
   const chunks = [];
@@ -32,6 +33,9 @@ module.exports = async function webhookRoutes({ req, res, url, app }) {
       : status === 413 ? "Webhook body is too large."
         : status === 400 ? "Webhook request is malformed."
           : "Webhook processing is temporarily unavailable.";
+    const fields = { ...errorContext(error), request_id: req.requestId };
+    if (status >= 500) logger.error("payment.webhook_processing_failed", fields);
+    else logger.warn("payment.webhook_rejected", fields);
     app.sendJson(res, status, { error: message });
   }
   return true;

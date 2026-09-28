@@ -381,6 +381,81 @@ automatic polling or alerting is configured. Reconcile provider and local
 records before taking customer-facing payment action. Do not issue refunds from
 an unverified browser report.
 
+## CI, logs, and alerts
+
+The GitHub Actions workflow runs locked dependency installation, syntax checks,
+whitespace validation, clean/repeated migrations against an ephemeral local
+PostgreSQL service, plus storage, upload-security, operations, and Redis
+regressions. It has read-only repository access and no production secrets. It
+deliberately does not run destructive PostgreSQL integration tests;
+`npm run db:smoke` must pass its existing separate-Supabase-project and
+Redis-endpoint guards in an isolated staging/test environment before release.
+CI is not a deployment pipeline.
+
+Application logs are JSON records with timestamp, severity, event, and (for
+HTTP requests) a validated `request_id` also returned as `X-Request-Id`. HTTP
+records include method, status, and elapsed time, but omit request paths,
+queries, IP addresses, session identifiers, and customer fields. Error records
+use stable dependency/code classifications; they do not include exception
+messages, stack traces, request bodies, credentials, or provider payloads. Use
+the request ID to correlate the response with hosting logs. Notifications and
+orders remain recorded in PostgreSQL; SMTP failures use a stable safe status.
+
+Use hosting-platform logs, health notifications, and deployment events for
+these actionable signals:
+
+- Repeated HTTP 5xx or aborted requests: correlate request IDs, inspect the
+  dependency/error classification, and check the matching service dashboard.
+- `/healthz` failures or startup/migration errors: check PostgreSQL, Redis,
+  object storage, migration logs, and recent configuration/release changes.
+- Redis/storage outage events: restore the dependency and verify readiness;
+  do not disable fail-closed behavior.
+- Payment-provider or webhook errors: inspect local intent/order/payment and
+  webhook-inbox state, then verify against the provider before retrying or
+  taking customer-facing action.
+- SMTP delivery failures: inspect notification status and perform the documented
+  manual support/re-send workflow; no automatic SMTP retry is configured.
+- Repeated failed deployments: stop repeated retries, inspect the first startup
+  error and release/config diff, and use the rollback procedure below.
+
+The application emits no metrics endpoint and configures no numerical alert
+thresholds. Configure platform health/deploy notifications, then tune alert
+thresholds from observed baseline traffic rather than guessing them. Review
+5xx, dependency failures, payment/webhook incidents, rate-limit responses, and
+restart/deploy events during routine operations.
+
+## Failed deployment and rollback
+
+1. If a release fails build, startup, migration, or `/healthz`, keep it out of
+   customer traffic. Capture the release identifier, timestamp, migration
+   ledger state, and sanitized structured error event/request ID. Do not copy
+   connection strings or secrets into incident notes.
+2. Compare the failed release with the previous healthy release and inspect
+   environment-setting changes. Correct a clearly identified configuration
+   issue and redeploy once validated; otherwise use the host's previous-release
+   rollback control.
+3. A code rollback does **not** reverse PostgreSQL migrations. Numbered
+   migrations are applied transactionally and have no automatic down
+   migrations. Roll back code only when the older release is compatible with
+   the schema already present. Otherwise keep traffic closed and use a reviewed
+   forward fix or restore a coordinated database backup into the approved
+   recovery target.
+4. Object-storage migration can leave both legacy local files and remote
+   objects; the tool never deletes local sources. If rolling back to code that
+   cannot read namespaced object keys, do not cut traffic over until references
+   and files are restored or a compatible release is deployed. Never delete
+   the remote bucket as a rollback shortcut.
+5. Restore prior environment values only after verifying they match the code
+   version. Do not roll payment credentials or webhook configuration to an
+   unverified value. For ambiguous payments/refunds, preserve durable state and
+   reconcile against the provider before customer-facing action; never infer
+   success from a browser response.
+6. After rollback, verify `/healthz`, storefront/product reads, login/session
+   behavior, admin access, public product images, authorized private artwork,
+   order/invoice views, and payment/webhook state. Record the deployed release
+   and migration ledger. Keep the failed release/configuration evidence for
+   diagnosis.
+
 ## Operational verification
 
 - `npm run check`: syntax validation, no external services.

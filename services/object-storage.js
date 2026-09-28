@@ -6,6 +6,7 @@ const {
   DeleteObjectCommand, ListObjectsV2Command
 } = require("@aws-sdk/client-s3");
 const { GENERATED_FILE } = require("./upload-security");
+const { errorContext, logger } = require("./logger");
 
 const OBJECT_TYPES = {
   artwork: { prefix: "artwork", visibility: "private" },
@@ -82,7 +83,10 @@ function createS3ObjectStorage(config, clientOverride = null) {
 
   async function send(operation, command) {
     try { return await client.send(command, requestOptions()); }
-    catch (error) { throw new ObjectStorageError(operation, error); }
+    catch (error) {
+      logger.error("object_storage.operation_failed", { ...errorContext(error, "object_storage"), operation });
+      throw new ObjectStorageError(operation, error);
+    }
   }
 
   return {
@@ -107,6 +111,7 @@ function createS3ObjectStorage(config, clientOverride = null) {
         return { body: await bodyBuffer(result.Body), contentType: result.ContentType || "application/octet-stream", size: Number(result.ContentLength || 0), metadata: result.Metadata || {} };
       } catch (error) {
         if (isMissingObject(error)) return null;
+        logger.error("object_storage.operation_failed", { ...errorContext(error, "object_storage"), operation: "download" });
         throw new ObjectStorageError("download", error);
       }
     },
@@ -118,6 +123,7 @@ function createS3ObjectStorage(config, clientOverride = null) {
         return { key: normalized, size: Number(result.ContentLength || 0), contentType: result.ContentType || "application/octet-stream", metadata: result.Metadata || {} };
       } catch (error) {
         if (isMissingObject(error)) return null;
+        logger.error("object_storage.operation_failed", { ...errorContext(error, "object_storage"), operation: "inspect" });
         throw new ObjectStorageError("inspect", error);
       }
     },

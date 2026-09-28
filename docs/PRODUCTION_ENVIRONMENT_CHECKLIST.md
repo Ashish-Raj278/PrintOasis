@@ -75,10 +75,11 @@ them as production service variables or point them at production resources.
 | `PRODUCTION_REDIS_URL` | OPTIONAL, TEST-ONLY, SECRET | Guard input used by the test helper to prove endpoint separation. |
 | `REDIS_TEST_CHILD` | OPTIONAL, TEST-ONLY | Internal child-process marker required by the isolated regression helper. |
 
-`NODE_NO_WARNINGS` appears in `render.yaml` as a Node runtime setting, not an
-application configuration variable. The app itself does not define a separate
-session-signing secret variable; session IDs are generated server-side and the
-canonical session payload is held in Redis.
+The app itself does not define a separate session-signing secret variable;
+session IDs are generated server-side and the canonical session payload is held
+in Redis. GitHub Actions requires no production variables or secrets; the
+destructive database smoke must instead use the separately guarded isolated
+test PostgreSQL/Redis configuration.
 
 ## Render and repository agreement
 
@@ -94,6 +95,10 @@ canonical session payload is held in Redis.
 - `README.md`, `docs/DEPLOYMENT.md`, and `docs/OPERATIONS_RUNBOOK.md` link to
   this checklist and describe the same startup, readiness, email, and recovery
   boundaries.
+- `.github/workflows/ci.yml` uses disposable CI PostgreSQL/Redis services and
+  service-free storage/security/operations tests; it does not deploy or receive
+  production credentials. Render deployment and its required private
+  environment values remain separately managed.
 
 ## Release sign-off
 
@@ -110,5 +115,8 @@ canonical session payload is held in Redis.
   before production invoices are issued.
 - [ ] Payment-provider account/configuration is approved before live online
   payments are enabled.
+- [ ] GitHub Actions CI passes; an isolated guarded PostgreSQL/Redis smoke has
+  passed for the release candidate; Render deploy and rollback have been
+  verified without exposing production credentials in logs.
 - [ ] Database restore drill and storage migration/audit completed; artwork
   access verified from a second application instance or isolated deployment.
