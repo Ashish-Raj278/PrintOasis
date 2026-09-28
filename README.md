@@ -25,7 +25,7 @@ Repository screenshots have not been committed yet. Add verified product screens
 - Checkout with address validation, shipping calculation, GST invoice view/print, cash on delivery, and a Razorpay-ready online-payment flow.
 - Order history, status timeline, shipment tracking, cancellation/restocking, and notification records.
 - Verified-purchase reviews, rating statistics, wishlist, saved addresses, password changes, and coupons.
-- Configurable Nodemailer SMTP delivery with a local email outbox fallback.
+- Configurable Nodemailer SMTP delivery with local notification logging (not an automatic retry queue).
 - Password-hashed accounts, server-side sessions, CSRF-protected forms, authorization checks, and SSR output escaping.
 - Responsive vanilla HTML/CSS/JavaScript UI with dark mode, mega navigation, and image-library support for galleries and card hover images.
 
@@ -95,6 +95,7 @@ flowchart LR
 │   └── cleanup-inventory-smoke.js    # Inventory smoke-test cleanup helper
 ├── docs/
 │   ├── DEPLOYMENT.md                 # Render/Docker deployment notes
+│   ├── OPERATIONS_RUNBOOK.md         # Backup, restore, email and outage procedures
 │   ├── GITHUB-AND-CLIENT.md          # Client sharing and GitHub notes
 │   └── SOURCE-GUIDE.md               # File-by-file source map
 ├── IMAGE_LIBRARY.md                  # Image resolver and naming contract
@@ -201,7 +202,7 @@ Copy `.env.example` to `.env`; never commit the resulting `.env` file.
 | `BASE_URL`, `PORT`, `DATA_DIR` | Canonical public origin, port, and runtime-data directory for uploads and email outbox. | `BASE_URL` defaults to localhost only outside production; HTTPS origin is required in production. `PORT` is optional. |
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | Initial/admin account configuration. | Change for production. |
 | `EMAIL_DELIVERY_ENABLED`, `EMAIL_FROM` | Enables delivery and defines sender identity. | Optional. |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS` | Nodemailer SMTP configuration. | Optional; otherwise email is logged to the outbox. |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS` | Nodemailer SMTP configuration. | Optional for startup; required for reliable account/order email at launch. Local logs are not an automatic retry queue. |
 | `EMAIL_WEBHOOK_URL` | Optional notification webhook fallback. | Optional. |
 | `SUPPORT_EMAIL`, `SUPPORT_PHONE`, `OFFICE_ADDRESS`, `CONTACT_RECIPIENT` | Customer-facing support and contact-enquiry details. | Optional; defaults exist. |
 | `GST_RATE_BPS` | Inclusive-tax extraction rate in basis points; defaults to `1800` to preserve existing display arithmetic. | Configure only after tax review; it does not change checkout totals. |
@@ -223,11 +224,15 @@ npm run db:order-integrity:smoke
 
 `npm run check` runs Node syntax checks across the server, services, routes, and browser JavaScript. `npm run db:smoke` runs customer/admin/inventory and Redis-session/rate-limit workflows against `TEST_DATABASE_URL` and `TEST_REDIS_URL`; both test endpoints are checked for separation from production configuration. `npm run redis:smoke` runs the isolated Redis service checks. No smoke runner flushes a Redis database. The PowerShell smoke entry points delegate to the PostgreSQL/Redis-isolated workflow.
 
+`npm run ops:check` tests SMTP configuration/send success/failure through a fake transport and checks generic dependency-readiness responses. It does not connect to SMTP or deliver email.
+
 `npm run db:order-integrity:smoke` runs the Stage 5 tax/invoice/order-state regression against the isolated `TEST_DATABASE_URL`; it uses a uniquely namespaced local test Redis endpoint and does not call a live payment provider.
 
 ## Deployment
 
-The repository includes a [Dockerfile](Dockerfile), [Render Blueprint](render.yaml), and [deployment guide](docs/DEPLOYMENT.md). The included Render configuration mounts `/var/data` for uploads and email-outbox persistence; production also requires a managed PostgreSQL `DATABASE_URL`. Configure secrets in the host's environment settings, not in Git.
+The repository includes a [Dockerfile](Dockerfile), [Render Blueprint](render.yaml), and [deployment guide](docs/DEPLOYMENT.md). The included Render configuration mounts `/var/data` for uploads and email-outbox persistence; production also requires managed PostgreSQL and Redis services. Configure secrets in the host's environment settings, not in Git.
+
+For PostgreSQL backup/restore, local artwork recovery, SMTP failures, Redis outages, migration recovery, and payment-provider incidents, see the [operations runbook](docs/OPERATIONS_RUNBOOK.md). `/healthz` checks PostgreSQL and Redis only; it does not verify SMTP or Razorpay availability. Uploaded files remain on a single instance's persistent disk until object storage is implemented.
 
 Google, Razorpay, and SMTP are implementation-ready but configuration-dependent; this repository does not claim a live payment deployment or a CI/CD pipeline.
 
@@ -253,6 +258,7 @@ Google, Razorpay, and SMTP are implementation-ready but configuration-dependent;
 
 - [Source guide](docs/SOURCE-GUIDE.md)
 - [Deployment guide](docs/DEPLOYMENT.md)
+- [Operations runbook](docs/OPERATIONS_RUNBOOK.md)
 - [GitHub and client sharing guide](docs/GITHUB-AND-CLIENT.md)
 - [Image library contract](IMAGE_LIBRARY.md)
 - [Image asset manifest](IMAGE_ASSET_MANIFEST.md)

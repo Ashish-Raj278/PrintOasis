@@ -42,7 +42,7 @@ DATABASE_URL=postgresql://user:password@host:5432/printoasis
 PGSSL=true
 REDIS_URL=rediss://user:password@managed-redis-host:6380
 REDIS_PREFIX=printoasis
-TRUST_PROXY_HOPS=1
+TRUST_PROXY_HOPS=0
 BASE_URL=https://your-final-domain.example
 GST_RATE_BPS=1800
 SELLER_LEGAL_NAME=
@@ -64,6 +64,18 @@ Redis is required at startup and is included in `/healthz`. Use a managed Redis 
 
 Initial shared rate limits (fixed windows): login 20/IP and 8/IP+account per 15 minutes; registration 10/IP per 15 minutes; Google sign-in 20/IP per 15 minutes; password reset request 10/IP and 5/IP+account per 15 minutes; reset and email-verification submissions 10/IP and 5/IP+token per 15 minutes; logout 30/IP and 10/session+IP per 15 minutes; password changes 10/IP and 5/user+IP per 15 minutes; contact 5/IP and tracking 20/IP per 10 minutes; payment 20/IP and 20/user+IP per 10 minutes; cart writes 60/IP and 60/session-or-user+IP per minute; multipart customer artwork uploads 5/IP and 5/session-or-user+IP per 10 minutes; checkout 10/IP and 10/session-or-user+IP per 10 minutes; admin writes 60/IP and 60/user+IP per minute, with product saves/uploads limited to 10/IP and 10/user+IP per 10 minutes. Limit responses are generic `429` responses; Redis failures fail closed with `503`.
 
+The Render Blueprint declares `DATABASE_URL`, `REDIS_URL`, `BASE_URL`,
+administrator credentials, and SMTP host/sender credentials as dashboard-supplied
+values (`sync: false`); no real values are stored in the repository. Render
+provides the runtime `PORT`; the application defaults to 3000 elsewhere. The
+Blueprint explicitly enables email delivery and declares a sample SMTP port and
+transport mode. Confirm the correct `TRUST_PROXY_HOPS` for the actual network
+path instead of copying a generic value. Startup waits for PostgreSQL,
+migrations, and Redis before listening. `/healthz` returns only generic
+database-and-Redis readiness; it does not probe disk, SMTP, Razorpay, or email
+delivery. See the [operations runbook](OPERATIONS_RUNBOOK.md) for recovery
+procedures.
+
 ```text
 ADMIN_EMAIL=owner-or-admin@example.com
 ADMIN_PASSWORD=a-strong-private-password
@@ -79,7 +91,14 @@ SMTP_USER=your-smtp-user
 SMTP_PASS=your-smtp-password
 ```
 
-Uploaded artwork, product images, and local email-outbox files live under the persistent disk path `/var/data`. PostgreSQL remains external to that disk. Customer artwork is not served from the public upload URL space: authenticated customers can retrieve only artwork associated with their cart or orders, and admins can retrieve only files that have a database reference. Public product images are served from a separate directory with server-detected image MIME types and `nosniff`.
+Also configure `SMTP_SECURE` according to the provider's documented connection
+mode and keep `EMAIL_DELIVERY_ENABLED=true`. SMTP is not verified at startup,
+and email failures have no automatic retry worker. Password-reset and
+verification token rows are persisted before send; a failed reset email can be
+requested again after recovery, but there is no verification-email resend
+route. Test delivery only to an approved controlled mailbox.
+
+Uploaded artwork, admin product images, and local email-outbox files live under the persistent disk path `/var/data`. PostgreSQL remains external to that disk. The disk is instance-local and is not shared between app instances; do not horizontally scale while file references depend on this local storage. Customer artwork is not served from the public upload URL space: authenticated customers can retrieve only artwork associated with their cart or orders, and admins can retrieve only files that have a database reference. Public product images are served from a separate directory with server-detected image MIME types and `nosniff`. Image-library assets under `public/assets/images/` ship with the application release. Generated invoice PDFs under ignored `invoices/` are derived output; PostgreSQL order and invoice snapshots are authoritative.
 
 Customer artwork is limited to one file up to 25 MiB per request; product-image uploads allow up to 10 files, 8 MiB each and 32 MiB aggregate. Request bodies have endpoint-specific caps, and supported PDF/AI/PSD/PNG/JPEG/WebP files are signature/structure checked before storage; browser MIME values are ignored. Filenames are randomized by the server. Failed database writes remove files created by that request. Startup removes abandoned `.uploading` staging files older than 24 hours; completed files are deliberately retained because older order rows may not contain artwork references. Operators should review completed unreferenced files before manual deletion. Uploads are not malware-scanned, so artwork still requires normal prepress review and a separately selected scanning process if business risk calls for one.
 

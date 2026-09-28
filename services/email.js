@@ -6,9 +6,9 @@ function escHtml(value = "") {
   }[character]));
 }
 
-function createEmailService(config) {
+function createEmailService(config, transportFactory = nodemailer.createTransport) {
   const configured = config.enabled !== false && Boolean(config.host && config.from);
-  const transporter = configured ? nodemailer.createTransport({
+  const transporter = configured ? transportFactory({
     host: config.host,
     port: config.port,
     secure: config.secure,
