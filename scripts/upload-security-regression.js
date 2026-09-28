@@ -119,7 +119,8 @@ async function assertUploadAccessBehavior({ app, get, postMultipart, csrf, prefi
   const savedProduct = await app.db.get("SELECT * FROM products WHERE slug=?", imageForm.slug);
   c.ok(savedProduct?.image_stored_name, "A validated product-image reference is stored.");
   trackUpload(savedProduct.image_stored_name, app.productImageDirectory);
-  const publicImage = await get(`/uploads/product-images/${encodeURIComponent(savedProduct.image_stored_name)}`);
+  const publicImagePath = savedProduct.image_stored_name.split("/").map(encodeURIComponent).join("/");
+  const publicImage = await get(`/uploads/${publicImagePath}`);
   c.equal(publicImage.response.status, 200, "Product catalog images remain publicly accessible.");
   c.equal(publicImage.response.headers.get("content-type"), "image/png", "Product image MIME is derived from its verified content.");
   c.equal(publicImage.response.headers.get("x-content-type-options"), "nosniff", "Product image response disables MIME sniffing.");

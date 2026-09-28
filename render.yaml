@@ -11,6 +11,24 @@ services:
         value: "1"
       - key: DATA_DIR
         value: /var/data
+      - key: OBJECT_STORAGE_BACKEND
+        value: s3
+      - key: OBJECT_STORAGE_ENDPOINT
+        sync: false
+      - key: OBJECT_STORAGE_REGION
+        sync: false
+      - key: OBJECT_STORAGE_ACCESS_KEY_ID
+        sync: false
+      - key: OBJECT_STORAGE_SECRET_ACCESS_KEY
+        sync: false
+      - key: OBJECT_STORAGE_PUBLIC_BUCKET
+        sync: false
+      - key: OBJECT_STORAGE_PRIVATE_BUCKET
+        sync: false
+      - key: OBJECT_STORAGE_FORCE_PATH_STYLE
+        value: "false"
+      - key: OBJECT_STORAGE_TIMEOUT_MS
+        value: "30000"
       - key: DATABASE_URL
         sync: false
       - key: REDIS_URL

@@ -244,6 +244,6 @@ async function cleanupOrphanedUploads({ uploadDir, productImageDir, olderThanMs 
 module.exports = {
   ARTWORK_LIMIT, PRODUCT_IMAGE_LIMIT, PRODUCT_IMAGE_AGGREGATE_LIMIT, PRODUCT_IMAGE_COUNT_LIMIT,
   ARTWORK_EXTENSIONS, IMAGE_EXTENSIONS, GENERATED_FILE, safeOriginalFilename, validateUpload,
-  validateMultipartFiles, resolveContained, assertRequestSize, writeUpload, removeUpload, cleanupOrphanedUploads,
+  validateMultipartFiles, resolveContained, assertRequestSize, generatedName, writeUpload, removeUpload, cleanupOrphanedUploads,
   detectFile, validatePng, validateJpeg, validateWebp, validatePdf, validatePsd
 };

@@ -10,12 +10,12 @@ The project includes:
 
 - `Dockerfile` - builds the production app with Node.js 24.
 - `render.yaml` - Render Blueprint for a web service.
-- Persistent data path: `/var/data` for uploads and email-outbox records.
+- Shared S3-compatible object storage for runtime uploads; `/var/data` remains for local email-outbox operational copies.
 - PostgreSQL connection supplied through `DATABASE_URL`.
 - Redis connection supplied through `REDIS_URL` for shared sessions and rate limits.
 - Health check path: `/healthz`.
 
-Render should attach a persistent disk at `/var/data` for uploads and email-outbox records. Users, sessions, carts, orders, and inventory require a separately provisioned PostgreSQL database.
+Render's Blueprint retains `/var/data` for local email-outbox records. Runtime artwork and admin-uploaded product images use configured shared object storage. Users, sessions, carts, orders, and inventory require PostgreSQL; sessions/rate limits use Redis.
 
 ## Steps
 
@@ -50,6 +50,15 @@ REDIS_URL=rediss://user:password@managed-redis-host:6380
 REDIS_PREFIX=printoasis
 TRUST_PROXY_HOPS=0
 BASE_URL=https://your-final-domain.example
+OBJECT_STORAGE_BACKEND=s3
+OBJECT_STORAGE_ENDPOINT=<provider-supplied-endpoint>
+OBJECT_STORAGE_REGION=<provider-supplied-region>
+OBJECT_STORAGE_ACCESS_KEY_ID=<private-server-credential>
+OBJECT_STORAGE_SECRET_ACCESS_KEY=<private-server-credential>
+OBJECT_STORAGE_PUBLIC_BUCKET=<private-bucket-name>
+OBJECT_STORAGE_PRIVATE_BUCKET=<private-bucket-name>
+OBJECT_STORAGE_FORCE_PATH_STYLE=false
+OBJECT_STORAGE_TIMEOUT_MS=30000
 GST_RATE_BPS=1800
 SELLER_LEGAL_NAME=
 SELLER_REGISTERED_ADDRESS=
@@ -77,8 +86,8 @@ provides the runtime `PORT`; the application defaults to 3000 elsewhere. The
 Blueprint explicitly enables email delivery and declares a sample SMTP port and
 transport mode. Confirm the correct `TRUST_PROXY_HOPS` for the actual network
 path instead of copying a generic value. Startup waits for PostgreSQL,
-migrations, and Redis before listening. `/healthz` returns only generic
-database-and-Redis readiness; it does not probe disk, SMTP, Razorpay, or email
+migrations, Redis, and object storage before listening. `/healthz` returns only
+generic dependency readiness; it does not probe SMTP, Razorpay, or email
 delivery. `GOOGLE_CLIENT_SECRET` and `GOOGLE_REDIRECT_URI` are not consumed by
 the current server; Google sign-in uses `GOOGLE_CLIENT_ID` for ID-token
 audience validation. See the [operations runbook](OPERATIONS_RUNBOOK.md) for
@@ -106,9 +115,52 @@ verification token rows are persisted before send; a failed reset email can be
 requested again after recovery, but there is no verification-email resend
 route. Test delivery only to an approved controlled mailbox.
 
-Uploaded artwork, admin product images, and local email-outbox files live under the persistent disk path `/var/data`. PostgreSQL remains external to that disk. The disk is instance-local and is not shared between app instances; do not horizontally scale while file references depend on this local storage. Customer artwork is not served from the public upload URL space: authenticated customers can retrieve only artwork associated with their cart or orders, and admins can retrieve only files that have a database reference. Public product images are served from a separate directory with server-detected image MIME types and `nosniff`. Image-library assets under `public/assets/images/` ship with the application release. Generated invoice PDFs under ignored `invoices/` are derived output; PostgreSQL order and invoice snapshots are authoritative.
+Customer artwork and admin product-image uploads are stored in separate S3-compatible buckets through the storage service. Bucket objects should not be anonymously readable: artwork downloads are authorized against the database and streamed by the application; product uploads are also served through the existing application route with signature validation, server-detected MIME types, and `nosniff`. Image-library assets under `public/assets/images/` remain source-controlled release assets. `/var/data/email-outbox/` is still local and contains operational copies, not a delivery queue; it is not a cross-instance dependency for order correctness. Invoice pages render from immutable PostgreSQL snapshots; the PDF helper is currently not called and no invoice PDF is required for recovery.
 
-Customer artwork is limited to one file up to 25 MiB per request; product-image uploads allow up to 10 files, 8 MiB each and 32 MiB aggregate. Request bodies have endpoint-specific caps, and supported PDF/AI/PSD/PNG/JPEG/WebP files are signature/structure checked before storage; browser MIME values are ignored. Filenames are randomized by the server. Failed database writes remove files created by that request. Startup removes abandoned `.uploading` staging files older than 24 hours; completed files are deliberately retained because older order rows may not contain artwork references. Operators should review completed unreferenced files before manual deletion. Uploads are not malware-scanned, so artwork still requires normal prepress review and a separately selected scanning process if business risk calls for one.
+Customer artwork remains limited to one file up to 25 MiB per request; product-image uploads allow up to 10 files, 8 MiB each and 32 MiB aggregate. Supported formats are signature/structure checked before object upload; browser MIME values are ignored and filenames are randomized. Database failure triggers best-effort object deletion; a failed compensation can leave an orphan, detectable with `npm run storage:migrate -- --audit`. Missing objects are surfaced as unavailable/not found rather than replaced with fake content. Uploads are not malware-scanned, so artwork still requires normal prepress review and a separately selected scanning process if business risk calls for one.
+
+### Runtime object storage setup and migration
+
+The production Blueprint requires `OBJECT_STORAGE_BACKEND=s3` and private
+dashboard values for endpoint, region, credentials, and distinct public/private
+bucket names. The provider/account is intentionally not preselected. Choose an
+S3-compatible service that supports the required server-side API operations and
+document its versioning, lifecycle, durability, and recovery controls; those
+capabilities are provider-specific and must be verified. Keep both buckets
+private at the provider ACL/policy level. Product images are public only through
+the PrintOasis application route; customer artwork is always access-checked.
+
+The implementation uses the AWS SDK for JavaScript v3 S3 client, so an
+S3-compatible endpoint can be selected without provider-specific route code.
+Supabase Storage is a viable candidate with private buckets and server-side
+access, but its documented S3 compatibility does not provide S3 object
+versioning; recovery therefore depends on a separately verified backup/copy
+policy. See [Supabase S3 compatibility](https://supabase.com/docs/guides/storage/s3/compatibility),
+[Supabase bucket access](https://supabase.com/docs/guides/storage/buckets/fundamentals),
+and [AWS SDK for JavaScript v3 S3 examples](https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/javascript_s3_code_examples.html).
+PrintOasis selects the S3 API/storage abstraction, not a named provider. Select
+the actual provider only after verifying private access, versioning/recovery,
+lifecycle, availability, and cost.
+
+Keep `public/assets/images/` in Git/release artifacts. Do not copy it to runtime
+storage. The migration tool scans current cart/order artwork and product image
+references, copies locally referenced objects, verifies bytes, then changes
+database references to namespaced keys. It supports repeatable execution and
+never removes the source files. With approved production configuration:
+
+```sh
+npm run storage:migrate -- --dry-run
+npm run storage:migrate -- --execute
+npm run storage:migrate -- --audit
+```
+
+Review every nonzero `missingLocalAndRemote`, `unverified`, `failed`, or
+`missingObjects` count before cutover. Keep local sources until the database/
+object audit and authorized historical artwork checks pass. The migration
+updates DB references and is an approved maintenance action, not a routine
+startup task. After cutover, multiple app instances share uploads via the
+database and object storage. Email outbox files remain instance-local logs;
+historical invoices remain reconstructible from DB snapshots.
 
 For local development, run a local Redis server and set `REDIS_URL` to it. Tests require a separate `TEST_REDIS_URL` endpoint and use a run-specific `REDIS_PREFIX`; the smoke runner rejects a test endpoint that matches the configured production Redis host and port. The regression runner does not flush Redis databases.
 

@@ -10,9 +10,9 @@ module.exports = async function adminRoutes(ctx) {
   if (url.pathname === "/admin/products/save") {
     let image, hoverImage, galleryImages = [];
     try {
-      image = app.saveProductImage(data.files?.product_image);
-      hoverImage = app.saveProductImage(data.files?.hover_image);
-      galleryImages = app.saveProductImages(data.files?.gallery_images);
+      image = await app.saveProductImage(data.files?.product_image);
+      hoverImage = await app.saveProductImage(data.files?.hover_image);
+      galleryImages = await app.saveProductImages(data.files?.gallery_images);
       const galleryPlacement = ["default", "featured", "trending", "recommendation"].includes(data.gallery_placement) ? data.gallery_placement : "default";
       const id = Number(data.id || 0), name = String(data.name || "").trim(), slug = app.slugify(data.slug || name);
       if (!name || !slug) throw new Error("Product name is required.");
@@ -30,7 +30,7 @@ module.exports = async function adminRoutes(ctx) {
       });
       app.redirect(res, "/admin/products?notice=Product+saved.");
     } catch (error) {
-      app.removeSavedUploads([image, hoverImage, ...galleryImages], app.productImageDirectory);
+      await app.removeSavedUploads([image, hoverImage, ...galleryImages], app.productImageDirectory);
       app.redirect(res, `/admin/products?notice=${encodeURIComponent(error.message)}`);
     }
     return true;

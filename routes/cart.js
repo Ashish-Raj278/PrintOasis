@@ -8,20 +8,23 @@ module.exports = async function cartRoutes(ctx) {
     let product = null;
     let artwork = null;
     try {
+      artwork = await app.saveArtwork(data.files?.artwork_file);
       await app.db.transaction(async tx => {
         product = await tx.get(`SELECT * FROM products WHERE id = ? AND ${app.visibleProductCondition()} FOR UPDATE`, productId);
         if (!product) return;
-        artwork = app.saveArtwork(data.files?.artwork_file);
         await app.addCartItem(session.id, product, data.quantity, {
           size: data.size, material: data.material, printOption: data.print_option,
           artworkNote: (data.artwork_note || "").slice(0, 500), artworkOriginalName: artwork?.original,
           artworkStoredName: artwork?.stored, artworkMime: artwork?.mime, artworkSize: artwork?.size
         }, tx);
       });
-      if (!product) return app.send(res, 404, "Product not found", "text/plain"), true;
+      if (!product) {
+        if (artwork?.stored) await app.removeSavedUploads([artwork], app.uploadDirectory);
+        return app.send(res, 404, "Product not found", "text/plain"), true;
+      }
       app.redirect(res, "/cart?notice=Product+added+to+your+cart.");
     } catch (error) {
-      if (artwork?.stored) app.removeSavedUploads([artwork], app.uploadDirectory);
+      if (artwork?.stored) await app.removeSavedUploads([artwork], app.uploadDirectory);
       if (product) return app.redirect(res, `/product/${product.slug}?notice=${encodeURIComponent(error.message)}`), true;
       throw error;
     }

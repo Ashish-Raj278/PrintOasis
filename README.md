@@ -39,7 +39,7 @@ Repository screenshots have not been committed yet. Add verified product screens
 | Inventory | `available = stock - reserved`; row-locked PostgreSQL transactions protect reservation, checkout, and restock changes. |
 | Data access | PostgreSQL through the official `pg` connection pool with parameterized statements, foreign keys, and explicit transactions. |
 | Security | Password hashing with `scrypt`, Redis-shared HTTP-only sessions, atomic Redis rate limits, CSRF tokens, role checks, HTML escaping, safe upload checks, and Razorpay signature verification. |
-| Images | A WebP-first library resolver supports primary, hover, gallery, category, and section-specific images while preserving legacy uploads. |
+| Images and files | A WebP-first source-controlled image library ships with the release; runtime uploads use a shared S3-compatible object-storage interface. |
 
 ## Tech Stack
 
@@ -86,6 +86,8 @@ flowchart LR
 │   ├── admin.js                      # Admin products, coupons, orders, notifications
 │   └── static.js                     # Public assets, uploaded images, health check
 ├── services/email.js                 # SMTP service and order-email templates
+├── services/object-storage.js        # Shared local/S3-compatible object operations
+├── services/storage-migration.js     # Resumable file-reference migration and audit
 ├── public/
 │   ├── app.js                        # Browser interactions
 │   ├── styles.css                    # Responsive UI styles
@@ -94,8 +96,9 @@ flowchart LR
 │   ├── sprint3-smoke.js              # Sprint 3 feature verification script
 │   └── cleanup-inventory-smoke.js    # Inventory smoke-test cleanup helper
 ├── docs/
-│   ├── DEPLOYMENT.md                 # Render/Docker deployment notes
+│   ├── DEPLOYMENT.md                 # Render/Docker deployment and object-storage setup
 │   ├── OPERATIONS_RUNBOOK.md         # Backup, restore, email and outage procedures
+│   ├── PRODUCTION_ENVIRONMENT_CHECKLIST.md # Deployment variables and release checks
 │   ├── GITHUB-AND-CLIENT.md          # Client sharing and GitHub notes
 │   └── SOURCE-GUIDE.md               # File-by-file source map
 ├── IMAGE_LIBRARY.md                  # Image resolver and naming contract
@@ -106,6 +109,10 @@ flowchart LR
 ├── render.yaml                       # Render Blueprint
 └── package.json                      # Scripts, dependencies, runtime requirement
 ```
+
+`scripts/storage-migrate.js` provides the explicit dry-run/execute/audit
+commands for transferring existing upload references; `scripts/storage-regression.js`
+tests the storage contract with disposable local fixtures.
 
 `data/` and `invoices/` are runtime output locations and are intentionally ignored by Git.
 
@@ -150,6 +157,12 @@ Fulfillment advances only through `Pending → Printing → Packed → Shipped �
 The image system is prepared for a reusable asset library rather than one image per product. It supports `primary`, `hover`, gallery, category, and placement-specific images with a WebP-first resolver and safe JPG/JPEG/PNG legacy fallback. See [IMAGE_LIBRARY.md](IMAGE_LIBRARY.md), [IMAGE_ASSET_MANIFEST.md](IMAGE_ASSET_MANIFEST.md), and [PHASE_B_IMAGE_PRODUCTION_SPEC.md](PHASE_B_IMAGE_PRODUCTION_SPEC.md).
 
 The infrastructure is implemented. Premium final product photography described in the manifest and Phase B specification is a planned content-production task, not a claim that every asset already exists.
+
+### Runtime File Storage
+
+Production customer artwork and admin-uploaded product images use separate configured S3-compatible buckets through `services/object-storage.js`. Artwork remains private: each download is authorized against the customer's cart/order or admin access before the server fetches and streams the object. Product uploads remain public through the existing application image route, which validates bytes and selects the MIME type; the bucket itself need not be anonymously readable. Legacy filename references continue to resolve during migration. Files under `public/assets/images/` remain release assets and are not copied to object storage. Invoice pages render from immutable PostgreSQL snapshots; generated PDFs are derived and are not durable records. `DATA_DIR/email-outbox/` is an operational local copy, not a delivery queue or shared business store.
+
+Before production cutover, configure the provider endpoint, two buckets, region/addressing mode, and restricted server credentials privately. Run `npm run storage:migrate -- --dry-run`, review all reported missing/unverified references, then run `--execute` and `--audit`. The tool verifies object bytes before changing each database reference and never deletes local files. See [Deployment](docs/DEPLOYMENT.md), the [environment checklist](docs/PRODUCTION_ENVIRONMENT_CHECKLIST.md), and [Operations Runbook](docs/OPERATIONS_RUNBOOK.md).
 
 ## Request Lifecycle
 
@@ -199,7 +212,13 @@ Copy `.env.example` to `.env`; never commit the resulting `.env` file.
 | `PGSSL`, `PGSSL_REJECT_UNAUTHORIZED`, `PGPOOL_MAX`, `PGPOOL_IDLE_TIMEOUT_MS`, `PG_CONNECT_TIMEOUT_MS` | PostgreSQL TLS and pool configuration. | Optional; defaults are supplied. |
 | `TEST_DATABASE_URL` | Isolated PostgreSQL database for `npm run db:smoke`; its Supabase project reference must differ from `DATABASE_URL`. | Required for smoke testing only. |
 | `TEST_REDIS_URL`, `TEST_REDIS_PREFIX` | Separate Redis endpoint and test namespace used by smoke/regression checks. | Required for Redis tests; endpoint must differ from production Redis. |
-| `BASE_URL`, `PORT`, `DATA_DIR` | Canonical public origin, port, and runtime-data directory for uploads and email outbox. | `BASE_URL` defaults to localhost only outside production; HTTPS origin is required in production. `PORT` is optional. |
+| `BASE_URL`, `PORT`, `DATA_DIR` | Canonical public origin, port, and local runtime-data directory for email outbox/staging. | `BASE_URL` defaults to localhost only outside production; HTTPS origin is required in production. `PORT` is optional. Runtime uploads use object storage. |
+| `OBJECT_STORAGE_BACKEND` | Runtime upload storage (`local` for development, `s3` for production). | Production requires `s3`; local storage is disabled there. |
+| `OBJECT_STORAGE_ENDPOINT`, `OBJECT_STORAGE_REGION` | S3-compatible endpoint and region. | Required for the production storage backend; use provider-supplied values. |
+| `OBJECT_STORAGE_ACCESS_KEY_ID`, `OBJECT_STORAGE_SECRET_ACCESS_KEY` | Server-only object storage credentials. | Required secrets for `s3`; set privately, never commit. |
+| `OBJECT_STORAGE_PUBLIC_BUCKET`, `OBJECT_STORAGE_PRIVATE_BUCKET` | Separate product-image and customer-artwork buckets. | Required for `s3`; bucket names differ and both should block anonymous access. |
+| `OBJECT_STORAGE_FORCE_PATH_STYLE` | S3 endpoint addressing mode. | Optional; enable only if the chosen endpoint requires it. |
+| `OBJECT_STORAGE_TIMEOUT_MS` | Object request deadline in milliseconds. | Optional; defaults to 30 seconds, capped at 120 seconds. |
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | Initial/admin account configuration. | Change for production. |
 | `EMAIL_DELIVERY_ENABLED`, `EMAIL_FROM` | Enables delivery and defines sender identity. | Optional. |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS` | Nodemailer SMTP configuration. | Optional for startup; required for reliable account/order email at launch. Local logs are not an automatic retry queue. |
@@ -230,9 +249,9 @@ npm run db:order-integrity:smoke
 
 ## Deployment
 
-The repository includes a [Dockerfile](Dockerfile), [Render Blueprint](render.yaml), and [deployment guide](docs/DEPLOYMENT.md). The included Render configuration mounts `/var/data` for uploads and email-outbox persistence; production also requires managed PostgreSQL and Redis services. Configure secrets in the host's environment settings, not in Git. Use the [pre-production environment checklist](docs/PRODUCTION_ENVIRONMENT_CHECKLIST.md) to close the real deployment values and the [operations runbook](docs/OPERATIONS_RUNBOOK.md) for recovery decisions.
+The repository includes a [Dockerfile](Dockerfile), [Render Blueprint](render.yaml), and [deployment guide](docs/DEPLOYMENT.md). The included Render configuration mounts `/var/data` for local email-outbox operational copies; runtime uploads use the separately configured object-storage service. Production also requires PostgreSQL and Redis. Configure secrets in the host's environment settings, not in Git. Use the [pre-production environment checklist](docs/PRODUCTION_ENVIRONMENT_CHECKLIST.md) and [operations runbook](docs/OPERATIONS_RUNBOOK.md) for release/recovery decisions.
 
-For PostgreSQL backup/restore, local artwork recovery, SMTP failures, Redis outages, migration recovery, and payment-provider incidents, see the [operations runbook](docs/OPERATIONS_RUNBOOK.md). `/healthz` checks PostgreSQL and Redis only; it does not verify SMTP or Razorpay availability. Uploaded files remain on a single instance's persistent disk until object storage is implemented.
+For PostgreSQL backup/restore, object-storage migration/recovery, SMTP failures, Redis outages, migration recovery, and payment-provider incidents, see the [operations runbook](docs/OPERATIONS_RUNBOOK.md). `/healthz` checks PostgreSQL, Redis, and object storage; it does not verify SMTP or Razorpay availability. The email outbox remains instance-local operational logging, not a delivery queue.
 
 Google, Razorpay, and SMTP are implementation-ready but configuration-dependent; this repository does not claim a live payment deployment or a CI/CD pipeline.
 
@@ -252,7 +271,7 @@ Google, Razorpay, and SMTP are implementation-ready but configuration-dependent;
 
 **Configuration-dependent:** live SMTP delivery, Google sign-in, Razorpay payments, public sharing, and hosted deployment require the correct credentials, approved accounts, and environment variables.
 
-**Future / production-scale improvements:** object storage, CDN delivery, background workers, stronger payment idempotency, observability, and CI/CD remain future work.
+**Future / production-scale improvements:** CDN delivery, background workers, observability, and CI/CD remain future work. Runtime uploads now use configured object storage; the production provider and recovery controls still require selection and verification.
 
 ## Documentation
 

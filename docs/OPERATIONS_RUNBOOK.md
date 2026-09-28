@@ -1,7 +1,8 @@
 # PrintOasis Operations Runbook
 
-This runbook describes the current single-Node.js deployment using PostgreSQL,
-Redis, and a persistent local disk. It does not assume provider backup
+This runbook describes the current Node.js deployment using PostgreSQL,
+Redis, S3-compatible object storage for runtime uploads, and a local disk for
+operational email copies. It does not assume provider backup
 retention, recovery-point objectives, or recovery-time guarantees. Record those
 values from the actual database and hosting plans before launch.
 
@@ -16,12 +17,13 @@ site. `TRUST_PROXY_HOPS` defaults to 0; set it only after confirming the
 reachable proxy chain and ensuring direct public access cannot bypass it.
 
 Startup connects PostgreSQL and Redis, applies each pending numbered SQL
-migration in its own transaction, performs initialization, checks both
-dependencies, and only then listens. A failed connection or migration prevents
+migration in its own transaction, checks PostgreSQL, Redis, and object storage,
+and only then listens. A failed connection, migration, or storage check prevents
 the server from accepting requests. `/healthz` is a dependency readiness check:
-it runs `SELECT 1` and a Redis PING and returns only `ok` or `service
-unavailable` with HTTP 200/503. It does not test SMTP, Razorpay, disk capacity,
-or email delivery, and it is not a separate process-liveness endpoint.
+it runs `SELECT 1`, a Redis PING, and checks access to both configured storage
+buckets; it returns only `ok` or `service unavailable` with HTTP 200/503. It
+does not test SMTP, Razorpay, local disk
+capacity, or email delivery, and it is not a separate process-liveness endpoint.
 
 SIGINT/SIGTERM stops the HTTP listener and then closes Redis and the PostgreSQL
 pool. Set the hosting platform's termination grace period to allow ordinary
@@ -129,8 +131,8 @@ is recorded.
 | --- | --- | --- |
 | PostgreSQL RPO | At most 24 hours with a verified daily backup; target at most 15 minutes only if PITR is enabled and its latest usable point is verified no more than 15 minutes behind the incident. | Project plan and backup/PITR configuration are unknown. No achieved RPO can currently be claimed. If daily backups are unavailable, an independently stored `pg_dump` at least daily is required for the 24-hour target. |
 | PostgreSQL RTO | Restore, verify, and cut over within one business day. | Internal target only; restore time depends on database size, provider availability, manual setup, and drill results. It is not verified yet. |
-| Runtime files/artwork RPO | At most 24 hours. | Not currently met/verified: `/var/data` is instance-local and this repository does not configure off-instance file backups. Requires an encrypted off-instance daily backup until Stage 7 storage is implemented. |
-| Runtime files/artwork RTO | Restore references and files within one business day. | Internal target only; requires a file archive, matching database recovery point, and a successful isolated restore drill. Object storage with a tested recovery/versioning policy is a Stage 7 dependency, not present today. |
+| Runtime files/artwork RPO | At most 24 hours. | Not yet verifiable: the storage provider has not been selected and its versioning/backup controls are unknown. Configure a provider recovery point no older than 24 hours or explicitly mark the target missed. |
+| Runtime files/artwork RTO | Restore references and files within one business day. | Internal target only; requires provider recovery, a matching database point, and a successful isolated restore drill. Provider capabilities and measured recovery time remain unverified. |
 
 Daily-backup RPO must be measured from the actual latest available snapshot,
 not assumed from the plan name. If any latest point is older than the target,
@@ -239,27 +241,67 @@ to backup configuration or recovery procedure. Never restore over production.
 
 | Location | Current contents | Recovery treatment |
 | --- | --- | --- |
-| `DATA_DIR/uploads/` (production example `/var/data/uploads/`) | Private customer artwork referenced by carts/order items. | Back up with restrictive access and coordinate its recovery point with PostgreSQL. Missing files cannot be reconstructed from database rows. |
-| `DATA_DIR/uploads/product-images/` | Admin-uploaded public product images. | Back up and restore with the database snapshot that contains their stored filenames. |
+| Configured private object bucket (`artwork/<generated-name>`) | Customer artwork referenced by carts/order items. | Verify provider recovery/versioning controls and reconcile against PostgreSQL references. Never expose a public bucket URL. |
+| Configured product-image object bucket (`product-images/<generated-name>`) | Admin-uploaded product images referenced by products/product_images. | Preserve object recovery alongside the PostgreSQL reference backup; images are served through the app with signature validation. |
+| Legacy/local `DATA_DIR/uploads/` and `DATA_DIR/uploads/product-images/` | Existing disk files during migration and local-development storage. | Migration sources; retain until the DB/object audit and authorized file checks pass. No automatic cleanup after migration. |
 | `DATA_DIR/email-outbox/` | Local text copies of order/contact notification content, including customer data. | Protect as sensitive operational data; include only if required by the organization's retention policy. It is not a delivery queue. |
+| Temporary `.uploading` staging files | Local backend's short-lived atomic-write staging only; S3 uploads are sent directly. | Only strictly named files older than 24 hours are removed in local mode; no customer-visible reference is created from a staging file. |
 | `public/assets/images/` | Deployed image-library assets, when present. | Preserve the matching source release/artifact and separately back up any local-only files; this directory is not the customer upload store. |
 | repository `invoices/` | Ignored PDF output location used by a currently uncalled helper; the customer invoice route renders from PostgreSQL snapshots. | Derived output, not the invoice source of truth. Can be regenerated from order/item/invoice snapshots if PDF generation is later invoked. |
 
 `DATA_DIR` defaults to `<repository>/data`; the included Render Blueprint sets
-it to `/var/data` and attaches a persistent disk. That disk is local to the
-deployment instance. It is not shared storage: do not run multiple application
-instances or move traffic between instances while expecting their uploaded
-files to be visible everywhere. Disk loss, disk replacement, or an instance
-change can make customer artwork unavailable unless a verified external file
-backup is restored. Object storage/shared media is explicitly deferred to
-Stage 7.
+it to `/var/data` for email-outbox operational copies and local staging. It is
+instance-local and is not shared. Runtime artwork and admin-uploaded images
+use configured object storage, so object storage and PostgreSQL references
+must be recoverable together. Source-controlled `public/assets/images/` stays
+in the application release.
 
-For coordinated recovery, stop writes or otherwise establish an operator-owned
-consistent capture point, archive `DATA_DIR/uploads`, note the PostgreSQL
-recovery point, and restore both together. Do not delete completed unreferenced
-artwork automatically: legacy orders may not contain complete references.
-Startup only removes old abandoned `.uploading` staging files. Review files
-manually before retention cleanup.
+For coordinated recovery, record the PostgreSQL recovery point and object
+provider recovery/versioning point. Restore into isolated targets first, then
+run the storage migration audit and verify missing-object and unreferenced-
+object counts. Do not automatically delete unreferenced objects: legacy order
+rows may lack references. Local email-outbox files are not a mail queue and do
+not participate in order correctness; apply host retention and privacy controls
+if they are retained.
+
+### Runtime object-storage migration and recovery
+
+The provider is not selected by this repository. Before launch, choose an
+S3-compatible service and verify its private-bucket policy, server-side
+Get/Put/Head/Delete/List permissions, HTTPS endpoint, versioning/recovery
+capabilities, and lifecycle policy. Set the `OBJECT_STORAGE_*` variables from
+the [pre-production checklist](PRODUCTION_ENVIRONMENT_CHECKLIST.md) in private
+deployment configuration. Never configure browser credentials or anonymous
+bucket reads. Product images are public only via the app route; customer artwork
+is always authorization-checked and streamed by the app.
+
+Migration is an explicit operator action. First take/record a consistent DB
+backup and preserve the local source disk. From an approved maintenance
+environment that can access both the database and files, run:
+
+```sh
+npm run storage:migrate -- --dry-run
+npm run storage:migrate -- --execute
+npm run storage:migrate -- --audit
+```
+
+Dry-run makes no changes. Execution copies and validates each referenced file,
+checks the remote bytes, then transactionally changes matching database
+references to a namespaced object key. It is resumable: if the object copy
+succeeded but the DB update failed, a retry verifies the existing object before
+updating the reference. The script never removes local files or unreferenced
+objects. Stop cutover for any nonzero `missingLocalAndRemote`, `unverified`, or
+`failed` count, or any `missingObjects` audit result. Review unreferenced object
+counts manually; do not auto-delete historical files.
+
+For disaster recovery, restore PostgreSQL and the provider's object version/
+backup into isolated targets, deploy compatible code/configuration there, and
+run `npm run storage:migrate -- --audit`. Verify catalog uploads, cart artwork,
+historical order artwork, private owner/admin authorization, product image
+MIME/`nosniff`, and representative invoice pages from their immutable DB
+snapshots. Reconcile the database recovery point with object recovery before
+traffic cutover. There is no cross-system transaction: a DB restore and object
+restore from mismatched times can produce missing or orphaned objects.
 
 ## SMTP and email operations
 
@@ -360,13 +402,13 @@ unverified until the named owner records them.
 | A. Database backups | PostgreSQL is authoritative. Supabase may provide plan-dependent backups; actual project plan/settings are **requires production verification**. The app does not schedule its own database backup. | Verify plan, visible backups, retention, PITR setting/retention/latest point; choose provider backup plus independent encrypted logical backup policy. | Supabase organization Billing/Subscription; project Database → Backups and PITR settings; record `SHOW server_version;` and latest point. | Supabase organization owner and database operator. |
 | B. Database restore drill | Procedure is documented; no real production backup restore has been claimed or tested here. | Restore to a separate isolated project/target, verify schema/data, then test the application on a disposable second copy. Never overwrite production for a drill. | Follow “Isolated database restore drill”; retain an evidence record with recovery point, counts, migration ledger, and elapsed times. | Database operator; project-plan access and an isolated target. |
 | C. RPO/RTO | Internal targets: DB RPO ≤24h with verified daily backup (≤15m only conditionally with fresh PITR); DB RTO ≤1 business day; files RPO ≤24h and RTO ≤1 business day. These are not customer SLAs and are not yet proven achievable. | Approve targets; configure backups/retention and file backup that meet them; revise targets if measured drills do not meet them. | Compare actual backup/recovery-point timestamps and file archive time; measure isolated restore drill. | Business owner approves risk; database and deployment operators provide evidence. |
-| D. File/artwork recovery | Customer artwork and admin-uploaded product images live under instance-local `DATA_DIR`; `/var/data` is not shared and no verified off-instance backup is configured. | Until Stage 7, configure and test a protected off-instance backup of `uploads/` coordinated with a DB point. Stage 7 will move persistent files to durable object storage. Include customer artwork, uploaded product images, retained generated invoice PDFs, and email logs/outbox only if retention is required. Keep release/source-controlled `public/assets/images/` in the release artifact. | Restore files and DB references together in an isolated drill; compare stored filenames/references and test authorized download. | Deployment operator and privacy/business owner set retention/access policy. |
+| D. File/artwork recovery | Runtime artwork and uploaded product images use two configured object buckets; source-controlled image assets remain in the release. Provider durability/versioning/retention are not known until the actual provider is selected and verified. | Select/configure object storage with documented recovery controls; run dry-run, execute, then audit migration; retain local source files until all references verify. Keep outbox files under host retention because they are not required to deliver mail. | Restore a selected database/object point in isolation, run storage audit, and test customer/admin artwork access plus public product images. | Storage provider/account owner and privacy/business owner. |
 | E. SMTP | Nodemailer SMTP is implemented, but provider, credentials, DNS authentication, and live deliverability are unverified. Sends are synchronous/best-effort with no automatic retry. | Select provider; privately supply host, port, TLS mode, conditional username/password, sender identity; publish provider-specific SPF/DKIM and choose DMARC policy. | Fake `npm run ops:check`, staging controlled-mailbox tests for verification/reset/order/shipment/delivery, then owner-approved production mailbox test. Inspect failure status/logs. | Business/domain owner selects and authorizes provider; deployment operator configures values. |
 | F. Redis | Required for shared sessions and rate limits; outages fail closed. Production endpoint/TLS and recovery behavior require deployment verification. Redis is not authoritative for orders/inventory. | Configure separate managed production Redis, prefer TLS endpoint, choose namespace, document provider persistence/failover behavior; do not use test Redis. | `/healthz` Redis dependency check, controlled restart/outage test in staging, and confirm generic 503/fail-closed behavior. | Redis service owner and deployment operator. |
-| G. Deployment | Render Blueprint runs one Node service with local `/var/data`; `PORT` is host supplied. Startup gates on DB, migrations, and Redis. | Set every required value in the [environment checklist](PRODUCTION_ENVIRONMENT_CHECKLIST.md); confirm HTTPS, canonical domain, proxy chain/hop count, persistent disk, one-instance limit, and termination grace. Verify optional email/payment features only when enabled. | Review Render service/Blueprint diff; confirm `/healthz`, storefront, login, admin, and file access after a controlled deploy. | Hosting account owner and deployment operator; real domain and proxy topology. |
+| G. Deployment | Render Blueprint runs Node with `/var/data` for operational outbox copies and configured object storage for uploads; `PORT` is host supplied. Startup gates on DB, migrations, Redis, and storage. | Configure object-storage variables/buckets privately, complete file migration/audit, and confirm HTTPS, proxy chain, outbox retention, and shutdown grace. Multiple instances can share uploads after cutover. | Review Blueprint/runtime config; confirm `/healthz`, storefront, login, admin, and private/public file access across separate instances. | Hosting and object-storage account owners; deployment operator. |
 | H. Migration recovery | Numbered SQL migrations `001`–`008` run before listen, each transactionally and recorded in `schema_migrations`; there are no down migrations. | Back up before release; review schema compatibility. If a migration fails, keep traffic closed, inspect migration ledger/logs, and use a reviewed forward fix or restore matching DB/code/files. | Compare migration ledger to the release; run `npm run check`; validate on an isolated restored copy before retry. | Database operator and release owner. |
 | I. Payment-provider outage | Razorpay integration is configuration-dependent. State is persisted; ambiguous provider results must not be manually marked paid. Reconciliation is callable, not scheduled. | Keep customer messaging/support procedure ready; preserve intent/provider/payment state, restore provider access, reconcile before acting. Do not issue unverified refunds. | Check provider dashboard against local checkout/payment/refund records; execute the callable reconciliation procedure in a controlled manner. No live calls are part of this runbook audit. | Merchant account owner and payment operations owner. |
-| J. Rollback | Code rollback does not reverse migrations. Restoring a point loses later writes; local runtime files must match DB references. | Prefer a compatible code rollback only after schema compatibility review. Otherwise use an approved forward fix or restore DB and file set from a coordinated point; reconcile intervening orders/payments before traffic resumes. | Stage the rollback/restore on an isolated target and compare migration ledger, order/payment state, invoice snapshots, and files. | Release owner, database operator, and business approver for data-loss window. |
+| J. Rollback | Code rollback does not reverse migrations. Object keys use the storage interface; local legacy files are retained after migration. | Roll back only to a release supporting the object backend and namespaced references. Otherwise restore coordinated DB/object versions or use retained local sources and the migration tool; reconcile intervening orders/payments before traffic resumes. | Test rollback on isolated DB/storage copies and compare migration ledger, payment/order state, invoice snapshots, and file access. | Release owner, database/storage operators, and business approver for data-loss window. |
 
 Do not mark a row complete based only on this documentation. Record the actual
 configuration and evidence in the deployment/recovery record, without copying

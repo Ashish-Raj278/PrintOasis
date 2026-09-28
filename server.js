@@ -4,6 +4,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { createDatabaseFromEnv, runMigrations, databaseHealth } = require("./services/database");
 const { createRedisService, requestLimitPolicies } = require("./services/redis");
+const { createObjectStorageFromEnv, objectKey } = require("./services/object-storage");
 const uploadSecurity = require("./services/upload-security");
 const { URL } = require("node:url");
 const { categories, products: catalogProducts, productPriorities } = require("./catalog");
@@ -80,6 +81,7 @@ fs.mkdirSync(PRODUCT_IMAGE_LIBRARY_DIR, { recursive: true });
 fs.mkdirSync(CATEGORY_IMAGE_LIBRARY_DIR, { recursive: true });
 fs.mkdirSync(HOME_IMAGE_LIBRARY_DIR, { recursive: true });
 fs.mkdirSync(EMAIL_LOG_DIR, { recursive: true });
+const storage = createObjectStorageFromEnv(process.env, { artworkDirectory: UPLOAD_DIR, productImageDirectory: PRODUCT_IMAGE_DIR });
 const emailService = createEmailService({ enabled: EMAIL_DELIVERY_ENABLED, host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE, user: SMTP_USER, pass: SMTP_PASS, from: EMAIL_FROM });
 let db;
 let redis;
@@ -201,6 +203,14 @@ function publicImageUrl(file) {
   return `/public/assets/images/${file.split(path.sep).join("/").split("/").map(encodeURIComponent).join("/")}`;
 }
 
+function uploadedImageUrl(storedName) {
+  return `/uploads/${objectKey("product-image", storedName).split("/").map(encodeURIComponent).join("/")}`;
+}
+
+function artworkUrl(storedName) {
+  return `/artwork/${objectKey("artwork", storedName).split("/").map(encodeURIComponent).join("/")}`;
+}
+
 function libraryImage(file, stem) {
   for (const extension of PREFERRED_IMAGE_EXTENSIONS) {
     const candidate = path.join(file, `${stem}${extension}`);
@@ -232,14 +242,14 @@ function productImageSet(product) {
   const records = productImageRecords(product).map(image => ({
     ...image,
     name: image.image_stored_name,
-    url: `/uploads/product-images/${encodeURIComponent(image.image_stored_name)}`,
+    url: uploadedImageUrl(image.image_stored_name),
     source: "upload",
     alt: ""
   }));
   const library = libraryGalleryImages(product);
   const libraryByStem = new Map(library.map(image => [path.basename(image.name, path.extname(image.name)).toLowerCase(), image]));
   const recordFor = (role, placement = "default") => records.find(image => image.role === role && image.placement === placement) || records.find(image => image.role === role && image.placement === "default");
-  const legacy = product.image_stored_name ? { name: product.image_stored_name, url: `/uploads/product-images/${encodeURIComponent(product.image_stored_name)}`, source: "legacy", alt: "" } : null;
+  const legacy = product.image_stored_name ? { name: product.image_stored_name, url: uploadedImageUrl(product.image_stored_name), source: "legacy", alt: "" } : null;
   const primary = libraryImage(libraryDirectory, "primary") || recordFor("primary") || legacy || records.find(image => image.role === "gallery") || libraryByStem.get("gallery-01") || library[0] || null;
   const hover = libraryImage(libraryDirectory, "hover") || recordFor("hover") || primary;
   const placements = Object.fromEntries(["hero", "card", "featured", "trending", "recommendation", "lifestyle"].map(placement => [
@@ -786,33 +796,44 @@ async function requestData(req) {
   return formBody(req);
 }
 
-function saveArtwork(file) {
+async function saveArtwork(file) {
   if (!file || !file.filename) return null;
-  return uploadSecurity.writeUpload(UPLOAD_DIR, uploadSecurity.validateUpload(file, "artwork", MAX_UPLOAD_BYTES));
+  const validated = uploadSecurity.validateUpload(file, "artwork", MAX_UPLOAD_BYTES);
+  const stored = objectKey("artwork", `artwork/${uploadSecurity.generatedName(validated.extension)}`);
+  try { await storage.put({ kind: "artwork", key: stored, body: validated.data, contentType: validated.mime }); }
+  catch (error) { await removeSavedUploads([{ stored }], UPLOAD_DIR); throw error; }
+  return { original: validated.original, stored, mime: validated.mime, size: validated.size };
 }
 
-function saveProductImage(file) {
+async function saveProductImage(file) {
   if (!file || !file.filename) return null;
-  return uploadSecurity.writeUpload(PRODUCT_IMAGE_DIR, uploadSecurity.validateUpload(file, "image", MAX_PRODUCT_IMAGE_BYTES));
+  const validated = uploadSecurity.validateUpload(file, "image", MAX_PRODUCT_IMAGE_BYTES);
+  const stored = objectKey("product-image", `product-images/${uploadSecurity.generatedName(validated.extension)}`);
+  try { await storage.put({ kind: "product-image", key: stored, body: validated.data, contentType: validated.mime }); }
+  catch (error) { await removeSavedUploads([{ stored }], PRODUCT_IMAGE_DIR); throw error; }
+  return { original: validated.original, stored, mime: validated.mime, size: validated.size };
 }
 
-function saveProductImages(files) {
+async function saveProductImages(files) {
   const saved = [];
   try {
     for (const file of (Array.isArray(files) ? files : [files])) {
-      const stored = saveProductImage(file);
+      const stored = await saveProductImage(file);
       if (stored) saved.push(stored);
     }
     return saved;
   } catch (error) {
-    for (const file of saved) uploadSecurity.removeUpload(PRODUCT_IMAGE_DIR, file.stored);
+    await removeSavedUploads(saved, PRODUCT_IMAGE_DIR);
     throw error;
   }
 }
 
-function removeSavedUploads(files, directory) {
+async function removeSavedUploads(files, directory) {
+  const kind = path.resolve(directory) === path.resolve(PRODUCT_IMAGE_DIR) ? "product-image" : "artwork";
   for (const file of files || []) {
-    if (file?.stored) uploadSecurity.removeUpload(directory, file.stored);
+    if (!file?.stored) continue;
+    try { await storage.delete({ kind, key: file.stored }); }
+    catch { console.error("Object cleanup failed after a database operation; the storage reconciliation tool may find an orphan."); }
   }
 }
 
@@ -1163,7 +1184,7 @@ async function cartPage(url, session, cart) {
     <section class="page-hero compact"><span class="eyebrow">YOUR ORDER</span><h1>Shopping cart</h1><p>Review your print specifications before checkout.</p></section>
     ${notice(url)}
     <section class="cart-layout section">
-      <div>${cart.items.length ? cart.items.map(item => `<article class="cart-item">${productArt(item)}<div class="cart-copy"><h3><a href="/product/${item.slug}">${esc(item.name)}</a></h3><p>${esc(item.size)} · ${esc(item.material)} · ${esc(item.print_option)}</p>${item.artwork_note ? `<small>Artwork note: ${esc(item.artwork_note)}</small>` : ""}${item.artwork_original_name ? `<small>Artwork: ${session.user ? `<a href="/artwork/${encodeURIComponent(item.artwork_stored_name)}">${esc(item.artwork_original_name)}</a>` : esc(item.artwork_original_name)}</small>` : ""}</div><form action="/cart/update" method="post"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="item_id" value="${item.id}"><label>Qty<input name="quantity" type="number" min="0" max="${item.quantity + sellableQuantity(item)}" value="${item.quantity}"></label><small>${item.quantity + sellableQuantity(item)} max available</small><button>Update</button></form><strong>${money(item.quantity * item.unit_price)}</strong></article>`).join("") : emptyState("cart", "Your cart is waiting.", "Choose a product and make it yours when the idea is ready.", "/products", "Browse products", "/help", "Need print help?")}</div>
+      <div>${cart.items.length ? cart.items.map(item => `<article class="cart-item">${productArt(item)}<div class="cart-copy"><h3><a href="/product/${item.slug}">${esc(item.name)}</a></h3><p>${esc(item.size)} · ${esc(item.material)} · ${esc(item.print_option)}</p>${item.artwork_note ? `<small>Artwork note: ${esc(item.artwork_note)}</small>` : ""}${item.artwork_original_name ? `<small>Artwork: ${session.user ? `<a href="${artworkUrl(item.artwork_stored_name)}">${esc(item.artwork_original_name)}</a>` : esc(item.artwork_original_name)}</small>` : ""}</div><form action="/cart/update" method="post"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="item_id" value="${item.id}"><label>Qty<input name="quantity" type="number" min="0" max="${item.quantity + sellableQuantity(item)}" value="${item.quantity}"></label><small>${item.quantity + sellableQuantity(item)} max available</small><button>Update</button></form><strong>${money(item.quantity * item.unit_price)}</strong></article>`).join("") : emptyState("cart", "Your cart is waiting.", "Choose a product and make it yours when the idea is ready.", "/products", "Browse products", "/help", "Need print help?")}</div>
       ${cart.items.length ? `<aside class="order-summary"><h2>Order summary</h2><p><span>Subtotal</span><b>${money(totals.subtotal)}</b></p><p><span>Delivery estimate</span><b>${totals.delivery === 0 ? "FREE" : money(totals.delivery)}</b></p><p class="total"><span>Total</span><b>${money(totals.total)}</b></p><small>Taxes included. Exact shipping updates by PIN code at checkout.</small><a class="button primary" href="/checkout">Proceed to checkout</a><a href="/products">Continue shopping</a></aside>` : ""}
     </section>
   `, session, cart);
@@ -1308,7 +1329,7 @@ async function orderDetailsPage(order, session, cart) {
       <div class="order-review-actions">
         ${items.map(item => `
           <div class="review-item" id="review-${item.product_id}">
-            <span>${esc(item.product_name)} <small>Qty: ${item.quantity}</small>${item.artwork_stored_name ? `<small>Artwork: <a href="/artwork/${encodeURIComponent(item.artwork_stored_name)}">${esc(item.artwork_original_name || "Download artwork")}</a></small>` : ""}</span>
+            <span>${esc(item.product_name)} <small>Qty: ${item.quantity}</small>${item.artwork_stored_name ? `<small>Artwork: <a href="${artworkUrl(item.artwork_stored_name)}">${esc(item.artwork_original_name || "Download artwork")}</a></small>` : ""}</span>
             ${order.status === "Delivered" ? `<form class="review-form order-review-form" method="post" action="/account/reviews/save"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="order_id" value="${order.id}"><input type="hidden" name="product_id" value="${item.product_id}"><label>Rating<select name="rating">${[5, 4, 3, 2, 1].map(rating => `<option value="${rating}" ${item.review?.rating === rating ? "selected" : ""}>${rating}</option>`).join("")}</select></label><label>Comment<textarea name="comment" rows="3" minlength="8" required>${esc(item.review?.comment || "")}</textarea></label><button class="button primary" type="submit">${item.review ? "Update review" : "Submit review"}</button></form>${item.review ? `<form method="post" action="/account/reviews/delete" onsubmit="return confirm('Delete this review?');"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="order_id" value="${order.id}"><input type="hidden" name="review_id" value="${item.review.id}"><button class="button ghost" type="submit">Delete review</button></form>` : ""}` : `<small>Reviews unlock after this order is delivered.</small>`}
           </div>
         `).join("")}
@@ -2783,13 +2804,16 @@ function servePublic(req, res, url) {
   return true;
 }
 
-function serveProductImage(req, res, url) {
-  let name;
-  try { name = decodeURIComponent(url.pathname.split("/").pop() || ""); } catch { return send(res, 404, "Not found", "text/plain"), true; }
-  if (!uploadSecurity.GENERATED_FILE.test(name) || !ALLOWED_IMAGE_EXTENSIONS.has(path.extname(name).toLowerCase())) return send(res, 404, "Not found", "text/plain"), true;
-  const file = uploadSecurity.resolveContained(PRODUCT_IMAGE_DIR, name);
-  if (!fs.existsSync(file) || !fs.statSync(file).isFile()) return send(res, 404, "Not found", "text/plain"), true;
-  const bytes = fs.readFileSync(file), detected = uploadSecurity.detectFile(bytes, path.extname(name).toLowerCase());
+async function serveProductImage(req, res, url) {
+  let key;
+  try { key = decodeURIComponent(url.pathname.slice("/uploads/".length)); } catch { return send(res, 404, "Not found", "text/plain"), true; }
+  let stored;
+  try { stored = objectKey("product-image", key); } catch { return send(res, 404, "Not found", "text/plain"), true; }
+  const name = stored.slice(stored.indexOf("/") + 1);
+  if (!ALLOWED_IMAGE_EXTENSIONS.has(path.extname(name).toLowerCase())) return send(res, 404, "Not found", "text/plain"), true;
+  const object = await storage.get({ kind: "product-image", key: stored });
+  if (!object) return send(res, 404, "Not found", "text/plain"), true;
+  const bytes = object.body, detected = uploadSecurity.detectFile(bytes, path.extname(name).toLowerCase());
   if (!detected || detected.kind !== "image") return send(res, 404, "Not found", "text/plain"), true;
   send(res, 200, bytes, detected.mime);
   return true;
@@ -2798,25 +2822,29 @@ function serveProductImage(req, res, url) {
 async function serveArtwork(req, res, url, session) {
   let name;
   try { name = decodeURIComponent(url.pathname.slice("/artwork/".length)); } catch { return send(res, 404, "Not found", "text/plain"), true; }
-  if (!uploadSecurity.GENERATED_FILE.test(name) || !ALLOWED_ARTWORK_EXTENSIONS.has(path.extname(name).toLowerCase())) return send(res, 404, "Not found", "text/plain"), true;
+  let stored;
+  try { stored = objectKey("artwork", name); } catch { return send(res, 404, "Not found", "text/plain"), true; }
+  const filename = stored.slice(stored.indexOf("/") + 1);
+  if (!ALLOWED_ARTWORK_EXTENSIONS.has(path.extname(filename).toLowerCase())) return send(res, 404, "Not found", "text/plain"), true;
+  const referenceNames = [stored, filename];
   const admin = isAdmin(session);
   let allowed = false;
   if (admin) {
-    allowed = Boolean(await db.get(`SELECT 1 FROM cart_items WHERE artwork_stored_name=?
-      UNION ALL SELECT 1 FROM order_items WHERE artwork_stored_name=? LIMIT 1`, name, name));
+    allowed = Boolean(await db.get(`SELECT 1 FROM cart_items WHERE artwork_stored_name IN (?,?)
+      UNION ALL SELECT 1 FROM order_items WHERE artwork_stored_name IN (?,?) LIMIT 1`, ...referenceNames, ...referenceNames));
   } else if (session?.user?.id) {
-    allowed = Boolean(await db.get(`SELECT 1 FROM cart_items WHERE artwork_stored_name=? AND session_id=?
-      UNION ALL SELECT 1 FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE oi.artwork_stored_name=? AND o.user_id=? LIMIT 1`, name, session.id, name, session.user.id));
+    allowed = Boolean(await db.get(`SELECT 1 FROM cart_items WHERE artwork_stored_name IN (?,?) AND session_id=?
+      UNION ALL SELECT 1 FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE oi.artwork_stored_name IN (?,?) AND o.user_id=? LIMIT 1`, ...referenceNames, session.id, ...referenceNames, session.user.id));
   }
   if (!allowed) return send(res, 404, "Not found", "text/plain"), true;
-  const file = uploadSecurity.resolveContained(UPLOAD_DIR, name);
-  if (!fs.existsSync(file) || !fs.statSync(file).isFile()) return send(res, 404, "Not found", "text/plain"), true;
-  const bytes = fs.readFileSync(file), extension = path.extname(name).toLowerCase();
+  const object = await storage.get({ kind: "artwork", key: stored });
+  if (!object) return send(res, 404, "Not found", "text/plain"), true;
+  const bytes = object.body, extension = path.extname(filename).toLowerCase();
   const detected = uploadSecurity.detectFile(bytes, extension);
   if (!detected || detected.kind !== "document" && detected.kind !== "image") return send(res, 404, "Not found", "text/plain"), true;
-  const referenced = await db.get(`SELECT artwork_original_name AS name FROM cart_items WHERE artwork_stored_name=?
-    UNION ALL SELECT artwork_original_name AS name FROM order_items WHERE artwork_stored_name=? LIMIT 1`, name, name);
-  const original = safeFileName(referenced?.name || name).replace(/["\\]/g, "_");
+  const referenced = await db.get(`SELECT artwork_original_name AS name FROM cart_items WHERE artwork_stored_name IN (?,?)
+    UNION ALL SELECT artwork_original_name AS name FROM order_items WHERE artwork_stored_name IN (?,?) LIMIT 1`, ...referenceNames, ...referenceNames);
+  const original = safeFileName(referenced?.name || filename).replace(/["\\]/g, "_");
   setSecurityHeaders(res);
   res.writeHead(200, {
     "Content-Type": detected.mime,
@@ -2882,6 +2910,8 @@ const app = {
   get db() { return db; },
   databaseHealth,
   redisHealth: async () => Boolean(redis && await redis.health()),
+  storageHealth: () => storage.health(),
+  storage,
   redisService: () => redis,
   defaultAddress,
   hashPassword,
@@ -2959,9 +2989,10 @@ const server = http.createServer(async (req, res) => {
     return send(res, 404, await layout("Page not found", `<section class="not-found section"><div class="not-found-mark" aria-hidden="true"><span>404</span></div><div><span class="eyebrow">PAGE NOT FOUND</span><h1>Looks like this page wasn't printed correctly.</h1><p>The link may have moved, expired or never made it to production. Search the catalog or head back to a fresh start.</p><form class="not-found-search" action="/products" role="search"><label class="sr-only" for="not-found-query">Search PrintOasis products</label><input id="not-found-query" name="q" placeholder="Search cards, flyers, stickers..." required><button class="button primary" type="submit">Search products</button></form><div class="not-found-actions"><a class="button primary" href="/">Return home</a><a class="button ghost" href="/products">Continue shopping</a></div></div></section>`, routedSession, routedCart));
 
   } catch (error) {
-    if (error.code !== "REDIS_UNAVAILABLE") console.error(error);
+    if (error.code !== "REDIS_UNAVAILABLE" && error.code !== "OBJECT_STORAGE_UNAVAILABLE") console.error(error);
     if (res.headersSent) return res.destroy();
     if (error.code === "REDIS_UNAVAILABLE") return send(res, 503, "Service temporarily unavailable. Please try again shortly.", "text/plain; charset=utf-8");
+    if (error.code === "OBJECT_STORAGE_UNAVAILABLE") return send(res, 503, "File storage is temporarily unavailable. Please try again shortly.", "text/plain; charset=utf-8");
     if (error.code === "UPLOAD_TOO_LARGE") return send(res, 413, "Upload exceeds the allowed request size.", "text/plain; charset=utf-8");
     if (error.code === "UPLOAD_INVALID") return send(res, 400, error.message, "text/plain; charset=utf-8");
     send(res, 500, process.env.NODE_ENV === "test" ? error.stack : "Something went wrong. Please try again.", "text/plain");
@@ -2972,8 +3003,11 @@ async function start() {
   try {
     await initRedis();
     await initDb();
-    await app.cleanupOrphanedUploads();
-    if (!await databaseHealth(db) || !await redis.health()) throw new Error("Application dependency health check failed.");
+    if (storage.backend === "local") {
+      await app.cleanupOrphanedUploads();
+      await storage.cleanupStaging();
+    }
+    if (!await databaseHealth(db) || !await redis.health() || !await storage.health()) throw new Error("Application dependency health check failed.");
     await new Promise((resolve, reject) => {
       server.once("error", reject);
       server.listen(PORT, () => { server.off("error", reject); resolve(); });
@@ -2984,11 +3018,13 @@ async function start() {
       try { await redis.close(); } catch {}
       redis = undefined;
     }
+    try { await storage.close(); } catch {}
     if (db) {
       try { await db.close(); } catch (closeError) { console.error("PostgreSQL pool cleanup after startup failure failed:", closeError); }
       db = undefined;
     }
-    console.error("PrintOasis could not start because a required database or shared Redis service is unavailable.", error.code === "REDIS_UNAVAILABLE" ? error.message : error);
+    const dependencyFailure = error.code === "REDIS_UNAVAILABLE" || error.code === "OBJECT_STORAGE_UNAVAILABLE";
+    console.error("PrintOasis could not start because a required database, Redis, or object-storage service is unavailable.", dependencyFailure ? error.message : error);
     process.exitCode = 1;
     throw error;
   }
@@ -3006,6 +3042,7 @@ async function shutdown(signal) {
       await redis.close();
       redis = undefined;
     }
+    await storage.close();
     if (db) {
       await db.close();
       db = undefined;

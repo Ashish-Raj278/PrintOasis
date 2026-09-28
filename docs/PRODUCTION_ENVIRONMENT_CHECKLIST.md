@@ -26,7 +26,16 @@ offered.
 | `REDIS_PREFIX` | OPTIONAL, PRODUCTION-ONLY | Namespace for this deployment; use a unique stable production prefix. Default is `printoasis`. |
 | `REDIS_CONNECT_TIMEOUT_MS` | OPTIONAL | Redis connect timeout; default is supplied by the service. |
 | `BASE_URL` | REQUIRED, PRODUCTION-ONLY | Canonical public HTTPS origin, without an untrusted request-derived host. Verify login, reset, verification, and order links use this origin. |
-| `DATA_DIR` | REQUIRED, PRODUCTION-ONLY | Point to the host's persistent runtime disk. Render Blueprint uses `/var/data`; that disk is instance-local and not shared. |
+| `DATA_DIR` | REQUIRED, PRODUCTION-ONLY | Point to the host's runtime disk for local email-outbox operational copies and staging. Render uses `/var/data`; this data is instance-local. Uploaded objects use shared object storage. |
+| `OBJECT_STORAGE_BACKEND` | REQUIRED, PRODUCTION-ONLY | Set `s3`; production explicitly rejects local-only upload storage. |
+| `OBJECT_STORAGE_ENDPOINT` | REQUIRED, PRODUCTION-ONLY | Provider-supplied S3-compatible endpoint; verify HTTPS and endpoint ownership. |
+| `OBJECT_STORAGE_REGION` | REQUIRED, PRODUCTION-ONLY | Provider-supplied region/region token expected by its S3 API. |
+| `OBJECT_STORAGE_ACCESS_KEY_ID` | REQUIRED, PRODUCTION-ONLY, SECRET | Restricted server credential for the configured buckets; store privately. |
+| `OBJECT_STORAGE_SECRET_ACCESS_KEY` | REQUIRED, PRODUCTION-ONLY, SECRET | Matching private server credential. Never expose to browsers or logs. |
+| `OBJECT_STORAGE_PUBLIC_BUCKET` | REQUIRED, PRODUCTION-ONLY | Distinct product-image bucket. Keep provider-level anonymous access disabled; PrintOasis serves validated images. |
+| `OBJECT_STORAGE_PRIVATE_BUCKET` | REQUIRED, PRODUCTION-ONLY | Distinct private customer-artwork bucket. Never enable anonymous reads. |
+| `OBJECT_STORAGE_FORCE_PATH_STYLE` | OPTIONAL, PRODUCTION-ONLY | Default `false`; enable only if the selected compatible endpoint requires path-style addressing. |
+| `OBJECT_STORAGE_TIMEOUT_MS` | OPTIONAL, PRODUCTION-ONLY | Request deadline in milliseconds; default `30000`, bounded by the service to 120000. Confirm it against provider latency and upload sizes. |
 | `TRUST_PROXY_HOPS` | REQUIRED, PRODUCTION-ONLY | Configure only after verifying the real proxy chain and ensuring direct access cannot bypass it. The default `0` does not trust forwarded client-IP headers. |
 | `ADMIN_EMAIL` | REQUIRED, PRODUCTION-ONLY | Set the real initial administrator account email privately. Verify admin access before launch. |
 | `ADMIN_PASSWORD` | REQUIRED, PRODUCTION-ONLY, SECRET | Strong private initial bootstrap password. Do not assume changing this environment variable later rotates an existing account password; use the account password workflow. |
@@ -73,8 +82,9 @@ canonical session payload is held in Redis.
 
 ## Render and repository agreement
 
-- `render.yaml` supplies `NODE_ENV=production`, `/var/data`, and private
-  dashboard values for database, Redis, origin, admin bootstrap, and SMTP.
+- `render.yaml` supplies `NODE_ENV=production`, `/var/data`,
+  `OBJECT_STORAGE_BACKEND=s3`, and private dashboard values for object storage,
+  database, Redis, origin, admin bootstrap, and SMTP.
   Render supplies `PORT`.
 - Optional feature/business values in this checklist must be added privately
   to the Render service only if the corresponding feature is enabled. Never
@@ -89,8 +99,8 @@ canonical session payload is held in Redis.
 
 - [ ] Database project, plan, PostgreSQL version, backup mode, retention, and
   latest recovery point verified in the production dashboard.
-- [ ] Database and Redis endpoints verified against the intended production
-  projects; test endpoints are separate.
+- [ ] Database, Redis, and object-storage endpoints/buckets verified against
+  the intended production projects; test endpoints are separate.
 - [ ] Canonical HTTPS origin, proxy hop count, and Secure-cookie behavior
   verified through the deployed edge.
 - [ ] Initial admin login and password-change workflow verified.
@@ -100,6 +110,5 @@ canonical session payload is held in Redis.
   before production invoices are issued.
 - [ ] Payment-provider account/configuration is approved before live online
   payments are enabled.
-- [ ] Database and runtime-file restore drills completed in isolated targets.
-- [ ] Single-instance local-disk limitation acknowledged until Stage 7 object
-  storage is implemented.
+- [ ] Database restore drill and storage migration/audit completed; artwork
+  access verified from a second application instance or isolated deployment.

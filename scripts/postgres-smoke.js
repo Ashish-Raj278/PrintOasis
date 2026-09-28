@@ -1,6 +1,8 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const fsp = require("node:fs/promises");
+const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { assertIsolatedSupabaseTestDatabase } = require("./database-isolation");
@@ -28,6 +30,8 @@ process.env.REDIS_URL = testRedisUrl;
 process.env.REDIS_PREFIX = `${redisTestPrefix}:${process.pid}:${stamp}`;
 process.env.NODE_ENV = "test";
 process.env.PORT = "0";
+process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "printoasis-postgres-smoke-"));
+process.env.OBJECT_STORAGE_BACKEND = "local";
 process.env.ADMIN_EMAIL = "postgres-smoke-admin@example.test";
 process.env.ADMIN_PASSWORD = "PostgresSmokeAdmin123!";
 process.env.EMAIL_DELIVERY_ENABLED = "false";
@@ -168,7 +172,7 @@ async function cleanup() {
     if (smokeSessionIds.size) await tx.run(`DELETE FROM sessions WHERE id IN (${[...smokeSessionIds].map(() => "?").join(",")})`, ...smokeSessionIds);
     await tx.run("DELETE FROM coupons WHERE code LIKE ?", `${prefix.toUpperCase()}%`);
   });
-  for (const entry of smokeUploads.splice(0)) app.removeSavedUploads([{ stored: entry.name }], entry.directory);
+  for (const entry of smokeUploads.splice(0)) await app.removeSavedUploads([{ stored: entry.name }], entry.directory);
 }
 async function cleanupRedisNamespace() {
   const client = app.redisService().client;
@@ -181,7 +185,11 @@ async function cleanupRedisNamespace() {
 }
 
 async function main() {
-  await start();
+  try { await start(); }
+  catch (error) {
+    await fsp.rm(process.env.DATA_DIR, { recursive: true, force: true });
+    throw error;
+  }
   baseUrl = `http://127.0.0.1:${server.address().port}`;
   try {
     const health = await get("/healthz"); assert.equal(health.response.status, 200); assert.equal(health.html, "ok");
@@ -333,7 +341,13 @@ async function main() {
   } finally {
     await stopSharedServer();
     try { await cleanup(); }
-    finally { try { await cleanupRedisNamespace(); } finally { await shutdown("postgres smoke"); } }
+    finally {
+      try { await cleanupRedisNamespace(); }
+      finally {
+        try { await shutdown("postgres smoke"); }
+        finally { await fsp.rm(process.env.DATA_DIR, { recursive: true, force: true }); }
+      }
+    }
   }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
