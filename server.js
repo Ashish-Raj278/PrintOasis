@@ -163,7 +163,6 @@ async function initDb() {
     await db.run(`INSERT INTO users (name,email,password_hash,is_admin) VALUES (?,?,?,1) ON CONFLICT (email) DO UPDATE SET is_admin = 1`, "PrintOasis Admin", ADMIN_EMAIL, hashPassword(ADMIN_PASSWORD));
   }
   await db.transaction(async tx => {
-    await tx.run("DELETE FROM products WHERE name = ? OR name LIKE ?", "Ashish R", "Smoke Poster %");
     for (const product of catalogProducts) {
       await tx.run("UPDATE products SET stock = ? WHERE slug = ? AND stock <= 0 AND reserved = 0", DEFAULT_SEEDED_STOCK, product[0]);
       await tx.run(`
