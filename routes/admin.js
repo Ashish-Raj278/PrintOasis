@@ -17,6 +17,10 @@ module.exports = async function adminRoutes(ctx) {
       const id = Number(data.id || 0), name = String(data.name || "").trim(), slug = app.slugify(data.slug || name);
       if (!name || !slug) throw new Error("Product name is required.");
       const values = { slug, name, category: data.category, price: Math.max(1, Number(data.price) || 1), min_qty: Math.max(1, Number(data.min_qty) || 1), rating: Math.max(1, Math.min(5, Number(data.rating) || 4.8)), stock: Math.max(0, Number(data.stock) || 0), status: data.status === "hidden" ? "hidden" : "active", featured: data.featured ? 1 : 0, badge: String(data.badge || "").trim(), description: String(data.description || "").trim(), sizes: String(data.sizes || "").trim(), materials: String(data.materials || "").trim(), print_options: String(data.print_options || "").trim(), color: String(data.color || "cobalt").trim(), active: data.status === "hidden" ? 0 : 1 };
+      if (!Number.isSafeInteger(values.price) || !Number.isSafeInteger(values.min_qty) ||
+          (BigInt(values.price) * 100n) % BigInt(values.min_qty) !== 0n) {
+        throw new Error("Price and minimum quantity must produce a unit price in whole paise.");
+      }
       await app.db.transaction(async tx => {
         let productId = id;
         if (id) {
@@ -71,7 +75,7 @@ module.exports = async function adminRoutes(ctx) {
   if (url.pathname === "/admin/orders/refund") {
     const orderId = Number(data.order_id), amountText = String(data.amount || "").trim(), reason = String(data.reason || "").trim().slice(0, 240);
     if (!Number.isSafeInteger(orderId) || !/^\d{1,8}(?:\.\d{1,2})?$/.test(amountText)) return app.redirect(res, "/admin/orders?notice=Enter+a+valid+refund+amount."), true;
-    const amountMinor = Math.round(Number(amountText) * 100);
+    const amountMinor = app.inrToMinor(amountText);
     const order = await app.db.get("SELECT payment_record_id FROM orders WHERE id=?", orderId);
     if (!order?.payment_record_id || amountMinor <= 0) return app.redirect(res, "/admin/orders?notice=This+order+has+no+refundable+online+payment."), true;
     try {

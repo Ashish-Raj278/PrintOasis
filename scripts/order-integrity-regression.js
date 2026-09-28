@@ -18,6 +18,13 @@ async function assertOrderIntegrityBehavior({ app, get, post, csrf, prefix, admi
 
   try {
     c.ok(await app.db.get("SELECT name FROM schema_migrations WHERE name='007-invoice-order-integrity.sql'"), "Invoice/order integrity migration is recorded.");
+    c.ok(await app.db.get("SELECT name FROM schema_migrations WHERE name='009-decimal-order-prices.sql'"), "Decimal order price migration is recorded.");
+    const monetaryColumns = await app.db.all(`SELECT table_name,column_name,data_type,numeric_precision,numeric_scale
+      FROM information_schema.columns WHERE table_schema='public' AND
+      (table_name,column_name) IN (('cart_items','unit_price'),('order_items','unit_price'),('orders','total'),('orders','shipping_fee'),('orders','discount'))`);
+    c.equal(monetaryColumns.length, 5, "All five rupee-denominated cart/order columns are present.");
+    c.ok(monetaryColumns.every(column => column.data_type === "numeric" && Number(column.numeric_precision) === 12 && Number(column.numeric_scale) === 2),
+      "Cart and order rupee columns use NUMERIC(12,2).");
     c.ok(await app.db.get("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='orders' AND column_name='invoice_snapshot'"), "Orders persist an immutable invoice snapshot.");
     c.ok(await app.db.get("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='order_status_events' AND column_name='previous_status'"), "Status history stores the prior state.");
     c.ok(await app.db.get("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='order_status_events' AND column_name='actor_type'"), "Status history stores the actor type.");
@@ -84,6 +91,19 @@ async function assertOrderIntegrityBehavior({ app, get, post, csrf, prefix, admi
     const historicalPage = await get(`/invoice/${encodeURIComponent(historical.order_number)}`, customer);
     c.equal(historicalPage.response.status, 200, "Historical invoice remains available after its product is deleted.");
     c.ok(historicalPage.html.includes("Deleted Product Snapshot"), "Historical invoice retains the product description after product deletion.");
+
+    const fractionalSnapshot = app.createInvoiceSnapshot({ subtotalMinor: 499, discountMinor: 0, shippingMinor: 9900, totalMinor: 10399 });
+    const fractionalHistorical = await app.db.get(`INSERT INTO orders
+      (order_number,user_id,total,status,customer_name,phone,address,city,postal_code,shipping_fee,discount,payment_method,invoice_snapshot)
+      VALUES (?, ?, '103.99','Pending','Fractional Invoice','9876500000','1 Test Road','Bengaluru','560001','99.00','0.00','cod',?::jsonb)
+      RETURNING id,order_number`, `${prefix}-fractional-invoice`, userId, JSON.stringify(fractionalSnapshot));
+    orderIds.push(Number(fractionalHistorical.id));
+    await app.db.run("INSERT INTO order_items (order_id,product_id,product_name,quantity,unit_price,configuration) VALUES (?,?,?,1,'4.99','Standard configuration')",
+      fractionalHistorical.id, product.id, "Fractional Price Snapshot");
+    const fractionalPage = await get(`/invoice/${encodeURIComponent(fractionalHistorical.order_number)}`, customer);
+    c.equal(fractionalPage.response.status, 200, "Fractional-rupee invoice renders successfully.");
+    c.ok(fractionalPage.html.includes("₹4.99") && fractionalPage.html.includes("₹103.99"),
+      "Invoice item and total display exact paise values.");
 
     async function makeOrder(label, paymentMethod = "cod") {
       const created = await app.db.get(`INSERT INTO orders

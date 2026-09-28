@@ -17,13 +17,13 @@ async function assertOrderFinalizationBehavior({ app, prefix }) {
   const user = await app.db.get("INSERT INTO users (name,email,password_hash) VALUES (?,?,?) RETURNING id",
     "Order Finalization Regression", `${suffix}@example.test`, "unused-test-hash");
 
-  async function addSession(label, product, quantity = 1) {
+  async function addSession(label, product, quantity = 1, unitPrice = "150.00") {
     const id = crypto.randomBytes(24).toString("hex");
     await app.db.run("INSERT INTO sessions (id,user_id,csrf,expires_at) VALUES (?,?,?,?)",
       id, user.id, crypto.randomBytes(18).toString("hex"), Date.now() + 3600000);
     await app.db.run(`INSERT INTO cart_items
       (session_id,product_id,quantity,size,material,print_option,artwork_note,artwork_original_name,artwork_stored_name,artwork_mime,artwork_size,unit_price)
-      VALUES (?,?,?,'Standard','Matte','Full color',NULL,NULL,NULL,NULL,NULL,150)`, id, product.id, quantity);
+      VALUES (?,?,?,'Standard','Matte','Full color',NULL,NULL,NULL,NULL,NULL,?)`, id, product.id, quantity, unitPrice);
     sessions.push(id);
     return { id, user: { id: user.id }, label };
   }
@@ -39,7 +39,7 @@ async function assertOrderFinalizationBehavior({ app, prefix }) {
 
   async function checkout(label, opts = {}) {
     const p = opts.product || await product(label, opts.stock || 1);
-    const session = await addSession(label, p, opts.quantity || 1);
+    const session = await addSession(label, p, opts.quantity || 1, opts.unitPrice || "150.00");
     await app.db.run("UPDATE products SET reserved=reserved+? WHERE id=?", opts.quantity || 1, p.id);
     const couponCode = opts.couponCode || "";
     const form = {
@@ -72,6 +72,28 @@ async function assertOrderFinalizationBehavior({ app, prefix }) {
   const orderByIntent = intentId => app.db.get("SELECT * FROM orders WHERE checkout_intent_id=?", intentId);
 
   try {
+    c.equal(app.inrToMinor("4.99"), 499, "Decimal INR converts to paise without floating-point rounding.");
+    c.equal(app.minorToInr(499), "4.99", "Paise convert to a fixed two-decimal INR value.");
+    c.equal(app.productUnitPriceMinor({ price: 499, min_qty: 100 }), 499, "Catalog minimum-quantity price yields an exact paise unit rate.");
+    c.equal(app.productUnitPriceMinor({ price: 749, min_qty: 50 }), 1498, "Catalog divisor produces a whole-paise unit rate.");
+    let unsupportedCatalogRate = false;
+    try { app.productUnitPriceMinor({ price: 100, min_qty: 3 }); } catch { unsupportedCatalogRate = true; }
+    c.ok(unsupportedCatalogRate, "Catalog price/minimum-quantity rates that cannot be represented in paise are rejected.");
+    const fractionalCatalogProduct = await app.db.get(`INSERT INTO products
+      (slug,name,category,price,min_qty,rating,description,sizes,materials,print_options,color,stock,reserved)
+      VALUES (?,?,'business-cards',499,100,4.8,'Fractional catalog fixture','Standard','Matte','Full color','navy',1,0)
+      RETURNING *`, `${suffix}-fractional-catalog`, "Fractional catalog fixture");
+    products.push(Number(fractionalCatalogProduct.id));
+    const fractionalCatalogSessionId = crypto.randomBytes(24).toString("hex");
+    await app.db.run("INSERT INTO sessions (id,user_id,csrf,expires_at) VALUES (?,?,?,?)",
+      fractionalCatalogSessionId, user.id, crypto.randomBytes(18).toString("hex"), Date.now() + 3600000);
+    sessions.push(fractionalCatalogSessionId);
+    await app.addCartItem(fractionalCatalogSessionId, fractionalCatalogProduct, 1,
+      { size: "Standard", material: "Matte", printOption: "Full color" });
+    const catalogCart = await app.cartData(fractionalCatalogSessionId);
+    c.equal(String(catalogCart.items[0].unit_price), "4.99", "Cart insertion stores the exact catalog-derived paise unit price.");
+    c.equal(catalogCart.subtotal_minor, 499, "Cart subtotal sums the catalog-derived price in integer paise.");
+
     const normal = await checkout("normal");
     const orderNumber = await app.finalizeCapturedCheckout(normal.session, normal.paymentId, { notify: false });
     const order = await app.db.get("SELECT * FROM orders WHERE order_number=?", orderNumber);
@@ -242,6 +264,31 @@ async function assertOrderFinalizationBehavior({ app, prefix }) {
       "Completed intent reuses its one existing order.");
     c.equal(Number((await app.db.get("SELECT COUNT(*) AS count FROM order_items WHERE order_id=?", completedId)).count), 1,
       "Already-finalized intent has no duplicate order items.");
+
+    const fractional = await checkout("fractional-online", { unitPrice: "4.99" });
+    c.equal(Number(fractional.intent.amount_minor), 10399, "Fractional item price plus delivery produces an exact paise checkout amount.");
+    const fractionalNumber = await app.finalizeCapturedCheckout(fractional.session, fractional.paymentId, { notify: false });
+    const fractionalOrder = await app.db.get("SELECT * FROM orders WHERE order_number=?", fractionalNumber);
+    orders.push(fractionalOrder.id);
+    const fractionalLine = await app.db.get("SELECT unit_price,quantity FROM order_items WHERE order_id=?", fractionalOrder.id);
+    c.equal(String(fractionalOrder.total), "103.99", "Captured order stores the exact two-decimal INR total.");
+    c.equal(String(fractionalLine.unit_price), "4.99", "Captured order item preserves the paise unit rate.");
+    c.equal(Number(fractionalOrder.invoice_snapshot.total_minor), 10399, "Fractional captured order invoice retains exact total paise.");
+
+    const fractionalCodProduct = await product("fractional-cod");
+    const fractionalCodSession = await addSession("fractional-cod", fractionalCodProduct, 1, "4.99");
+    await app.db.run("UPDATE products SET reserved=reserved+1 WHERE id=?", fractionalCodProduct.id);
+    const fractionalCodCart = await app.cartData(fractionalCodSession.id);
+    const fractionalCodNumber = await app.createLocalOrder(fractionalCodSession, fractionalCodCart, {
+      postal_code: "560001", customer_name: "Fractional COD", phone: "9876500000",
+      address: "4 Fractional Road", city: "Bengaluru", gst_number: ""
+    }, "cod", null, { notify: false });
+    const fractionalCodOrder = await app.db.get("SELECT * FROM orders WHERE order_number=?", fractionalCodNumber);
+    orders.push(fractionalCodOrder.id);
+    const fractionalCodLine = await app.db.get("SELECT unit_price FROM order_items WHERE order_id=?", fractionalCodOrder.id);
+    c.equal(String(fractionalCodOrder.total), "103.99", "COD order stores the same exact decimal INR total.");
+    c.equal(String(fractionalCodLine.unit_price), "4.99", "COD order item preserves the paise unit rate.");
+    c.equal(Number(fractionalCodOrder.invoice_snapshot.total_minor), 10399, "COD invoice snapshot retains exact total paise.");
 
     const codFixture = await checkout("cod-compatible");
     const codOrderNumber = await app.createLocalOrder(codFixture.session, await app.cartData(codFixture.session.id),

@@ -461,12 +461,17 @@ if (searchInput && searchForm) {
 }
 
 const quantity = document.querySelector('input[name="quantity"]');
-const price = document.querySelector("[data-unit-price]");
+const price = document.querySelector("[data-unit-price-minor]");
 if (quantity && price) {
-  const unit = Number(price.dataset.unitPrice);
+  const unitMinor = BigInt(price.dataset.unitPriceMinor);
   const minimum = Number(quantity.min || 1);
   const formatter = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
-  const update = () => { price.textContent = formatter.format((Number(quantity.value) || minimum) * unit); };
+  const update = () => {
+    const amount = unitMinor * BigInt(Number(quantity.value) || minimum);
+    const whole = amount / 100n;
+    const fraction = String(amount % 100n).padStart(2, "0");
+    price.textContent = fraction === "00" ? formatter.format(whole) : `${formatter.format(whole)}.${fraction}`;
+  };
   quantity.addEventListener("input", update);
   update();
 }
@@ -481,7 +486,7 @@ document.querySelectorAll(".artwork-input").forEach(input => {
 const postalInput = document.querySelector('input[name="postal_code"]');
 const shippingBox = document.querySelector(".shipping-estimate");
 if (postalInput && shippingBox) {
-  const subtotal = Number(shippingBox.dataset.subtotal || 0);
+  const subtotalMinor = BigInt(shippingBox.dataset.subtotalMinor || 0);
   const formatter = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
   const updateShipping = () => {
     const pin = postalInput.value.trim();
@@ -489,7 +494,7 @@ if (postalInput && shippingBox) {
       shippingBox.textContent = "Enter PIN code for exact shipping.";
       return;
     }
-    const fee = subtotal >= 999 ? 0 : /^(11|40|41|56|57|60|70)/.test(pin) ? 99 : 149;
+    const fee = subtotalMinor >= 99900n ? 0 : /^(11|40|41|56|57|60|70)/.test(pin) ? 99 : 149;
     shippingBox.textContent = `Estimated shipping: ${fee === 0 ? "FREE" : formatter.format(fee)}`;
   };
   postalInput.addEventListener("input", updateShipping);

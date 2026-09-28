@@ -189,7 +189,50 @@ async function initRedis() {
 
 const esc = (value = "") => String(value).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const money = value => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(value);
-const moneyMinor = value => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Number(value) / 100);
+const wholeRupees = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
+function minorToInr(value) {
+  const amount = BigInt(value);
+  if (amount < 0n) throw new Error("Money amount cannot be negative.");
+  return `${amount / 100n}.${String(amount % 100n).padStart(2, "0")}`;
+}
+function inrToMinor(value) {
+  const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(String(value ?? "").trim());
+  if (!match) throw new Error("Money amount must have no more than two decimal places.");
+  const amount = BigInt(match[1]) * 100n + BigInt((match[2] || "").padEnd(2, "0") || "0");
+  if (amount > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("Money amount exceeds the supported range.");
+  return Number(amount);
+}
+function multiplyMinor(unitMinor, quantity) {
+  if (!Number.isSafeInteger(unitMinor) || unitMinor < 0 || !Number.isSafeInteger(Number(quantity)) || Number(quantity) < 0) {
+    throw new Error("Money amount or quantity is invalid.");
+  }
+  const amount = BigInt(unitMinor) * BigInt(quantity);
+  if (amount > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("Money amount exceeds the supported range.");
+  return Number(amount);
+}
+function addMinor(left, right) {
+  const amount = BigInt(left) + BigInt(right);
+  if (amount < 0n || amount > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("Money amount exceeds the supported range.");
+  return Number(amount);
+}
+function moneyMinor(value, trimZeroes = false) {
+  const amount = BigInt(value);
+  if (amount < 0n) throw new Error("Money amount cannot be negative.");
+  const whole = amount / 100n;
+  const fraction = String(amount % 100n).padStart(2, "0");
+  if (trimZeroes && fraction === "00") return wholeRupees.format(whole);
+  return `${wholeRupees.format(whole)}.${fraction}`;
+}
+function productUnitPriceMinor(product) {
+  const price = BigInt(product.price);
+  const quantity = BigInt(product.min_qty);
+  if (quantity <= 0n || (price * 100n) % quantity !== 0n) {
+    throw new Error("Product price and minimum quantity must produce an exact paise unit price.");
+  }
+  const unitMinor = price * 100n / quantity;
+  if (unitMinor > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("Product unit price exceeds the supported range.");
+  return Number(unitMinor);
+}
 const parseCookies = req => Object.fromEntries((req.headers.cookie || "").split(";").filter(Boolean).map(part => {
   const i = part.indexOf("=");
   return [part.slice(0, i).trim(), decodeURIComponent(part.slice(i + 1))];
@@ -299,10 +342,10 @@ async function attachProductImages(products, executor = db) {
   });
 };
 
-function shippingFee(subtotal, postalCode = "") {
-  if (subtotal >= 999) return 0;
+function shippingFeeMinor(subtotalMinor, postalCode = "") {
+  if (subtotalMinor >= 99900) return 0;
   const pin = String(postalCode || "");
-  return /^(11|40|41|56|57|60|70)/.test(pin) ? 99 : 149;
+  return /^(11|40|41|56|57|60|70)/.test(pin) ? 9900 : 14900;
 }
 
 function sellerInvoiceSnapshot() {
@@ -356,11 +399,12 @@ function orderInvoiceSnapshot(order) {
     const parsed = typeof saved === "string" ? JSON.parse(saved) : saved;
     return parsed;
   }
-  const totalMinor = Math.round(Number(order.total) * 100);
-  const shippingMinor = Math.round(Number(order.shipping_fee || 0) * 100);
-  const discountMinor = Math.round(Number(order.discount || 0) * 100);
+  const totalMinor = inrToMinor(order.total);
+  const shippingMinor = inrToMinor(order.shipping_fee || 0);
+  const discountMinor = inrToMinor(order.discount || 0);
   const subtotalMinor = totalMinor - shippingMinor + discountMinor;
-  const taxableMinor = Math.round(Number(order.total) / 1.18) * 100;
+  // Legacy snapshots rounded the taxable base to whole rupees.
+  const taxableMinor = Number(((BigInt(totalMinor) + 59n) / 118n) * 100n);
   return {
     version: 1, currency: "INR", tax_rate_bps: 1800, tax_inclusive: true,
     shipping_tax_treatment: "included_in_aggregate_taxable_value",
@@ -370,7 +414,7 @@ function orderInvoiceSnapshot(order) {
   };
 }
 
-async function couponValidation(code, subtotal, executor = db) {
+async function couponValidation(code, subtotalMinor, executor = db) {
   const normalized = String(code || "").trim().toUpperCase();
   if (!normalized) return { coupon: null, error: "" };
   const coupon = await executor.get("SELECT * FROM coupons WHERE code = ?", normalized);
@@ -382,19 +426,34 @@ async function couponValidation(code, subtotal, executor = db) {
   if (expiryDate && expiryDate < new Date().toISOString().slice(0, 10)) return { coupon: null, error: "This coupon has expired." };
   if (coupon.usage_limit !== null && Number(coupon.times_used) >= Number(coupon.usage_limit)) return { coupon: null, error: "This coupon has reached its usage limit." };
   const minimumOrder = Number(coupon.minimum_order || coupon.min_total || 0);
-  if (subtotal < minimumOrder) return { coupon: null, error: `This coupon requires an order of at least ${money(minimumOrder)}.` };
+  if (BigInt(subtotalMinor) < BigInt(minimumOrder) * 100n) return { coupon: null, error: `This coupon requires an order of at least ${money(minimumOrder)}.` };
   return { coupon, error: "" };
 }
 
-async function couponFor(code, subtotal) { return (await couponValidation(code, subtotal)).coupon; }
+async function couponFor(code, subtotalMinor) { return (await couponValidation(code, subtotalMinor)).coupon; }
 
 async function cartTotals(cart, postalCode = "", couponCode = "", executor = db) {
-  const couponResult = await couponValidation(couponCode, cart.subtotal, executor);
+  const subtotalMinor = Number.isSafeInteger(cart.subtotal_minor)
+    ? cart.subtotal_minor
+    : (cart.items || []).reduce((sum, item) => addMinor(sum, multiplyMinor(inrToMinor(item.unit_price), Number(item.quantity))), 0);
+  const couponResult = await couponValidation(couponCode, subtotalMinor, executor);
   const coupon = couponResult.coupon;
-  const rawDiscount = coupon ? coupon.type === "percent" ? Math.round(cart.subtotal * coupon.value / 100) : coupon.value : 0;
-  const discount = coupon ? Math.min(cart.subtotal, rawDiscount, Number(coupon.maximum_discount) || Infinity) : 0;
-  const delivery = shippingFee(cart.subtotal - discount, postalCode);
-  return { subtotal: cart.subtotal, discount, delivery, total: Math.max(0, cart.subtotal - discount + delivery), coupon, couponError: couponResult.error };
+  const subtotal = BigInt(subtotalMinor);
+  const percentDiscountMinor = coupon?.type === "percent"
+    // Preserve the existing whole-rupee rounding rule for percentage coupons.
+    ? Number((subtotal * BigInt(coupon.value) + 5000n) / 10000n * 100n)
+    : coupon?.type === "fixed" ? Number(BigInt(coupon.value) * 100n) : 0;
+  const maximumDiscountMinor = coupon?.maximum_discount == null ? Number.MAX_SAFE_INTEGER : Number(BigInt(coupon.maximum_discount) * 100n);
+  const discountMinor = coupon ? Math.min(subtotalMinor, percentDiscountMinor, maximumDiscountMinor) : 0;
+  const deliveryMinor = shippingFeeMinor(subtotalMinor - discountMinor, postalCode);
+  return {
+    subtotal_minor: subtotalMinor,
+    discount_minor: discountMinor,
+    delivery_minor: deliveryMinor,
+    total_minor: Math.max(0, subtotalMinor - discountMinor + deliveryMinor),
+    coupon,
+    couponError: couponResult.error
+  };
 }
 
 function visibleProductCondition(alias = "") {
@@ -454,7 +513,8 @@ async function addCartItem(sessionId, product, quantity, configuration, executor
   if (requested > available) throw new Error(`Only ${sellableQuantity(product)} items available for ${product.name}.`);
   const reservation = await executor.run("UPDATE products SET reserved = reserved + ? WHERE id = ? AND reserved + ? <= stock", requested, product.id, requested);
   if (!reservation.changes) throw new Error(`Only ${sellableQuantity(product)} items available for ${product.name}.`);
-  await executor.run(`INSERT INTO cart_items (session_id,product_id,quantity,size,material,print_option,artwork_note,artwork_original_name,artwork_stored_name,artwork_mime,artwork_size,unit_price) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, sessionId, product.id, requested, configuration.size, configuration.material, configuration.printOption, configuration.artworkNote || null, configuration.artworkOriginalName || null, configuration.artworkStoredName || null, configuration.artworkMime || null, configuration.artworkSize || null, product.price / product.min_qty);
+  const unitPriceMinor = productUnitPriceMinor(product);
+  await executor.run(`INSERT INTO cart_items (session_id,product_id,quantity,size,material,print_option,artwork_note,artwork_original_name,artwork_stored_name,artwork_mime,artwork_size,unit_price) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, sessionId, product.id, requested, configuration.size, configuration.material, configuration.printOption, configuration.artworkNote || null, configuration.artworkOriginalName || null, configuration.artworkStoredName || null, configuration.artworkMime || null, configuration.artworkSize || null, minorToInr(unitPriceMinor));
   return requested;
 }
 
@@ -683,9 +743,8 @@ async function generateInvoice(orderId) {
     doc.moveDown(0.5);
 
     items.forEach(item => {
-        doc.text(
-            `${item.product_name}  | Qty: ${item.quantity} | ₹${item.unit_price}`
-        );
+        const unitPriceMinor = inrToMinor(item.unit_price);
+        doc.text(`${item.product_name}  | Qty: ${item.quantity} | ${moneyMinor(unitPriceMinor, true)} each | ${moneyMinor(multiplyMinor(unitPriceMinor, Number(item.quantity)), true)}`);
     });
 
     doc.moveDown();
@@ -705,7 +764,8 @@ async function generateInvoice(orderId) {
 async function cartData(sessionId) {
   const rows = await db.all(`SELECT ci.*, p.slug, p.name, p.color, p.category, p.stock, p.reserved, p.status, p.active FROM cart_items ci JOIN products p ON p.id = ci.product_id WHERE ci.session_id = ? ORDER BY ci.id DESC`, sessionId);
   const items = await attachProductImages(rows);
-  return { items, count: items.reduce((n, item) => n + item.quantity, 0), subtotal: items.reduce((n, item) => n + item.quantity * item.unit_price, 0) };
+  const subtotalMinor = items.reduce((sum, item) => sum + inrToMinor(item.unit_price) * Number(item.quantity), 0);
+  return { items, count: items.reduce((n, item) => n + item.quantity, 0), subtotal_minor: items.reduce((sum, item) => addMinor(sum, multiplyMinor(inrToMinor(item.unit_price), Number(item.quantity))), 0) };
 }
 function redirect(res, location) {
   setSecurityHeaders(res);
@@ -1063,6 +1123,7 @@ async function productPage(product, session, cart, url) {
   const available = productAvailable(product);
   const sellable = sellableQuantity(product);
   const defaultQuantity = sellable > 0 ? Math.min(Math.max(1, product.min_qty), sellable) : 0;
+  const unitPriceMinor = productUnitPriceMinor(product);
   const reviews = await db.all("SELECT * FROM reviews WHERE product_id = ? AND approved = 1 ORDER BY id DESC LIMIT 6", product.id);
   const reviewSummaryRow = await db.get(`
     SELECT
@@ -1106,7 +1167,7 @@ async function productPage(product, session, cart, url) {
           <label>Quantity<input type="number" name="quantity" min="1" step="1" max="${sellable}" value="${defaultQuantity || 1}" ${sellable <= 0 ? "disabled" : "required"}></label>
           <label class="full">Artwork notes <textarea name="artwork_note" rows="3" placeholder="Design link, file name, colors or special instructions"></textarea></label>
           <label class="full">Upload artwork <input class="artwork-input" type="file" name="artwork_file" accept=".pdf,.png,.ai,.psd,application/pdf,image/png"><small class="input-help">Accepted: PDF, PNG, AI, PSD up to 25 MB.</small><span class="artwork-preview"></span></label>
-          <div class="price-box"><span>Starting total</span><strong data-unit-price="${product.price / product.min_qty}">${money(defaultQuantity ? defaultQuantity * product.price / product.min_qty : product.price)}</strong><small>${available <= 0 ? "Out of Stock" : `${sellable} available now`} · Inclusive of taxes</small><span class="stock-state ${stockState.kind}">${stockState.label}</span></div>
+          <div class="price-box"><span>Starting total</span><strong data-unit-price-minor="${unitPriceMinor}">${moneyMinor(defaultQuantity ? multiplyMinor(unitPriceMinor, defaultQuantity) : inrToMinor(product.price), true)}</strong><small>${available <= 0 ? "Out of Stock" : `${sellable} available now`} · Inclusive of taxes</small><span class="stock-state ${stockState.kind}">${stockState.label}</span></div>
           ${available > 0
   ? `<button class="button primary full product-add-button" type="submit">Add to cart</button>`
   : `<button class="button full" type="button" disabled>Out of Stock</button>`}
@@ -1185,8 +1246,8 @@ async function cartPage(url, session, cart) {
     <section class="page-hero compact"><span class="eyebrow">YOUR ORDER</span><h1>Shopping cart</h1><p>Review your print specifications before checkout.</p></section>
     ${notice(url)}
     <section class="cart-layout section">
-      <div>${cart.items.length ? cart.items.map(item => `<article class="cart-item">${productArt(item)}<div class="cart-copy"><h3><a href="/product/${item.slug}">${esc(item.name)}</a></h3><p>${esc(item.size)} · ${esc(item.material)} · ${esc(item.print_option)}</p>${item.artwork_note ? `<small>Artwork note: ${esc(item.artwork_note)}</small>` : ""}${item.artwork_original_name ? `<small>Artwork: ${session.user ? `<a href="${artworkUrl(item.artwork_stored_name)}">${esc(item.artwork_original_name)}</a>` : esc(item.artwork_original_name)}</small>` : ""}</div><form action="/cart/update" method="post"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="item_id" value="${item.id}"><label>Qty<input name="quantity" type="number" min="0" max="${item.quantity + sellableQuantity(item)}" value="${item.quantity}"></label><small>${item.quantity + sellableQuantity(item)} max available</small><button>Update</button></form><strong>${money(item.quantity * item.unit_price)}</strong></article>`).join("") : emptyState("cart", "Your cart is waiting.", "Choose a product and make it yours when the idea is ready.", "/products", "Browse products", "/help", "Need print help?")}</div>
-      ${cart.items.length ? `<aside class="order-summary"><h2>Order summary</h2><p><span>Subtotal</span><b>${money(totals.subtotal)}</b></p><p><span>Delivery estimate</span><b>${totals.delivery === 0 ? "FREE" : money(totals.delivery)}</b></p><p class="total"><span>Total</span><b>${money(totals.total)}</b></p><small>Taxes included. Exact shipping updates by PIN code at checkout.</small><a class="button primary" href="/checkout">Proceed to checkout</a><a href="/products">Continue shopping</a></aside>` : ""}
+      <div>${cart.items.length ? cart.items.map(item => `<article class="cart-item">${productArt(item)}<div class="cart-copy"><h3><a href="/product/${item.slug}">${esc(item.name)}</a></h3><p>${esc(item.size)} · ${esc(item.material)} · ${esc(item.print_option)}</p>${item.artwork_note ? `<small>Artwork note: ${esc(item.artwork_note)}</small>` : ""}${item.artwork_original_name ? `<small>Artwork: ${session.user ? `<a href="${artworkUrl(item.artwork_stored_name)}">${esc(item.artwork_original_name)}</a>` : esc(item.artwork_original_name)}</small>` : ""}</div><form action="/cart/update" method="post"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="item_id" value="${item.id}"><label>Qty<input name="quantity" type="number" min="0" max="${item.quantity + sellableQuantity(item)}" value="${item.quantity}"></label><small>${item.quantity + sellableQuantity(item)} max available</small><button>Update</button></form><strong>${moneyMinor(multiplyMinor(inrToMinor(item.unit_price), Number(item.quantity)), true)}</strong></article>`).join("") : emptyState("cart", "Your cart is waiting.", "Choose a product and make it yours when the idea is ready.", "/products", "Browse products", "/help", "Need print help?")}</div>
+      ${cart.items.length ? `<aside class="order-summary"><h2>Order summary</h2><p><span>Subtotal</span><b>${moneyMinor(totals.subtotal_minor, true)}</b></p><p><span>Delivery estimate</span><b>${totals.delivery_minor === 0 ? "FREE" : moneyMinor(totals.delivery_minor, true)}</b></p><p class="total"><span>Total</span><b>${moneyMinor(totals.total_minor, true)}</b></p><small>Taxes included. Exact shipping updates by PIN code at checkout.</small><a class="button primary" href="/checkout">Proceed to checkout</a><a href="/products">Continue shopping</a></aside>` : ""}
     </section>
   `, session, cart);
 }
@@ -1205,14 +1266,14 @@ async function checkoutPage(session, cart, url = new URL("/checkout", "http://lo
         ${savedAddress ? `<p class="saved-address-note">Using your default address: ${esc(savedAddress.label)}. <a href="/account/addresses">Manage addresses</a></p>` : `<p class="saved-address-note">Save delivery addresses from <a href="/account/addresses">your account</a> to prefill checkout.</p>`}
         <div class="form-grid"><label>Full name<input name="customer_name" value="${esc(savedAddress?.recipient_name || session.user.name)}" required></label><label>Phone number<input name="phone" value="${esc(savedAddress?.phone || "")}" inputmode="tel" pattern="[0-9 +()-]{8,18}" required></label><label class="full">Address<textarea name="address" required rows="3">${esc(savedAddress?.address || "")}</textarea></label><label>City<input name="city" value="${esc(savedAddress?.city || "")}" required></label><label>PIN code<input name="postal_code" value="${esc(savedAddress?.postal_code || "")}" inputmode="numeric" pattern="[0-9]{6}" required></label><label>GST number <small class="input-help">Optional, shown on invoice.</small><input name="gst_number" maxlength="20"></label><label>Coupon code <small class="input-help">Try WELCOME10 or PRINT100.</small><input name="coupon_code" value="${esc(couponCode)}" maxlength="24"></label></div>
         <button class="button ghost coupon-apply" type="submit" formmethod="get" formaction="/checkout" formnovalidate>Apply coupon</button>
-        ${totals.couponError ? `<p class="form-error">${esc(totals.couponError)}</p>` : totals.coupon ? `<p class="form-success"><b>${esc(totals.coupon.code)}</b> applied. You save ${money(totals.discount)}. <button class="copy-control" type="button" data-copy-value="${esc(totals.coupon.code)}" data-copy-label="Coupon code">Copy code</button></p>` : ""}
-        <div class="shipping-estimate" data-subtotal="${cart.subtotal}">Enter PIN code for exact shipping.</div>
+        ${totals.couponError ? `<p class="form-error">${esc(totals.couponError)}</p>` : totals.coupon ? `<p class="form-success"><b>${esc(totals.coupon.code)}</b> applied. You save ${moneyMinor(totals.discount_minor, true)}. <button class="copy-control" type="button" data-copy-value="${esc(totals.coupon.code)}" data-copy-label="Coupon code">Copy code</button></p>` : ""}
+        <div class="shipping-estimate" data-subtotal-minor="${cart.subtotal_minor}">Enter PIN code for exact shipping.</div>
         <h2>Payment</h2>
         ${razorpayReady ? `<label class="payment-option"><input type="radio" name="payment_method" value="razorpay" checked><span><b>Pay securely online</b><small>UPI, cards, netbanking and supported wallets via Razorpay.</small></span></label>` : `<div class="integration-note">Online payment activates after Razorpay keys are added. Cash on delivery remains available.</div>`}
         <label class="payment-option"><input type="radio" name="payment_method" value="cod" ${razorpayReady ? "" : "checked"}><span><b>Cash on delivery</b><small>Available for eligible orders.</small></span></label>
-        <button class="button primary" type="submit">Place order · ${money(totals.total)}</button>
+        <button class="button primary" type="submit">Place order · ${moneyMinor(totals.total_minor, true)}</button>
       </form>
-      <aside class="order-summary"><h2>Your prints</h2>${cart.items.map(i => `<p><span>${esc(i.name)} × ${i.quantity}</span><b>${money(i.quantity * i.unit_price)}</b></p>`).join("")}${totals.discount ? `<p><span>Coupon discount</span><b>−${money(totals.discount)}</b></p>` : ""}<p><span>Delivery estimate</span><b>${totals.delivery === 0 ? "FREE" : money(totals.delivery)}</b></p><p class="total"><span>Total</span><b>${money(totals.total)}</b></p></aside>
+      <aside class="order-summary"><h2>Your prints</h2>${cart.items.map(i => `<p><span>${esc(i.name)} × ${i.quantity}</span><b>${moneyMinor(multiplyMinor(inrToMinor(i.unit_price), Number(i.quantity)), true)}</b></p>`).join("")}${totals.discount_minor ? `<p><span>Coupon discount</span><b>−${moneyMinor(totals.discount_minor, true)}</b></p>` : ""}<p><span>Delivery estimate</span><b>${totals.delivery_minor === 0 ? "FREE" : moneyMinor(totals.delivery_minor, true)}</b></p><p class="total"><span>Total</span><b>${moneyMinor(totals.total_minor, true)}</b></p></aside>
     </section>
     ${razorpayReady ? `<script src="https://checkout.razorpay.com/v1/checkout.js"></script>` : ""}
   `, session, cart);
@@ -1256,7 +1317,7 @@ function orderList(orders, session) {
       <article class="order-card">
         <div class="order-card-summary"><span>${esc(order.order_number)} <button class="copy-control" type="button" data-copy-value="${esc(order.order_number)}" data-copy-label="Order ID">Copy</button></span><small>Placed ${new Date(order.created_at).toLocaleDateString("en-IN", { dateStyle: "medium" })}</small></div>
         <b class="status ${statusClass(order.status)}">${esc(order.status)}</b>
-        <small class="order-card-total">${money(order.total)} · ${order.status === "Delivered" ? "Completed" : "In progress"}</small>
+        <small class="order-card-total">${moneyMinor(inrToMinor(order.total), true)} · ${order.status === "Delivered" ? "Completed" : "In progress"}</small>
         <a class="button ghost" href="/account/orders/${order.id}">View Details →</a>
         ${session ? `<form method="post" action="/account/orders/reorder"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="order_id" value="${order.id}"><button class="button ghost" type="submit">Reorder</button></form>` : ""}
       </article>
@@ -1313,13 +1374,13 @@ async function orderDetailsPage(order, session, cart) {
     </section>
 
     <section class="section narrow order-details">
-      <header class="order-detail-header"><div><span class="eyebrow">ORDER STATUS</span><h2>${esc(order.status)}</h2><p>Order total <strong>${money(order.total)}</strong></p></div><b class="status ${statusClass(order.status)}">${esc(order.status)}</b></header>
+      <header class="order-detail-header"><div><span class="eyebrow">ORDER STATUS</span><h2>${esc(order.status)}</h2><p>Order total <strong>${moneyMinor(inrToMinor(order.total), true)}</strong></p></div><b class="status ${statusClass(order.status)}">${esc(order.status)}</b></header>
 
       <section class="shipment-panel"><div><span class="panel-label">Shipment timeline</span><h3>${order.status === "Delivered" ? "Delivered to your address" : "Your order is moving through production"}</h3></div>${statusTimeline(order)}</section>
 
       <div class="order-information-grid">
         <article><span class="panel-label">Delivery address</span><p>${esc(order.customer_name)}<br>${esc(order.address)}<br>${esc(order.city)} - ${esc(order.postal_code)}<br><a href="tel:${encodeURIComponent(order.phone)}">${esc(order.phone)}</a></p></article>
-        <article><span class="panel-label">Payment summary</span><p><strong>${money(order.total)}</strong><br>${esc(order.payment_id ? "Payment confirmed" : "Payment details recorded")}<br>Placed ${new Date(order.created_at).toLocaleDateString("en-IN", { dateStyle: "medium" })}</p></article>
+        <article><span class="panel-label">Payment summary</span><p><strong>${moneyMinor(inrToMinor(order.total), true)}</strong><br>${esc(order.payment_id ? "Payment confirmed" : "Payment details recorded")}<br>Placed ${new Date(order.created_at).toLocaleDateString("en-IN", { dateStyle: "medium" })}</p></article>
         <article class="tracking-information"><span class="panel-label">Tracking</span>${order.courier_name || order.tracking_number || order.estimated_delivery ? `<p>${order.courier_name ? `<strong>${esc(order.courier_name)}</strong><br>` : ""}${order.tracking_number ? `<code>${esc(order.tracking_number)}</code> <button class="copy-control" type="button" data-copy-value="${esc(order.tracking_number)}" data-copy-label="Tracking number">Copy</button><br>` : ""}${order.estimated_delivery ? `Estimated delivery: ${new Date(order.estimated_delivery).toLocaleDateString("en-IN", { dateStyle: "medium" })}` : ""}</p>` : `<p>Tracking details will appear when your order is dispatched.</p>`}${order.tracking_url ? `<a class="button primary" href="${esc(order.tracking_url)}" target="_blank" rel="noopener">Track package</a>` : ""}</article>
       </div>
 
@@ -1494,7 +1555,7 @@ function adminOrderRows(orders, session, editable = true) {
           <b>${esc(o.order_number)}</b>
 
           <small>
-            ${esc(o.customer_name)} · ${esc(o.email || "")} · ${money(o.total)}
+            ${esc(o.customer_name)} · ${esc(o.email || "")} · ${moneyMinor(inrToMinor(o.total), true)}
           </small>
 
           <small>
@@ -1685,7 +1746,7 @@ async function invoicePage(order, items, session, cart) {
   const sellerMissing = !seller.legal_name || !seller.registered_address;
   const sellerBlock = `<div class="invoice-box"><h2>Seller</h2><p>${seller.legal_name ? esc(seller.legal_name) : "Seller legal name not configured"}${seller.registered_address ? `<br>${esc(seller.registered_address)}` : ""}${seller.gstin ? `<br>GSTIN: ${esc(seller.gstin)}` : ""}${seller.support_email ? `<br>${esc(seller.support_email)}` : ""}${seller.support_phone ? `<br>${esc(seller.support_phone)}` : ""}</p>${sellerMissing ? `<small>Seller identity details must be configured before production invoices are issued.</small>` : ""}</div>`;
   const paymentStatus = order.payment_status || (order.payment_method === "cod" ? "Due on delivery" : "Not recorded");
-  return await layout(`Invoice ${order.order_number}`, `<section class="invoice section narrow"><div class="invoice-head"><div><span class="eyebrow">GST INVOICE</span><h1>${esc(order.order_number)}</h1><p>${new Date(order.created_at).toLocaleDateString("en-IN", { dateStyle: "long" })}</p></div><div class="invoice-actions"><a class="button ghost" href="/account/orders/${order.id}">Back to order</a><button class="button primary" onclick="window.print()">Print / Save PDF</button></div></div>${sellerBlock}<div class="invoice-box"><h2>Bill to / ship to</h2><p>${esc(order.customer_name)}<br>${esc(order.address)}<br>${esc(order.city)} - ${esc(order.postal_code)}<br>Phone: ${esc(order.phone)}${order.gst_number ? `<br>GSTIN: ${esc(order.gst_number)}` : ""}</p></div><table class="invoice-table"><caption class="sr-only">Invoice items for ${esc(order.order_number)}</caption><thead><tr><th scope="col">Item</th><th scope="col">Qty</th><th scope="col">Rate</th><th scope="col">Total</th></tr></thead><tbody>${items.map(i => `<tr><td>${esc(i.product_name)}<small>${esc(i.configuration)}</small></td><td>${i.quantity}</td><td>${money(i.unit_price)}</td><td>${money(i.quantity * i.unit_price)}</td></tr>`).join("")}</tbody></table><div class="invoice-totals"><p><span>Subtotal</span><b>${moneyMinor(invoice.subtotal_minor)}</b></p><p><span>Shipping</span><b>${moneyMinor(invoice.shipping_minor)}</b></p><p><span>Discount${order.coupon_code ? ` (${esc(order.coupon_code)})` : ""}</span><b>−${moneyMinor(invoice.discount_minor)}</b></p><p><span>Taxable value</span><b>${moneyMinor(invoice.taxable_minor)}</b></p><p><span>GST included (${(Number(invoice.tax_rate_bps) / 100).toFixed(2)}%)</span><b>${moneyMinor(invoice.tax_minor)}</b></p><p><span>Payment</span><b>${esc(order.payment_method)} · ${esc(paymentStatus)}</b></p><p class="total"><span>Grand total</span><b>${moneyMinor(invoice.total_minor)}</b></p></div></section>`, session, cart);
+  return await layout(`Invoice ${order.order_number}`, `<section class="invoice section narrow"><div class="invoice-head"><div><span class="eyebrow">GST INVOICE</span><h1>${esc(order.order_number)}</h1><p>${new Date(order.created_at).toLocaleDateString("en-IN", { dateStyle: "long" })}</p></div><div class="invoice-actions"><a class="button ghost" href="/account/orders/${order.id}">Back to order</a><button class="button primary" onclick="window.print()">Print / Save PDF</button></div></div>${sellerBlock}<div class="invoice-box"><h2>Bill to / ship to</h2><p>${esc(order.customer_name)}<br>${esc(order.address)}<br>${esc(order.city)} - ${esc(order.postal_code)}<br>Phone: ${esc(order.phone)}${order.gst_number ? `<br>GSTIN: ${esc(order.gst_number)}` : ""}</p></div><table class="invoice-table"><caption class="sr-only">Invoice items for ${esc(order.order_number)}</caption><thead><tr><th scope="col">Item</th><th scope="col">Qty</th><th scope="col">Rate</th><th scope="col">Total</th></tr></thead><tbody>${items.map(i => `<tr><td>${esc(i.product_name)}<small>${esc(i.configuration)}</small></td><td>${i.quantity}</td><td>${moneyMinor(inrToMinor(i.unit_price), true)}</td><td>${moneyMinor(multiplyMinor(inrToMinor(i.unit_price), Number(i.quantity)), true)}</td></tr>`).join("")}</tbody></table><div class="invoice-totals"><p><span>Subtotal</span><b>${moneyMinor(invoice.subtotal_minor)}</b></p><p><span>Shipping</span><b>${moneyMinor(invoice.shipping_minor)}</b></p><p><span>Discount${order.coupon_code ? ` (${esc(order.coupon_code)})` : ""}</span><b>−${moneyMinor(invoice.discount_minor)}</b></p><p><span>Taxable value</span><b>${moneyMinor(invoice.taxable_minor)}</b></p><p><span>GST included (${(Number(invoice.tax_rate_bps) / 100).toFixed(2)}%)</span><b>${moneyMinor(invoice.tax_minor)}</b></p><p><span>Payment</span><b>${esc(order.payment_method)} · ${esc(paymentStatus)}</b></p><p class="total"><span>Grand total</span><b>${moneyMinor(invoice.total_minor)}</b></p></div></section>`, session, cart);
 }
 
 function requireAuth(session, res, next = "/account") {
@@ -1753,10 +1814,7 @@ async function createLocalOrder(session, cart, data, paymentMethod, paymentId = 
   if (!cart.items.length) throw new Error("Your cart is empty.");
   const totals = await cartTotals(cart, data.postal_code, data.coupon_code);
   if (data.coupon_code && totals.couponError) throw new Error(totals.couponError);
-  const subtotalMinor = Math.round(Number(totals.subtotal) * 100);
-  const discountMinor = Math.round(Number(totals.discount) * 100);
-  const shippingMinor = Math.round(Number(totals.delivery) * 100);
-  const totalMinor = Math.round(Number(totals.total) * 100);
+  const { subtotal_minor: subtotalMinor, discount_minor: discountMinor, delivery_minor: shippingMinor, total_minor: totalMinor } = totals;
   const invoiceSnapshot = createInvoiceSnapshot({ subtotalMinor, discountMinor, shippingMinor, totalMinor });
   const orderNumber = `PO-${new Date().getFullYear()}-${crypto.randomInt(100000, 999999)}`;
   const orderId = await db.transaction(async tx => {
@@ -1772,11 +1830,11 @@ async function createLocalOrder(session, cart, data, paymentMethod, paymentId = 
       const usage = await tx.run("UPDATE coupons SET times_used = times_used + 1 WHERE code = ? AND active = 1 AND (usage_limit IS NULL OR times_used < usage_limit) AND (expiry_date IS NULL OR expiry_date >= ?)", totals.coupon.code, new Date().toISOString().slice(0, 10));
       if (!usage.changes) throw new Error("This coupon is no longer available.");
     }
-    const order = await tx.run("INSERT INTO orders (order_number,user_id,total,status,customer_name,phone,address,city,postal_code,shipping_fee,discount,coupon_code,gst_number,payment_method,payment_id,invoice_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?::jsonb) RETURNING id", orderNumber, session.user.id, totals.total, "Pending", data.customer_name, data.phone, data.address, data.city, data.postal_code, totals.delivery, totals.discount, totals.coupon?.code || null, data.gst_number || null, paymentMethod, paymentId, JSON.stringify(invoiceSnapshot));
+    const order = await tx.run("INSERT INTO orders (order_number,user_id,total,status,customer_name,phone,address,city,postal_code,shipping_fee,discount,coupon_code,gst_number,payment_method,payment_id,invoice_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?::jsonb) RETURNING id", orderNumber, session.user.id, minorToInr(totalMinor), "Pending", data.customer_name, data.phone, data.address, data.city, data.postal_code, minorToInr(shippingMinor), minorToInr(discountMinor), totals.coupon?.code || null, data.gst_number || null, paymentMethod, paymentId, JSON.stringify(invoiceSnapshot));
     const id = order.rows[0].id;
     for (const item of cart.items) {
       await tx.run(`INSERT INTO order_items (order_id,product_id,product_name,quantity,unit_price,configuration,artwork_original_name,artwork_stored_name,artwork_mime,artwork_size)
-        VALUES (?,?,?,?,?,?,?,?,?,?)`, id, item.product_id, item.name, item.quantity, item.unit_price,
+        VALUES (?,?,?,?,?,?,?,?,?,?)`, id, item.product_id, item.name, item.quantity, minorToInr(inrToMinor(item.unit_price)),
       `${item.size} · ${item.material} · ${item.print_option}${item.artwork_original_name ? ` · Artwork: ${item.artwork_original_name}` : ""}`,
       item.artwork_original_name || null, item.artwork_stored_name || null, item.artwork_mime || null, item.artwork_size || null);
       const deduction = await tx.run("UPDATE products SET stock = stock - ?, reserved = reserved - ? WHERE id = ? AND stock >= ? AND reserved >= ?", item.quantity, item.quantity, item.product_id, item.quantity, item.quantity);
@@ -1893,14 +1951,13 @@ async function finalizeCapturedCheckout(session, paymentId, options = {}) {
       const lineTotalMinor = Number(item.line_total_minor);
       if (!Number.isSafeInteger(productId) || productId <= 0 || !Number.isSafeInteger(quantity) || quantity <= 0 ||
           !Number.isSafeInteger(unitPriceMinor) || unitPriceMinor < 0 ||
-          !Number.isSafeInteger(lineTotalMinor) || lineTotalMinor !== quantity * unitPriceMinor ||
-          unitPriceMinor % 100 !== 0) {
+          !Number.isSafeInteger(lineTotalMinor) || !Number.isSafeInteger(quantity * unitPriceMinor) || lineTotalMinor !== quantity * unitPriceMinor) {
         throw reject("ORDER_FINALIZATION_SNAPSHOT_INVALID", "The saved checkout item details could not be verified.");
       }
       const key = lineKey(item);
       requiredByLine.set(key, (requiredByLine.get(key) || 0) + quantity);
       productQuantities.set(productId, (productQuantities.get(productId) || 0) + quantity);
-      subtotalMinor += lineTotalMinor;
+      subtotalMinor = addMinor(subtotalMinor, lineTotalMinor);
     }
     const discountMinor = Number(shipping.discount_minor);
     const recordedSubtotalMinor = Number(shipping.subtotal_minor);
@@ -1912,9 +1969,6 @@ async function finalizeCapturedCheckout(session, paymentId, options = {}) {
         !Number.isSafeInteger(expectedAmount) || subtotalMinor - discountMinor + shippingMinor !== expectedAmount ||
         Number(binding.intent_amount_minor) !== expectedAmount || intent.currency !== "INR") {
       throw reject("ORDER_FINALIZATION_SNAPSHOT_TOTAL_MISMATCH", "The saved checkout total could not be verified.");
-    }
-    for (const value of [subtotalMinor, discountMinor, shippingMinor, expectedAmount]) {
-      if (value % 100 !== 0) throw reject("ORDER_FINALIZATION_SNAPSHOT_TOTAL_MISMATCH", "The saved checkout total is not compatible with order pricing.");
     }
     const invoiceSnapshot = createInvoiceSnapshot({
       subtotalMinor, discountMinor, shippingMinor, totalMinor: expectedAmount,
@@ -1963,12 +2017,12 @@ async function finalizeCapturedCheckout(session, paymentId, options = {}) {
       (order_number,user_id,total,status,customer_name,phone,address,city,postal_code,shipping_fee,discount,coupon_code,gst_number,
        payment_method,payment_id,checkout_intent_id,payment_record_id,invoice_snapshot)
       VALUES (?,?,?,'Pending',?,?,?,?,?,?,?,?,?,'razorpay',?,?,?,?::jsonb)
-      RETURNING id,order_number`, orderNumber, userId, expectedAmount / 100, address.customer_name, address.phone,
-    address.address, address.city, address.postal_code, shippingMinor / 100, discountMinor / 100,
+      RETURNING id,order_number`, orderNumber, userId, minorToInr(expectedAmount), address.customer_name, address.phone,
+    address.address, address.city, address.postal_code, minorToInr(shippingMinor), minorToInr(discountMinor),
     intent.coupon_code || null, address.gst_number || null, normalizedPaymentId, intent.id, binding.payment_record_id, JSON.stringify(invoiceSnapshot));
 
     for (const item of snapshot) {
-      const unitPrice = Number(item.unit_price_minor) / 100;
+      const unitPrice = minorToInr(Number(item.unit_price_minor));
       const configuration = `${item.size || ""} · ${item.material || ""} · ${item.print_option || ""}${item.artwork_original_name ? ` · Artwork: ${item.artwork_original_name}` : ""}`;
       await tx.run(`INSERT INTO order_items (order_id,product_id,product_name,quantity,unit_price,configuration,artwork_original_name,artwork_stored_name,artwork_mime,artwork_size)
         VALUES (?,?,?,?,?,?,?,?,?,?)`, order.id, Number(item.product_id), String(item.product_name || "Printed product"),
@@ -2037,10 +2091,10 @@ async function createCheckoutIntent(session, data = {}) {
     }
 
     if (couponCode) await tx.get("SELECT code FROM coupons WHERE code = ? FOR UPDATE", couponCode);
-    const subtotal = items.reduce((sum, item) => sum + Number(item.quantity) * Number(item.unit_price), 0);
-    const totals = await cartTotals({ items, subtotal }, postalCode, couponCode, tx);
+    const subtotalMinor = items.reduce((sum, item) => addMinor(sum, multiplyMinor(inrToMinor(item.unit_price), Number(item.quantity))), 0);
+    const totals = await cartTotals({ items, subtotal_minor: subtotalMinor }, postalCode, couponCode, tx);
     if (couponCode && totals.couponError) throw invalid(totals.couponError);
-    const amountMinor = Math.round(Number(totals.total) * 100);
+    const amountMinor = totals.total_minor;
     if (!Number.isSafeInteger(amountMinor) || amountMinor < 0) throw invalid("Checkout total is invalid.");
 
     const cartSnapshot = items.map(item => ({
@@ -2048,9 +2102,9 @@ async function createCheckoutIntent(session, data = {}) {
       product_id: Number(item.product_id),
       product_name: item.name,
       quantity: Number(item.quantity),
-      unit_price: Number(item.unit_price),
-      unit_price_minor: Math.round(Number(item.unit_price) * 100),
-      line_total_minor: Math.round(Number(item.quantity) * Number(item.unit_price) * 100),
+      unit_price: String(item.unit_price),
+      unit_price_minor: inrToMinor(item.unit_price),
+      line_total_minor: multiplyMinor(inrToMinor(item.unit_price), Number(item.quantity)),
       size: item.size,
       material: item.material,
       print_option: item.print_option,
@@ -2080,9 +2134,9 @@ async function createCheckoutIntent(session, data = {}) {
       address: String(data.address || "").trim().slice(0, 500),
       city: String(data.city || "").trim().slice(0, 120),
       gst_number: String(data.gst_number || "").trim().slice(0, 40),
-      subtotal_minor: Math.round(Number(totals.subtotal) * 100),
-      discount_minor: Math.round(Number(totals.discount) * 100),
-      shipping_minor: Math.round(Number(totals.delivery) * 100),
+      subtotal_minor: totals.subtotal_minor,
+      discount_minor: totals.discount_minor,
+      shipping_minor: totals.delivery_minor,
       invoice_tax_rate_bps: GST_RATE_BPS,
       invoice_seller: sellerInvoiceSnapshot(),
       coupon: couponSnapshot
@@ -2900,6 +2954,10 @@ const app = {
   cartData,
   cartPage,
   cartTotals,
+  inrToMinor,
+  minorToInr,
+  moneyMinor,
+  productUnitPriceMinor,
   createInvoiceSnapshot,
   checkoutPage,
   couponFor,
