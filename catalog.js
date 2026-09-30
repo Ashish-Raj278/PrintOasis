@@ -110,7 +110,7 @@ const products = [
   ["personalised-photo-albums", "Personalised Photo Albums", "gifts", 1499, 1, 4.8, "Recommended", "Premium photo albums for weddings, milestones, portfolios and memories.", "8 x 8 in|12 x 12 in", "Hard cover|Linen cover", "Layflat|Standard", "ink"],
   ["photo-cushions", "Photo Cushions", "gifts", 699, 1, 4.6, "", "Soft custom cushions that turn favourite images into lasting gifts.", "12 x 12 in|16 x 16 in", "Polyester|Velvet", "Single-sided|Double-sided", "yellow"],
   ["personalised-wall-clocks", "Personalised Wall Clocks", "gifts", 899, 1, 4.6, "", "Custom wall clocks for homes, offices, gifts and branded spaces.", "10 in|12 in", "MDF|Acrylic", "Full colour print", "cobalt"],
-  ["printoasis-diwali-hamper-kit", "PrintOasis Diwali Hamper Kit", "gifts", 0, 1, 0, "Draft", "Seasonal gifting concept in development. Contents, personalisation, pricing and availability have not been confirmed. Not available to order.", "Details to be confirmed", "Details to be confirmed", "Details to be confirmed", "ink", { draft: true }],
+  ["printoasis-diwali-hamper-kit", "PrintOasis Diwali Hamper Kit", "gifts", 1499, 1, 0, "Limited Edition", "A ready-to-gift festive box with a PrintOasis-branded printed sleeve, 200 g assorted almonds, cashews, raisins and pistachios, 100 g assorted chocolates in sealed retail packaging, two decorative diyas, one greeting card personalised with the recipient’s name and your message, a matching name tag and festive ribbon. Price includes the listed hamper and packaging.", "One hamper", "Gift box", "Printed sleeve, greeting card and name tag", "ink", { prelaunch: true }],
 
   ["letterheads", "Premium Company Letterheads", "stationery", 599, 100, 4.7, "", "Professional letterheads on smooth, writing-friendly premium stock.", "A4", "100 GSM bond|120 GSM premium", "Single-sided", "cobalt"],
   ["business-envelopes", "Branded Business Envelopes", "stationery", 699, 100, 4.7, "", "Professional envelopes for invoices, correspondence and corporate mailers.", "DL|C5|C4", "100 GSM bond|120 GSM premium", "Front print|Front + flap", "yellow"],
@@ -143,8 +143,8 @@ const products = [
   ["bulk-corporate-welcome-kits", "Bulk Corporate Welcome Kits", "bulk", 24999, 50, 4.8, "Recommended", "Coordinated welcome kits for large onboarding programmes and multi-location teams.", "Starter|Premium", "Mixed merchandise", "Custom branding", "ink"]
 ];
 
-// Draft products use the existing hidden-product status and are inserted once
-// with explicit zero stock. They remain editable through /admin/products.
+// Prelaunch products use an explicit zero-stock seed so they can be reviewed
+// through normal catalogue, detail and search routes without being purchasable.
 const productCollections = {
   "limited-editions": ["printoasis-diwali-hamper-kit"]
 };

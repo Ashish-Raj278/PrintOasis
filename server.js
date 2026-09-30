@@ -164,10 +164,10 @@ async function initDb() {
   }
   await db.transaction(async tx => {
     for (const product of catalogProducts) {
-      if (product[12]?.draft) {
+      if (product[12]?.prelaunch) {
         await tx.run(`
           INSERT INTO products (slug,name,category,price,min_qty,rating,badge,description,sizes,materials,print_options,color,stock,reserved,status,active)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,0,'hidden',0)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,0,'active',1)
           ON CONFLICT (slug) DO NOTHING
         `, ...product.slice(0, 12));
         continue;
@@ -989,16 +989,22 @@ async function layout(title, content, session, cart, description = "Custom print
   </body></html>`;
 }
 
+function productImageAlt(product) {
+  return product.slug === "printoasis-diwali-hamper-kit"
+    ? "PrintOasis Diwali Hamper Kit in a plum and gold gift box with assorted dry fruits, chocolates, two decorative diyas, greeting card and personalised name tag"
+    : `${product.name} mockup`;
+}
+
 function productArt(product, large = false, placement = "card") {
   const images = productImageSet(product);
   const primary = images[placement] || images.primary;
   if (primary) {
     const hover = images.hover && images.hover.url !== primary.url ? images.hover : null;
     const loading = large ? "fetchpriority=high" : 'loading="lazy" decoding="async"';
-    return `<div class="product-photo ${large ? "large" : ""}" data-product-image><img class="product-photo-primary" src="${esc(primary.url)}" alt="${esc(product.name)} mockup" width="1200" height="900" ${loading}>${hover ? `<img class="product-photo-hover" src="${esc(hover.url)}" alt="" width="1200" height="900" loading="lazy" decoding="async">` : ""}</div>`;
+    return `<div class="product-photo ${large ? "large" : ""}" data-product-image><img class="product-photo-primary" src="${esc(primary.url)}" alt="${esc(productImageAlt(product))}" width="1200" height="900" ${loading}>${hover ? `<img class="product-photo-hover" src="${esc(hover.url)}" alt="" width="1200" height="900" loading="lazy" decoding="async">` : ""}</div>`;
   }
   const categoryClass = String(product.category || "products").replace(/[^a-z0-9-]/gi, "");
-  return `<div class="product-art art-${categoryClass} ${esc(product.color)} ${large ? "large" : ""}" role="img" aria-label="${esc(product.name)} product mockup">
+  return `<div class="product-art art-${categoryClass} ${esc(product.color)} ${large ? "large" : ""}" role="img" aria-label="${esc(productImageAlt(product))}">
     <span class="art-shadow"></span><span class="art-sheet"></span><span class="art-mark">${esc(product.name.split(" ").map(w => w[0]).join("").slice(0, 2))}</span>
     <small>${esc(product.category.replace("-", " "))}</small>
   </div>`;
@@ -1014,11 +1020,13 @@ function highlightSearch(value, query = "") {
 
 function productCard(product, searchQuery = "", placement = "card") {
   const available = sellableQuantity(product);
+  const rating = Number(product.rating || 0);
+  const isDiwaliHamper = product.slug === "printoasis-diwali-hamper-kit";
   return `<article class="product-card">
     <a href="/product/${product.slug}">${productArt(product, false, placement)}</a>
-    <div class="product-meta">${product.badge ? `<span class="badge">${esc(product.badge)}</span>` : ""}<span>★ ${product.rating}</span></div>
+    <div class="product-meta">${product.badge ? `<span class="badge">${esc(product.badge)}</span>` : ""}${rating > 0 ? `<span>★ ${rating.toFixed(1)}</span>` : ""}</div>
     <h3><a href="/product/${product.slug}">${highlightSearch(product.name, searchQuery)}</a></h3>
-    <p>From <strong>${money(product.price)}</strong> / ${product.min_qty === 1 ? "piece" : `${product.min_qty} pcs`}${available <= 0 ? ` <span class="stock-note">Out of Stock</span>` : ""}</p>
+    <p>${isDiwaliHamper ? "" : "From "}<strong>${money(product.price)}</strong> / ${isDiwaliHamper ? "hamper" : product.min_qty === 1 ? "piece" : `${product.min_qty} pcs`}${available <= 0 ? ` <span class="stock-note">Out of Stock</span>` : ""}</p>
     ${searchQuery ? `<small class="product-search-snippet">${highlightSearch(product.description, searchQuery)}</small>` : ""}
   </article>`;
 }
@@ -1027,7 +1035,7 @@ function productGallery(product) {
   const images = productImageSet(product);
   if (!images.primary) return productArt(product, true, "hero");
   const gallery = images.gallery.length ? images.gallery : [images.primary];
-  return `<div class="product-gallery-images" data-product-gallery><div class="product-photo large product-gallery-main" data-product-image><img class="product-photo-primary" src="${esc(images.hero?.url || images.primary.url)}" alt="${esc(product.name)} mockup" width="1600" height="1200" fetchpriority="high"></div>${gallery.length > 1 ? `<div class="product-gallery-thumbnails" aria-label="${esc(product.name)} image gallery">${gallery.map((image, index) => `<button type="button" class="${image.url === (images.hero?.url || images.primary.url) ? "is-active" : ""}" data-gallery-image data-image-src="${esc(image.url)}" data-image-alt="${esc(product.name)} product view ${index + 1}" aria-label="View ${esc(product.name)} image ${index + 1}" aria-current="${image.url === (images.hero?.url || images.primary.url) ? "true" : "false"}"><img src="${esc(image.url)}" alt="" width="120" height="90" loading="lazy" decoding="async"></button>`).join("")}</div>` : ""}</div>`;
+  return `<div class="product-gallery-images" data-product-gallery><div class="product-photo large product-gallery-main" data-product-image><img class="product-photo-primary" src="${esc(images.hero?.url || images.primary.url)}" alt="${esc(productImageAlt(product))}" width="1600" height="1200" fetchpriority="high"></div>${gallery.length > 1 ? `<div class="product-gallery-thumbnails" aria-label="${esc(product.name)} image gallery">${gallery.map((image, index) => `<button type="button" class="${image.url === (images.hero?.url || images.primary.url) ? "is-active" : ""}" data-gallery-image data-image-src="${esc(image.url)}" data-image-alt="${esc(product.name)} product view ${index + 1}" aria-label="View ${esc(product.name)} image ${index + 1}" aria-current="${image.url === (images.hero?.url || images.primary.url) ? "true" : "false"}"><img src="${esc(image.url)}" alt="" width="120" height="90" loading="lazy" decoding="async"></button>`).join("")}</div>` : ""}</div>`;
 }
 
 async function homePage(session, cart) {
@@ -1049,16 +1057,17 @@ async function homePage(session, cart) {
   };
   // The existing carousel renderer prefixes its image paths with /public/.
   // Keep the new library-backed slide compatible without changing old slides.
-  const diwaliHeroImage = homeImage("hero-diwali-hamper", "hero-diwali-hamper.svg").replace(/^\/public\//, "");
+  const diwaliHeroImage = homeImage("hero-diwali-hamper", "hero-diwali-hamper.png").replace(/^\/public\//, "");
+  const diwaliProductPurchasable = Boolean(await db.get(`SELECT id FROM products WHERE slug = ? AND ${visibleProductCondition()} AND COALESCE(stock, 0) - COALESCE(reserved, 0) >= min_qty`, "printoasis-diwali-hamper-kit"));
   const heroSlides = [
-    ["FESTIVE GIFTING CONCEPT", "Make Diwali Personal.", "Explore personalised keepsakes and gifting ideas for the season. The Diwali hamper concept is still being confirmed.", "/products?category=gifts", "Explore Personalised Gifts", "hero-diwali", diwaliHeroImage, "Illustrative Diwali gifting concept with a ribboned box and diya; final hamper details are unconfirmed"],
+    ["FESTIVE GIFTING", "Make Diwali Personal.", "The PrintOasis Diwali Hamper Kit · ₹1,499 incl. taxes. Thoughtful gifts, made yours.", diwaliProductPurchasable ? "/product/printoasis-diwali-hamper-kit" : "/products?category=gifts", diwaliProductPurchasable ? "Shop Diwali Hamper" : "Explore Personalised Gifts", "hero-diwali", diwaliHeroImage, "PrintOasis Diwali Hamper Kit in a festive gift box with dry fruits, chocolates, decorative diyas, greeting card and personalised name tag; ₹1,499 including tax", "/products?category=gifts", "Personalised Gifts"],
     ["PREMIUM BUSINESS CARDS", "Leave a lasting first impression.", "Exceptionally finished cards with the weight, texture and precision your brand deserves.", "/products?category=business-cards", "Explore Business Cards", "hero-business", homeImage("hero-business-cards", "hero-business-cards.png"), "Premium PrintOasis business cards on a modern desk"],
     ["CUSTOM APPAREL", "Wear the work you are proud of.", "Turn team uniforms, event merchandise and everyday ideas into memorable custom apparel.", "/products?category=apparel", "Create Custom Apparel", "hero-apparel", homeImage("hero-custom-apparel", "hero-custom-apparel.png"), "PrintOasis branded premium hoodie and apparel"],
     ["MARKETING MATERIALS", "Make every campaign impossible to miss.", "Posters, flyers, folders and campaign materials, produced with rich colour and a crisp finish.", "/products?category=marketing", "Shop Marketing Prints", "hero-marketing", homeImage("hero-marketing-materials", "hero-marketing-materials.png"), "PrintOasis branded marketing materials and presentation folders"]
   ];
   return await layout("Online printing made brilliantly simple", `
     <section class="home-hero carousel-shell" data-carousel data-carousel-interval="4000" aria-label="PrintOasis promotions">
-      <div class="carousel-track">${heroSlides.map((slide, index) => `<article class="hero-slide ${slide[5]} ${index === 0 ? "is-active" : ""}" aria-hidden="${index === 0 ? "false" : "true"}"><img src="/public/${slide[6]}" alt="${slide[7]}" ${index === 0 ? "fetchpriority=high" : 'loading="lazy" decoding="async"'}><div class="hero-slide-overlay"></div><div class="hero-copy"><span class="eyebrow">${slide[0]}</span><h1>${slide[1]}</h1><p>${slide[2]}</p><div class="hero-cta"><a class="button primary" href="${slide[3]}">${slide[4]}</a><a class="button ghost light-ghost" href="/products">All products</a></div></div></article>`).join("")}</div>
+      <div class="carousel-track">${heroSlides.map((slide, index) => `<article class="hero-slide ${slide[5]} ${index === 0 ? "is-active" : ""}" aria-hidden="${index === 0 ? "false" : "true"}">${slide[5] === "hero-diwali" ? `<div class="hero-diwali-artwork"><img src="/public/${slide[6]}" alt="${slide[7]}" fetchpriority="high"><a class="hero-art-link hero-art-link-primary" href="${slide[3]}" aria-label="${slide[4]}"></a><a class="hero-art-link hero-art-link-secondary" href="${slide[8]}" aria-label="${slide[9]}"></a></div><div class="hero-diwali-copy"><span class="eyebrow">${slide[0]}</span><h1>${slide[1]}</h1><p>${slide[2]}</p><div class="hero-cta"><a class="button primary" href="${slide[3]}">${slide[4]}</a><a class="button ghost light-ghost" href="${slide[8]}">${slide[9]}</a></div></div>` : `<img src="/public/${slide[6]}" alt="${slide[7]}" ${index === 0 ? "fetchpriority=high" : 'loading="lazy" decoding="async"'}><div class="hero-slide-overlay"></div><div class="hero-copy"><span class="eyebrow">${slide[0]}</span><h1>${slide[1]}</h1><p>${slide[2]}</p><div class="hero-cta"><a class="button primary" href="${slide[3]}">${slide[4]}</a><a class="button ghost light-ghost" href="${slide[8] || "/products"}">${slide[9] || "All products"}</a></div></div>`}</article>`).join("")}</div>
       <div class="carousel-controls"><button class="carousel-arrow previous" type="button" aria-label="Previous promotion">&larr;</button><div class="carousel-dots" role="tablist" aria-label="Choose promotion">${heroSlides.map((_, index) => `<button type="button" role="tab" aria-label="Promotion ${index + 1}" aria-selected="${index === 0}" data-carousel-dot="${index}"></button>`).join("")}</div><button class="carousel-arrow next" type="button" aria-label="Next promotion">&rarr;</button></div>
       <a class="hero-scroll-indicator" href="#offers" aria-label="Scroll to current offers"><span></span>Scroll to discover</a>
     </section>
@@ -1124,7 +1133,7 @@ async function productsPage(url, session, cart) {
   const categoryImages = categoryInfo ? categoryImageSet(category) : null;
   const whatsappUrl = `https://wa.me/${SUPPORT_PHONE.replace(/\D/g, "")}?text=${encodeURIComponent(`Hello PrintOasis, I would like help with ${categoryInfo ? categoryInfo[1] : "a custom print order"}.`)}`;
   const pageHero = categoryInfo
-    ? `<section class="page-hero compact category-landing category-${esc(category)}"><div><span class="eyebrow">${collection ? "CURATED COLLECTION" : "PRINTOASIS COLLECTION"}</span><h1>${collection ? "Limited Editions" : esc(categoryInfo[1])}</h1><p>${collection ? "A code-curated collection within Personalised Gifts. Only products available to order appear here." : esc(categoryInfo[2])}</p><div class="category-landing-actions"><a class="button primary" href="#catalog-results">${collection ? "Explore Limited Editions" : "Explore the collection"}</a>${category === "gifts" ? `<a class="button ghost" href="/products?category=gifts&collection=limited-editions"${collection ? ' aria-current="page"' : ""}>Limited Editions</a>` : ""}<a class="button ghost whatsapp-cta" href="${whatsappUrl}" target="_blank" rel="noopener noreferrer">Need a custom quantity? WhatsApp us</a></div></div><div class="category-landing-art">${categoryImages?.hero ? `<div class="product-photo category-cover" data-product-image><img class="product-photo-primary" src="${esc(categoryImages.hero.url)}" alt="${esc(categoryInfo[1])} collection" width="1200" height="675" loading="lazy" decoding="async"></div>` : categoryProduct ? productArt(categoryProduct, false, "hero") : ""}</div></section>`
+    ? `<section class="page-hero compact category-landing category-${esc(category)}"><div><span class="eyebrow">${collection ? "CURATED COLLECTION" : "PRINTOASIS COLLECTION"}</span><h1>${collection ? "Limited Editions" : esc(categoryInfo[1])}</h1><p>${collection ? "A code-curated seasonal collection within Personalised Gifts." : esc(categoryInfo[2])}</p><div class="category-landing-actions"><a class="button primary" href="#catalog-results">${collection ? "Explore Limited Editions" : "Explore the collection"}</a>${category === "gifts" ? `<a class="button ghost" href="/products?category=gifts&collection=limited-editions"${collection ? ' aria-current="page"' : ""}>Limited Editions</a>` : ""}<a class="button ghost whatsapp-cta" href="${whatsappUrl}" target="_blank" rel="noopener noreferrer">Need a custom quantity? WhatsApp us</a></div></div><div class="category-landing-art">${categoryImages?.hero ? `<div class="product-photo category-cover" data-product-image><img class="product-photo-primary" src="${esc(categoryImages.hero.url)}" alt="${esc(categoryInfo[1])} collection" width="1200" height="675" loading="lazy" decoding="async"></div>` : categoryProduct ? productArt(categoryProduct, false, "hero") : ""}</div></section>`
     : `<section class="page-hero compact"><span class="eyebrow">PRINT SHOP</span><h1>${q ? `Results for “${esc(q)}”` : "All products"}</h1><p>${q ? "Browse professionally finished products for your next idea." : `${products.length} customizable products for work, events and gifting.`}</p></section>`;
   return await layout(categoryInfo ? categoryInfo[1] : q ? `Search: ${q}` : "All products", `
     ${pageHero}
@@ -1138,6 +1147,7 @@ async function productsPage(url, session, cart) {
 
 async function productPage(product, session, cart, url) {
   [product] = await attachProductImages([product]);
+  const isDiwaliHamper = product.slug === "printoasis-diwali-hamper-kit";
   const sizes = split(product.sizes), materials = split(product.materials), options = split(product.print_options);
   const available = productAvailable(product);
   const sellable = sellableQuantity(product);
@@ -1173,28 +1183,25 @@ async function productPage(product, session, cart, url) {
     <section class="breadcrumbs"><a href="/">Home</a><span>/</span><a href="/products?category=${product.category}">${esc(categories.find(c => c[0] === product.category)?.[1] || "Products")}</a><span>/</span>${esc(product.name)}</section>
     ${notice(url)}
     <section class="product-detail">
-      <div class="product-gallery">${productGallery(product)}<div class="quality-note"><b>✓ Free artwork quality check</b><span>We review every file before printing.</span></div></div>
+      <div class="product-gallery">${productGallery(product)}${isDiwaliHamper ? `<div class="quality-note"><b>Personalised for your recipient</b><span>Add their name and your greeting-card message below.</span></div>` : `<div class="quality-note"><b>✓ Free artwork quality check</b><span>We review every file before printing.</span></div>`}</div>
       <div class="product-config">
-        ${product.badge ? `<span class="badge">${esc(product.badge)}</span>` : ""}<h1>${esc(product.name)}</h1><div class="rating"><span class="rating-stars" aria-label="${product.rating} out of 5 stars">★★★★★</span><span>${product.rating} · ${reviewSummary.count ? `${reviewSummary.count} review${reviewSummary.count === 1 ? "" : "s"}` : "No reviews yet"}</span></div><p class="lead">${esc(product.description)}</p>
-        <ul class="feature-list"><li>Low minimum order of ${product.min_qty}</li><li>Rich, calibrated color</li><li>Tracked delivery across India</li></ul>
+        ${product.badge ? `<span class="badge">${esc(product.badge)}</span>` : ""}<h1>${esc(product.name)}</h1>${Number(product.rating || 0) > 0 ? `<div class="rating"><span class="rating-stars" aria-label="${product.rating} out of 5 stars">★★★★★</span><span>${product.rating} · ${reviewSummary.count ? `${reviewSummary.count} review${reviewSummary.count === 1 ? "" : "s"}` : "No reviews yet"}</span></div>` : ""}<p class="lead">${esc(product.description)}</p>
+        ${isDiwaliHamper ? `<ul class="feature-list hamper-contents"><li>Premium gift box with a PrintOasis-branded printed sleeve or packaging</li><li>200 g assorted dry fruits: almonds, cashews, raisins and pistachios</li><li>100 g assorted chocolates in sealed retail packaging</li><li>Two decorative diyas</li><li>One personalised greeting card with recipient name and your message</li><li>Matching personalised name tag and festive ribbon/finishing</li></ul>` : `<ul class="feature-list"><li>Low minimum order of ${product.min_qty}</li><li>Rich, calibrated color</li><li>Tracked delivery across India</li></ul>`}
         ${session.user ? `<form action="/wishlist/toggle" method="post" class="inline-action"><input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}"><button class="button ghost wishlist-button" type="submit" aria-label="${wished ? "Remove from wishlist" : "Add to wishlist"}">${wished ? "♥ Saved" : "♡ Wishlist"}</button></form>` : `<a class="button ghost wishlist-button" href="/login?next=${encodeURIComponent(`/product/${product.slug}`)}">♡ Wishlist</a>`}
         <form id="product-config" action="/cart/add" method="post" class="config-form" enctype="multipart/form-data">
           <input type="hidden" name="csrf" value="${session.csrf}"><input type="hidden" name="product_id" value="${product.id}">
-          <label>Size<select name="size">${sizes.map(v => `<option>${esc(v)}</option>`).join("")}</select></label>
-          <label>Material<select name="material">${materials.map(v => `<option>${esc(v)}</option>`).join("")}</select></label>
-          <label>Print / finish<select name="print_option">${options.map(v => `<option>${esc(v)}</option>`).join("")}</select></label>
+          ${isDiwaliHamper ? `<input type="hidden" name="size" value="One hamper"><input type="hidden" name="material" value="Gift box"><input type="hidden" name="print_option" value="Printed sleeve, greeting card and name tag">` : `<label>Size<select name="size">${sizes.map(v => `<option>${esc(v)}</option>`).join("")}</select></label><label>Material<select name="material">${materials.map(v => `<option>${esc(v)}</option>`).join("")}</select></label><label>Print / finish<select name="print_option">${options.map(v => `<option>${esc(v)}</option>`).join("")}</select></label>`}
           <label>Quantity<input type="number" name="quantity" min="1" step="1" max="${sellable}" value="${defaultQuantity || 1}" ${sellable <= 0 ? "disabled" : "required"}></label>
-          <label class="full">Artwork notes <textarea name="artwork_note" rows="3" placeholder="Design link, file name, colors or special instructions"></textarea></label>
-          <label class="full">Upload artwork <input class="artwork-input" type="file" name="artwork_file" accept=".pdf,.png,.ai,.psd,application/pdf,image/png"><small class="input-help">Accepted: PDF, PNG, AI, PSD up to 25 MB.</small><span class="artwork-preview"></span></label>
-          <div class="price-box"><span>Starting total</span><strong data-unit-price-minor="${unitPriceMinor}">${moneyMinor(defaultQuantity ? multiplyMinor(unitPriceMinor, defaultQuantity) : inrToMinor(product.price), true)}</strong><small>${available <= 0 ? "Out of Stock" : `${sellable} available now`} · Inclusive of taxes</small><span class="stock-state ${stockState.kind}">${stockState.label}</span></div>
+          ${isDiwaliHamper ? `<label class="full">Recipient name for the greeting card and name tag<input type="text" name="recipient_name" autocomplete="off" maxlength="60" required></label><label class="full">Greeting-card message<textarea name="card_message" rows="3" maxlength="400" required></textarea><small class="input-help">Up to 400 characters.</small></label>` : `<label class="full">Artwork notes <textarea name="artwork_note" rows="3" placeholder="Design link, file name, colors or special instructions"></textarea></label><label class="full">Upload artwork <input class="artwork-input" type="file" name="artwork_file" accept=".pdf,.png,.ai,.psd,application/pdf,image/png"><small class="input-help">Accepted: PDF, PNG, AI, PSD up to 25 MB.</small><span class="artwork-preview"></span></label>`}
+          <div class="price-box"><span>${isDiwaliHamper ? "Price per hamper" : "Starting total"}</span><strong data-unit-price-minor="${unitPriceMinor}">${moneyMinor(defaultQuantity ? multiplyMinor(unitPriceMinor, defaultQuantity) : inrToMinor(product.price), true)}</strong><small>${available <= 0 ? "Out of Stock" : `${sellable} available now`} · Inclusive of taxes${isDiwaliHamper && available <= 0 ? " · Availability will be updated when confirmed" : ""}</small><span class="stock-state ${stockState.kind}">${stockState.label}</span></div>
           ${available > 0
   ? `<button class="button primary full product-add-button" type="submit">Add to cart</button>`
   : `<button class="button full" type="button" disabled>Out of Stock</button>`}
         </form>
-        <div class="mobile-cart-bar" aria-label="Quick add to cart"><span>From ${money(product.price)}</span><button class="button primary" form="product-config" type="submit" ${available <= 0 ? "disabled" : ""}>${available > 0 ? "Add to cart" : "Out of stock"}</button></div>
+        <div class="mobile-cart-bar" aria-label="Quick add to cart"><span>${isDiwaliHamper ? `${money(product.price)} / hamper` : `From ${money(product.price)}`}</span><button class="button primary" form="product-config" type="submit" ${available <= 0 ? "disabled" : ""}>${available > 0 ? "Add to cart" : "Out of stock"}</button></div>
       </div>
     </section>
-    <section class="info-tabs section"><article><span>01</span><h3>Production-ready</h3><p>High-resolution print with automated and human quality checks.</p></article><article><span>02</span><h3>Need design help?</h3><p>Add notes to your order and our prepress team will contact you.</p></article><article><span>03</span><h3>Reliable delivery</h3><p>Estimated dispatch in 2–4 working days for standard products.</p></article></section>
+    ${isDiwaliHamper ? `<section class="info-tabs section"><article><span>01</span><h3>Made personal</h3><p>Share the recipient’s name and your greeting-card message with your order.</p></article><article><span>02</span><h3>Ready to gift</h3><p>The hamper includes the festive box, dry fruits, chocolates, diyas, card, name tag and ribbon listed above.</p></article><article><span>03</span><h3>Availability</h3><p>This item is not available to order until sellable stock is confirmed.</p></article></section>` : `<section class="info-tabs section"><article><span>01</span><h3>Production-ready</h3><p>High-resolution print with automated and human quality checks.</p></article><article><span>02</span><h3>Need design help?</h3><p>Add notes to your order and our prepress team will contact you.</p></article><article><span>03</span><h3>Reliable delivery</h3><p>Estimated dispatch in 2–4 working days for standard products.</p></article></section>`}
     <section class="section reviews-section" id="review">
       <div class="section-heading"><div><span class="eyebrow">CUSTOMER REVIEWS</span><h2>Print confidence from real orders</h2></div></div>
       <div class="review-layout">
@@ -1880,7 +1887,7 @@ async function createLocalOrder(session, cart, data, paymentMethod, paymentId = 
     for (const item of cart.items) {
       await tx.run(`INSERT INTO order_items (order_id,product_id,product_name,quantity,unit_price,configuration,artwork_original_name,artwork_stored_name,artwork_mime,artwork_size)
         VALUES (?,?,?,?,?,?,?,?,?,?)`, id, item.product_id, item.name, item.quantity, minorToInr(inrToMinor(item.unit_price)),
-      `${item.size} · ${item.material} · ${item.print_option}${item.artwork_original_name ? ` · Artwork: ${item.artwork_original_name}` : ""}`,
+      `${item.size} · ${item.material} · ${item.print_option}${item.artwork_note ? ` · ${item.artwork_note}` : ""}${item.artwork_original_name ? ` · Artwork: ${item.artwork_original_name}` : ""}`,
       item.artwork_original_name || null, item.artwork_stored_name || null, item.artwork_mime || null, item.artwork_size || null);
       const deduction = await tx.run("UPDATE products SET stock = stock - ?, reserved = reserved - ? WHERE id = ? AND stock >= ? AND reserved >= ?", item.quantity, item.quantity, item.product_id, item.quantity, item.quantity);
       if (!deduction.changes) throw new Error(`Inventory changed for ${item.name}. Please review your cart.`);
@@ -2068,7 +2075,7 @@ async function finalizeCapturedCheckout(session, paymentId, options = {}) {
 
     for (const item of snapshot) {
       const unitPrice = minorToInr(Number(item.unit_price_minor));
-      const configuration = `${item.size || ""} · ${item.material || ""} · ${item.print_option || ""}${item.artwork_original_name ? ` · Artwork: ${item.artwork_original_name}` : ""}`;
+      const configuration = `${item.size || ""} · ${item.material || ""} · ${item.print_option || ""}${item.artwork_note ? ` · ${item.artwork_note}` : ""}${item.artwork_original_name ? ` · Artwork: ${item.artwork_original_name}` : ""}`;
       await tx.run(`INSERT INTO order_items (order_id,product_id,product_name,quantity,unit_price,configuration,artwork_original_name,artwork_stored_name,artwork_mime,artwork_size)
         VALUES (?,?,?,?,?,?,?,?,?,?)`, order.id, Number(item.product_id), String(item.product_name || "Printed product"),
       Number(item.quantity), unitPrice, configuration, item.artwork_original_name || null, item.artwork_stored_name || null,

@@ -308,14 +308,15 @@ footer{grid-template-columns:minmax(220px,1.6fr) repeat(4,minmax(130px,1fr));gap
 @media(max-width:1100px){footer{grid-template-columns:minmax(210px,1.4fr) repeat(2,minmax(150px,1fr))}footer>div:first-child{grid-row:span 2}.resource-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:680px){footer{grid-template-columns:1fr 1fr;gap:24px}footer>div:first-child{grid-column:1/-1;grid-row:auto}.trust-section,.contact-layout,.trust-links,.resources-section{width:100%}.resource-heading{align-items:start;flex-direction:column;gap:6px}.resource-grid{grid-template-columns:1fr}.resource-card{min-height:0}.resources-section{padding-top:36px}.resource-group+.resource-group{margin-top:42px}}
 
-/* Focused seasonal homepage treatment; the rest of the storefront stays on-brand. */
-.hero-diwali{background:#21152f}
-.hero-diwali>img{object-position:78% center}
-.hero-diwali .hero-slide-overlay{background:linear-gradient(90deg,rgba(28,18,39,.97) 0%,rgba(39,22,49,.91) 38%,rgba(41,21,48,.36) 70%,rgba(41,21,48,.12) 100%),linear-gradient(0deg,rgba(20,14,31,.28),transparent 48%)}
-.hero-diwali .hero-copy .eyebrow{color:#ffdb78}
-.hero-diwali .hero-copy h1{max-width:570px;text-wrap:balance}
-.hero-diwali .hero-copy p{max-width:480px;color:#f7eaf0}
-.hero-diwali .hero-copy .button.primary{background:#f0a13d;border-color:#f0a13d;color:#281632}
-.hero-diwali .hero-copy .button.primary:hover{background:#ffca70;border-color:#ffca70}
+/* Supplied festive artwork contains its own typography and CTA artwork. Keep
+   its full 16:9 composition visible and make the printed buttons real links. */
+.hero-diwali{display:block;min-height:0;height:min(56.25vw,760px);padding:0;background:#21152f}
+.hero-diwali-artwork{position:relative;width:min(100%,1351px);height:100%;margin-inline:auto;aspect-ratio:16/9}
+.hero-diwali-artwork>img{display:block;width:100%;height:100%;object-fit:contain}
+.hero-art-link{position:absolute;display:block;border-radius:12px}
+.hero-art-link-primary{left:5.3%;top:72.8%;width:16.8%;height:7.3%}
+.hero-art-link-secondary{left:23%;top:72.8%;width:17.8%;height:7.3%}
+.hero-art-link:focus-visible{outline:3px solid #fff;outline-offset:3px;box-shadow:0 0 0 6px #8a4a00}
+.hero-diwali-copy{display:none}
 .catalog-subfilter-heading{margin:20px 0 6px;padding:15px 10px 4px;border-top:1px solid var(--line);font-size:12px;color:var(--muted)}
-@media(max-width:680px){.hero-diwali>img{object-position:72% center}.hero-diwali .hero-slide-overlay{background:linear-gradient(90deg,rgba(27,17,38,.94) 0%,rgba(35,20,45,.8) 62%,rgba(35,20,45,.46) 100%),linear-gradient(0deg,rgba(20,14,31,.38),transparent 54%)}.hero-diwali .hero-copy{padding-bottom:138px}.hero-diwali .hero-copy h1{max-width:12ch}.hero-diwali .hero-copy p{max-width:34ch}.catalog-subfilter-heading{margin-top:14px}}
+@media(max-width:680px){.hero-diwali{height:auto}.hero-diwali-artwork{width:100%;height:auto}.hero-diwali-artwork>img{width:100%;height:auto;object-fit:contain}.hero-art-link{display:none}.hero-diwali-copy{display:block;position:relative;width:auto;height:auto;margin:0;padding:20px 20px 86px;overflow:visible;white-space:normal;background:#21152f}.hero-diwali-copy .eyebrow{color:#ffdb78}.hero-diwali-copy h1{max-width:12ch;margin:8px 0 12px;font:800 clamp(32px,9vw,44px)/1 "Syne";letter-spacing:-.05em}.hero-diwali-copy p{max-width:34ch;margin:0;color:#f7eaf0;font-size:15px;line-height:1.5}.hero-diwali-copy .hero-cta{display:flex;flex-wrap:wrap;gap:9px;margin:16px 0 0}.hero-diwali-copy .button{min-height:44px;padding-inline:15px;font-size:13px}.hero-diwali-copy .button.primary{background:#f0a13d;border-color:#f0a13d;color:#281632}.hero-diwali-copy .button.ghost{color:#fff;border-color:rgba(255,255,255,.6)}.catalog-subfilter-heading{margin-top:14px}}

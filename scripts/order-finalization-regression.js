@@ -17,13 +17,13 @@ async function assertOrderFinalizationBehavior({ app, prefix }) {
   const user = await app.db.get("INSERT INTO users (name,email,password_hash) VALUES (?,?,?) RETURNING id",
     "Order Finalization Regression", `${suffix}@example.test`, "unused-test-hash");
 
-  async function addSession(label, product, quantity = 1, unitPrice = "150.00") {
+  async function addSession(label, product, quantity = 1, unitPrice = "150.00", artworkNote = null) {
     const id = crypto.randomBytes(24).toString("hex");
     await app.db.run("INSERT INTO sessions (id,user_id,csrf,expires_at) VALUES (?,?,?,?)",
       id, user.id, crypto.randomBytes(18).toString("hex"), Date.now() + 3600000);
     await app.db.run(`INSERT INTO cart_items
       (session_id,product_id,quantity,size,material,print_option,artwork_note,artwork_original_name,artwork_stored_name,artwork_mime,artwork_size,unit_price)
-      VALUES (?,?,?,'Standard','Matte','Full color',NULL,NULL,NULL,NULL,NULL,?)`, id, product.id, quantity, unitPrice);
+      VALUES (?,?,?,'Standard','Matte','Full color',?,NULL,NULL,NULL,NULL,?)`, id, product.id, quantity, artworkNote, unitPrice);
     sessions.push(id);
     return { id, user: { id: user.id }, label };
   }
@@ -39,7 +39,7 @@ async function assertOrderFinalizationBehavior({ app, prefix }) {
 
   async function checkout(label, opts = {}) {
     const p = opts.product || await product(label, opts.stock || 1);
-    const session = await addSession(label, p, opts.quantity || 1, opts.unitPrice || "150.00");
+    const session = await addSession(label, p, opts.quantity || 1, opts.unitPrice || "150.00", opts.artworkNote || null);
     await app.db.run("UPDATE products SET reserved=reserved+? WHERE id=?", opts.quantity || 1, p.id);
     const couponCode = opts.couponCode || "";
     const form = {
@@ -94,7 +94,7 @@ async function assertOrderFinalizationBehavior({ app, prefix }) {
     c.equal(String(catalogCart.items[0].unit_price), "4.99", "Cart insertion stores the exact catalog-derived paise unit price.");
     c.equal(catalogCart.subtotal_minor, 499, "Cart subtotal sums the catalog-derived price in integer paise.");
 
-    const normal = await checkout("normal");
+    const normal = await checkout("normal", { artworkNote: "Recipient name: Asha\nGreeting-card message: Happy Diwali" });
     const orderNumber = await app.finalizeCapturedCheckout(normal.session, normal.paymentId, { notify: false });
     const order = await app.db.get("SELECT * FROM orders WHERE order_number=?", orderNumber);
     orders.push(order.id);
@@ -109,6 +109,9 @@ async function assertOrderFinalizationBehavior({ app, prefix }) {
     c.equal(Number((await app.db.get("SELECT reserved FROM products WHERE id=?", normal.product.id)).reserved), 0, "Finalization releases only the consumed reservation.");
     const itemCount = Number((await app.db.get("SELECT COUNT(*) AS count FROM order_items WHERE order_id=?", order.id)).count);
     c.equal(itemCount, 1, "One immutable order item is created from the intent snapshot.");
+    const personalizedSnapshot = await app.db.get("SELECT configuration FROM order_items WHERE order_id=?", order.id);
+    c.ok(personalizedSnapshot.configuration.includes("Recipient name: Asha") && personalizedSnapshot.configuration.includes("Greeting-card message: Happy Diwali"),
+      "Captured-checkout order item preserves recipient and greeting-card details from the cart snapshot.");
     c.equal(await app.finalizeCapturedCheckout(normal.session, normal.paymentId, { notify: false }), orderNumber,
       "Repeated finalization returns the existing order.");
     c.equal(Number((await app.db.get("SELECT COUNT(*) AS count FROM orders WHERE checkout_intent_id=?", normal.intent.id)).count), 1,
@@ -290,13 +293,16 @@ async function assertOrderFinalizationBehavior({ app, prefix }) {
     c.equal(String(fractionalCodLine.unit_price), "4.99", "COD order item preserves the paise unit rate.");
     c.equal(Number(fractionalCodOrder.invoice_snapshot.total_minor), 10399, "COD invoice snapshot retains exact total paise.");
 
-    const codFixture = await checkout("cod-compatible");
+    const codFixture = await checkout("cod-compatible", { artworkNote: "Recipient name: Mira\nGreeting-card message: With love" });
     const codOrderNumber = await app.createLocalOrder(codFixture.session, await app.cartData(codFixture.session.id),
       codFixture.form, "cod", null, { notify: false });
     const codOrder = await app.db.get("SELECT * FROM orders WHERE order_number=?", codOrderNumber);
     orders.push(codOrder.id);
     c.ok(codOrder && codOrder.payment_method === "cod" && codOrder.checkout_intent_id == null && codOrder.payment_record_id == null,
       "Legacy COD order creation remains independent of online payment state.");
+    const codSnapshot = await app.db.get("SELECT configuration FROM order_items WHERE order_id=?", codOrder.id);
+    c.ok(codSnapshot.configuration.includes("Recipient name: Mira") && codSnapshot.configuration.includes("Greeting-card message: With love"),
+      "Local COD order items preserve recipient and greeting-card personalisation.");
     return c.count;
   } finally {
     await app.db.transaction(async tx => {

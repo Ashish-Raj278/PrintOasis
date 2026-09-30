@@ -35,7 +35,8 @@ public/assets/images/categories/<category-slug>/featured.webp
 public/assets/images/home/hero-business-cards.webp
 public/assets/images/home/hero-custom-apparel.webp
 public/assets/images/home/hero-marketing-materials.webp
-public/assets/images/home/hero-diwali-hamper.svg
+public/assets/images/home/hero-diwali-hamper.png
+public/assets/images/products/gifts/printoasis-diwali-hamper-kit/primary.png
 ```
 
 Category `hero.webp` is used on the existing category landing header. Homepage hero files replace their existing source images only when present, preserving the current fallback otherwise.

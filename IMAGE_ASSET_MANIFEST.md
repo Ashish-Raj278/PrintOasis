@@ -1,6 +1,6 @@
 # PrintOasis Image Asset Manifest
 
-This is the Phase B production plan for catalog imagery. The Diwali concept illustration below is a source-authored SVG; other planned product photography remains WebP. Product paths are relative to `public/assets/images/products/<category-slug>/<product-slug>/`.
+This is the Phase B production plan for catalog imagery. Product paths are relative to `public/assets/images/products/<category-slug>/<product-slug>/`.
 
 ## Library Contract
 
@@ -31,7 +31,7 @@ public/assets/images/
     bulk/<product-slug>/
 ```
 
-The category slugs above intentionally match the existing catalog and routes. Each category may additionally receive `hero.webp`, `cover.webp`, and `featured.webp` under `categories/<category-slug>/`. Homepage hero slots include `home/hero-business-cards.webp`, `home/hero-custom-apparel.webp`, `home/hero-marketing-materials.webp`, and the authored festive concept `home/hero-diwali-hamper.svg`.
+The category slugs above intentionally match the existing catalog and routes. Each category may additionally receive `hero.webp`, `cover.webp`, and `featured.webp` under `categories/<category-slug>/`. Homepage hero slots include `home/hero-business-cards.webp`, `home/hero-custom-apparel.webp`, `home/hero-marketing-materials.webp`, and the supplied festive banner `home/hero-diwali-hamper.png`.
 
 ## Usage Map
 
@@ -294,7 +294,7 @@ The category slugs above intentionally match the existing catalog and routes. Ea
 ## Personalised Gifts
 
 ### PrintOasis Diwali Hamper Kit (`gifts/printoasis-diwali-hamper-kit`)
-- `primary.svg` (concept illustration only; final hamper contents are unconfirmed)
+- `primary.png` (supplied product photograph/render; 1536 × 1024 source, displayed within the existing catalog image crop)
 
 ### Personalised Photo Mugs (`gifts/photo-mugs`)
 - `primary.webp`, `hover.webp`, `side.webp`, `handle-detail.webp`, `gift-box.webp`, `lifestyle-01.webp`, `featured.webp`

@@ -12,9 +12,19 @@ module.exports = async function cartRoutes(ctx) {
       await app.db.transaction(async tx => {
         product = await tx.get(`SELECT * FROM products WHERE id = ? AND ${app.visibleProductCondition()} FOR UPDATE`, productId);
         if (!product) return;
+        const isDiwaliHamper = product.slug === "printoasis-diwali-hamper-kit";
+        const recipientName = String(data.recipient_name || "").trim();
+        const cardMessage = String(data.card_message || "").trim();
+        if (isDiwaliHamper && (!recipientName || recipientName.length > 60 || !cardMessage || cardMessage.length > 400)) {
+          throw new Error("Enter a recipient name (up to 60 characters) and greeting-card message (up to 400 characters).");
+        }
+        const artworkNote = isDiwaliHamper
+          ? `Recipient name: ${recipientName}\nGreeting-card message: ${cardMessage}`
+          : String(data.artwork_note || "").slice(0, 500);
+        if (artworkNote.length > 500) throw new Error("The personalisation details are too long. Shorten the name or greeting-card message.");
         await app.addCartItem(session.id, product, data.quantity, {
           size: data.size, material: data.material, printOption: data.print_option,
-          artworkNote: (data.artwork_note || "").slice(0, 500), artworkOriginalName: artwork?.original,
+          artworkNote, artworkOriginalName: artwork?.original,
           artworkStoredName: artwork?.stored, artworkMime: artwork?.mime, artworkSize: artwork?.size
         }, tx);
       });
