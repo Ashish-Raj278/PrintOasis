@@ -1,6 +1,6 @@
 # PrintOasis Image Library
 
-New catalog imagery belongs under `public/assets/images`. The application prefers a WebP asset when it exists, then AVIF, JPG/JPEG and PNG. Existing uploaded product images in `data/uploads/product-images` remain fully supported and are used when a library asset is absent.
+New catalog imagery belongs under `public/assets/images`. The application prefers a WebP asset when it exists, then AVIF, JPG/JPEG, PNG and repository-authored SVG illustrations. Existing uploaded product images in `data/uploads/product-images` remain fully supported and are used when a library asset is absent. SVG support is for trusted source assets only; product-image uploads do not accept SVG.
 
 ## Product paths
 
@@ -35,6 +35,7 @@ public/assets/images/categories/<category-slug>/featured.webp
 public/assets/images/home/hero-business-cards.webp
 public/assets/images/home/hero-custom-apparel.webp
 public/assets/images/home/hero-marketing-materials.webp
+public/assets/images/home/hero-diwali-hamper.svg
 ```
 
 Category `hero.webp` is used on the existing category landing header. Homepage hero files replace their existing source images only when present, preserving the current fallback otherwise.

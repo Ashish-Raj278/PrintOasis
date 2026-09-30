@@ -33,6 +33,11 @@ row:
  "Print option 1|Print option 2", "cobalt"]
 ```
 
+An internal draft seed may append `{ draft: true }` after the normal fields.
+The startup seed inserts it once with hidden status and zero stock, and does
+not overwrite later admin edits. Code-curated collections are defined in
+`productCollections`; only active products appear in storefront routes.
+
 The numeric values mean:
 
 - `399` - starting price in INR.

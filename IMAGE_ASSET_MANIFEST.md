@@ -1,6 +1,6 @@
 # PrintOasis Image Asset Manifest
 
-This is the Phase B production plan for catalog imagery. It deliberately contains no assets. Every path is relative to `public/assets/images/products/<category-slug>/<product-slug>/` and every new asset is WebP.
+This is the Phase B production plan for catalog imagery. The Diwali concept illustration below is a source-authored SVG; other planned product photography remains WebP. Product paths are relative to `public/assets/images/products/<category-slug>/<product-slug>/`.
 
 ## Library Contract
 
@@ -9,6 +9,7 @@ This is the Phase B production plan for catalog imagery. It deliberately contain
 - Every supported image in a product folder is available to the product-page gallery; use descriptive lowercase kebab-case names.
 - `featured.webp`, `trending.webp`, and `recommendation.webp` are optional section-specific card images. They allow the same product to look appropriate on different homepage sections without replacing its primary image.
 - Existing JPG, JPEG, and PNG uploads remain valid. Future AVIF support is already isolated in the resolver's preferred-format list.
+- Trusted, repository-authored SVG illustrations are supported in the image library. The admin upload path continues to reject SVG.
 
 ## Folder Hierarchy
 
@@ -30,7 +31,7 @@ public/assets/images/
     bulk/<product-slug>/
 ```
 
-The category slugs above intentionally match the existing catalog and routes. Each category may additionally receive `hero.webp`, `cover.webp`, and `featured.webp` under `categories/<category-slug>/`. Homepage hero slots are `home/hero-business-cards.webp`, `home/hero-custom-apparel.webp`, and `home/hero-marketing-materials.webp`.
+The category slugs above intentionally match the existing catalog and routes. Each category may additionally receive `hero.webp`, `cover.webp`, and `featured.webp` under `categories/<category-slug>/`. Homepage hero slots include `home/hero-business-cards.webp`, `home/hero-custom-apparel.webp`, `home/hero-marketing-materials.webp`, and the authored festive concept `home/hero-diwali-hamper.svg`.
 
 ## Usage Map
 
@@ -292,6 +293,9 @@ The category slugs above intentionally match the existing catalog and routes. Ea
 
 ## Personalised Gifts
 
+### PrintOasis Diwali Hamper Kit (`gifts/printoasis-diwali-hamper-kit`)
+- `primary.svg` (concept illustration only; final hamper contents are unconfirmed)
+
 ### Personalised Photo Mugs (`gifts/photo-mugs`)
 - `primary.webp`, `hover.webp`, `side.webp`, `handle-detail.webp`, `gift-box.webp`, `lifestyle-01.webp`, `featured.webp`
 
@@ -419,6 +423,6 @@ The category slugs above intentionally match the existing catalog and routes. Ea
 
 - Generate only the listed assets that make sense for the product; do not add filler views.
 - Deliver each asset to its exact product folder with the listed filename.
-- Use WebP with a crisp 4:3 primary crop and optimise for web delivery.
+- Use WebP for product photography with a crisp 4:3 primary crop; source-authored vector concepts may remain SVG.
 - Keep text-free product photography where possible so campaign copy can remain in HTML.
 - Verify `primary.webp` first, then hover/card behavior, gallery order, category hero, and section-specific images.

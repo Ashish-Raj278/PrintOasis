@@ -8,7 +8,7 @@ const { createObjectStorageFromEnv, objectKey } = require("./services/object-sto
 const { attachRequestId, errorContext, logger } = require("./services/logger");
 const uploadSecurity = require("./services/upload-security");
 const { URL } = require("node:url");
-const { categories, products: catalogProducts, productPriorities } = require("./catalog");
+const { categories, products: catalogProducts, productPriorities, productCollections } = require("./catalog");
 const PDFDocument = require("pdfkit");
 const { createEmailService, orderEmailTemplate } = require("./services/email");
 const { createRefundService } = require("./services/refunds");
@@ -90,7 +90,7 @@ let refundService;
 const ORDER_STATUSES = ["Pending", "Printing", "Packed", "Shipped", "Delivered", "Cancelled"];
 const ALLOWED_ARTWORK_EXTENSIONS = new Set([".pdf", ".png", ".ai", ".psd"]);
 const ALLOWED_IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
-const PREFERRED_IMAGE_EXTENSIONS = [".webp", ".avif", ".jpg", ".jpeg", ".png"];
+const PREFERRED_IMAGE_EXTENSIONS = [".webp", ".avif", ".jpg", ".jpeg", ".png", ".svg"];
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_PRODUCT_IMAGE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_SEEDED_STOCK = 1000;
@@ -164,6 +164,14 @@ async function initDb() {
   }
   await db.transaction(async tx => {
     for (const product of catalogProducts) {
+      if (product[12]?.draft) {
+        await tx.run(`
+          INSERT INTO products (slug,name,category,price,min_qty,rating,badge,description,sizes,materials,print_options,color,stock,reserved,status,active)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,0,'hidden',0)
+          ON CONFLICT (slug) DO NOTHING
+        `, ...product.slice(0, 12));
+        continue;
+      }
       await tx.run("UPDATE products SET stock = ? WHERE slug = ? AND stock <= 0 AND reserved = 0", DEFAULT_SEEDED_STOCK, product[0]);
       await tx.run(`
         INSERT INTO products (slug,name,category,price,min_qty,rating,badge,description,sizes,materials,print_options,color)
@@ -934,7 +942,6 @@ async function nav(session, cart) {
     return `<div class="mega-nav-wrap"><a class="mega-nav-trigger" href="${categoryHref}" data-category="${esc(group.slug)}">${label}</a><button class="mega-nav-toggle" type="button" aria-label="Show ${label} menu" aria-expanded="false" aria-haspopup="true" aria-controls="${menuId}"><span aria-hidden="true">+</span></button><div class="mega-products-menu" id="${menuId}" role="region" aria-label="${label} menu" aria-hidden="true"><div class="mega-menu-heading"><span>${allProducts ? "SHOP BY CATEGORY" : esc(group.name.toUpperCase())}</span></div>${content}</div></div>`;
   };
   return `
-    <div class="promise">Free delivery over ₹999 · Select products ready in 4 hours</div>
     <a class="skip-link" href="#main-content">Skip to main content</a>
     <header class="site-header" aria-label="Site header">
       <a class="brand" href="/" aria-label="PrintOasis home"><span>PRINT</span>OASIS<i>.</i></a>
@@ -1040,7 +1047,11 @@ async function homePage(session, cart) {
     products: Number((await db.get(`SELECT COUNT(*) AS count FROM products WHERE ${visibleProductCondition()}`)).count),
     categories: categories.length
   };
+  // The existing carousel renderer prefixes its image paths with /public/.
+  // Keep the new library-backed slide compatible without changing old slides.
+  const diwaliHeroImage = homeImage("hero-diwali-hamper", "hero-diwali-hamper.svg").replace(/^\/public\//, "");
   const heroSlides = [
+    ["FESTIVE GIFTING CONCEPT", "Make Diwali Personal.", "Explore personalised keepsakes and gifting ideas for the season. The Diwali hamper concept is still being confirmed.", "/products?category=gifts", "Explore Personalised Gifts", "hero-diwali", diwaliHeroImage, "Illustrative Diwali gifting concept with a ribboned box and diya; final hamper details are unconfirmed"],
     ["PREMIUM BUSINESS CARDS", "Leave a lasting first impression.", "Exceptionally finished cards with the weight, texture and precision your brand deserves.", "/products?category=business-cards", "Explore Business Cards", "hero-business", homeImage("hero-business-cards", "hero-business-cards.png"), "Premium PrintOasis business cards on a modern desk"],
     ["CUSTOM APPAREL", "Wear the work you are proud of.", "Turn team uniforms, event merchandise and everyday ideas into memorable custom apparel.", "/products?category=apparel", "Create Custom Apparel", "hero-apparel", homeImage("hero-custom-apparel", "hero-custom-apparel.png"), "PrintOasis branded premium hoodie and apparel"],
     ["MARKETING MATERIALS", "Make every campaign impossible to miss.", "Posters, flyers, folders and campaign materials, produced with rich colour and a crisp finish.", "/products?category=marketing", "Shop Marketing Prints", "hero-marketing", homeImage("hero-marketing-materials", "hero-marketing-materials.png"), "PrintOasis branded marketing materials and presentation folders"]
@@ -1080,12 +1091,17 @@ async function homePage(session, cart) {
 }
 
 async function productsPage(url, session, cart) {
-  const category = url.searchParams.get("category") || "";
+  const requestedCategory = url.searchParams.get("category") || "";
   const q = url.searchParams.get("q") || "";
+  const requestedCollection = url.searchParams.get("collection") || "";
+  const collection = productCollections[requestedCollection] && (!requestedCategory || requestedCategory === "gifts") ? requestedCollection : "";
+  const category = requestedCategory || (collection ? "gifts" : "");
+  const collectionSlugs = collection ? productCollections[collection] : [];
   const sort = ["recommended", "price-asc", "price-desc", "newest"].includes(url.searchParams.get("sort")) ? url.searchParams.get("sort") : "recommended";
   const productsUrl = (nextCategory = category) => {
     const params = new URLSearchParams();
     if (nextCategory) params.set("category", nextCategory);
+    if (collection && nextCategory === "gifts") params.set("collection", collection);
     if (q) params.set("q", q);
     if (sort !== "recommended") params.set("sort", sort);
     const query = params.toString();
@@ -1094,6 +1110,10 @@ async function productsPage(url, session, cart) {
   let sql = `SELECT * FROM products WHERE ${visibleProductCondition()}`;
   const args = [];
   if (category) { sql += " AND category = ?"; args.push(category); }
+  if (collection) {
+    sql += collectionSlugs.length ? ` AND slug IN (${collectionSlugs.map(() => "?").join(",")})` : " AND 1 = 0";
+    args.push(...collectionSlugs);
+  }
   if (q) { sql += " AND (name ILIKE ? OR description ILIKE ?)"; args.push(`%${q}%`, `%${q}%`); }
   sql += sort === "price-asc" ? " ORDER BY price ASC, rating DESC" : sort === "price-desc" ? " ORDER BY price DESC, rating DESC" : sort === "newest" ? " ORDER BY id DESC" : " ORDER BY rating DESC, name";
   let products = await db.all(sql, ...args);
@@ -1104,13 +1124,13 @@ async function productsPage(url, session, cart) {
   const categoryImages = categoryInfo ? categoryImageSet(category) : null;
   const whatsappUrl = `https://wa.me/${SUPPORT_PHONE.replace(/\D/g, "")}?text=${encodeURIComponent(`Hello PrintOasis, I would like help with ${categoryInfo ? categoryInfo[1] : "a custom print order"}.`)}`;
   const pageHero = categoryInfo
-    ? `<section class="page-hero compact category-landing category-${esc(category)}"><div><span class="eyebrow">PRINTOASIS COLLECTION</span><h1>${esc(categoryInfo[1])}</h1><p>${esc(categoryInfo[2])}</p><div class="category-landing-actions"><a class="button primary" href="#catalog-results">Explore the collection</a><a class="button ghost whatsapp-cta" href="${whatsappUrl}" target="_blank" rel="noopener noreferrer">Need a custom quantity? WhatsApp us</a></div></div><div class="category-landing-art">${categoryImages?.hero ? `<div class="product-photo category-cover" data-product-image><img class="product-photo-primary" src="${esc(categoryImages.hero.url)}" alt="${esc(categoryInfo[1])} collection" width="1200" height="675" loading="lazy" decoding="async"></div>` : categoryProduct ? productArt(categoryProduct, false, "hero") : ""}</div></section>`
+    ? `<section class="page-hero compact category-landing category-${esc(category)}"><div><span class="eyebrow">${collection ? "CURATED COLLECTION" : "PRINTOASIS COLLECTION"}</span><h1>${collection ? "Limited Editions" : esc(categoryInfo[1])}</h1><p>${collection ? "A code-curated collection within Personalised Gifts. Only products available to order appear here." : esc(categoryInfo[2])}</p><div class="category-landing-actions"><a class="button primary" href="#catalog-results">${collection ? "Explore Limited Editions" : "Explore the collection"}</a>${category === "gifts" ? `<a class="button ghost" href="/products?category=gifts&collection=limited-editions"${collection ? ' aria-current="page"' : ""}>Limited Editions</a>` : ""}<a class="button ghost whatsapp-cta" href="${whatsappUrl}" target="_blank" rel="noopener noreferrer">Need a custom quantity? WhatsApp us</a></div></div><div class="category-landing-art">${categoryImages?.hero ? `<div class="product-photo category-cover" data-product-image><img class="product-photo-primary" src="${esc(categoryImages.hero.url)}" alt="${esc(categoryInfo[1])} collection" width="1200" height="675" loading="lazy" decoding="async"></div>` : categoryProduct ? productArt(categoryProduct, false, "hero") : ""}</div></section>`
     : `<section class="page-hero compact"><span class="eyebrow">PRINT SHOP</span><h1>${q ? `Results for “${esc(q)}”` : "All products"}</h1><p>${q ? "Browse professionally finished products for your next idea." : `${products.length} customizable products for work, events and gifting.`}</p></section>`;
   return await layout(categoryInfo ? categoryInfo[1] : q ? `Search: ${q}` : "All products", `
     ${pageHero}
     <section class="catalog section" id="catalog-results">
-      <aside class="catalog-filters"><h3>Categories</h3><a class="${!category ? "active" : ""}" href="${productsUrl("")}"${!category ? ' aria-current="page"' : ""}>All products</a>${categories.map(c => `<a class="${category === c[0] ? "active" : ""}" href="${productsUrl(c[0])}"${category === c[0] ? ' aria-current="page"' : ""}>${c[1]}</a>`).join("")}</aside>
-      <div><div class="catalog-bar"><div><span class="catalog-result-label">${q ? `Search results for “${esc(q)}”` : categoryInfo ? esc(categoryInfo[1]) : "All products"}</span><b>${products.length} product${products.length === 1 ? "" : "s"}</b></div><form class="catalog-sort" method="get" action="/products"><input type="hidden" name="q" value="${esc(q)}"><input type="hidden" name="category" value="${esc(category)}"><label>Sort by<select name="sort" onchange="this.form.submit()"><option value="recommended" ${sort === "recommended" ? "selected" : ""}>Recommended</option><option value="newest" ${sort === "newest" ? "selected" : ""}>Newest</option><option value="price-asc" ${sort === "price-asc" ? "selected" : ""}>Price: low to high</option><option value="price-desc" ${sort === "price-desc" ? "selected" : ""}>Price: high to low</option></select></label><noscript><button class="button ghost" type="submit">Apply</button></noscript></form></div>
+      <aside class="catalog-filters"><h3>Categories</h3><a class="${!category ? "active" : ""}" href="${productsUrl("")}"${!category ? ' aria-current="page"' : ""}>All products</a>${categories.map(c => `<a class="${category === c[0] ? "active" : ""}" href="${productsUrl(c[0])}"${category === c[0] ? ' aria-current="page"' : ""}>${c[1]}</a>`).join("")}${category === "gifts" || !category ? `<h3 class="catalog-subfilter-heading">Personalised Gifts</h3><a class="${collection ? "active" : ""}" href="/products?category=gifts&collection=limited-editions"${collection ? ' aria-current="page"' : ""}>Limited Editions</a>` : ""}</aside>
+      <div><div class="catalog-bar"><div><span class="catalog-result-label">${q ? `Search results for “${esc(q)}”` : collection ? "Limited Editions · Personalised Gifts" : categoryInfo ? esc(categoryInfo[1]) : "All products"}</span><b>${products.length} product${products.length === 1 ? "" : "s"}</b></div><form class="catalog-sort" method="get" action="/products"><input type="hidden" name="q" value="${esc(q)}"><input type="hidden" name="category" value="${esc(category)}">${collection ? `<input type="hidden" name="collection" value="${esc(collection)}">` : ""}<label>Sort by<select name="sort" onchange="this.form.submit()"><option value="recommended" ${sort === "recommended" ? "selected" : ""}>Recommended</option><option value="newest" ${sort === "newest" ? "selected" : ""}>Newest</option><option value="price-asc" ${sort === "price-asc" ? "selected" : ""}>Price: low to high</option><option value="price-desc" ${sort === "price-desc" ? "selected" : ""}>Price: high to low</option></select></label><noscript><button class="button ghost" type="submit">Apply</button></noscript></form></div>
       ${products.length ? `<div class="product-grid">${products.map(product => productCard(product, q)).join("")}</div>` : `${emptyState("search", "That search needs a little more ink", "Try a product type, finish or occasion. You can also browse one of our popular collections.", "/products", "Continue shopping", "/help", "Get print help")}<div class="search-recovery"><b>Popular searches</b><div>${["Business Cards", "Flyers", "Stickers", "Photo Mugs"].map(item => `<a href="/products?q=${encodeURIComponent(item)}">${esc(item)}</a>`).join("")}</div></div><div class="search-category-shortcuts">${categories.slice(0, 5).map(item => `<a href="/products?category=${encodeURIComponent(item[0])}">${esc(item[1])}</a>`).join("")}</div>`}</div>
     </section>
   `, session, cart);
