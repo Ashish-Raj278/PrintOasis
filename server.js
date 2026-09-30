@@ -1506,7 +1506,7 @@ async function productForm(product, session) {
     <label>Category<select name="category">${categories.map(c => `<option value="${c[0]}" ${p.category === c[0] ? "selected" : ""}>${c[1]}</option>`).join("")}</select></label>
     <label>Price INR<input name="price" type="number" min="1" value="${esc(p.price)}" required></label>
     <label>Minimum quantity<input name="min_qty" type="number" min="1" value="${esc(p.min_qty)}" required></label>
-    <label>Rating<input name="rating" type="number" min="1" max="5" step="0.1" value="${esc(p.rating)}" required></label>
+    <label>Rating<input name="rating" type="number" min="0" max="5" step="0.1" value="${esc(p.rating)}" required></label>
     <label>Badge<input name="badge" value="${esc(p.badge || "")}"></label>
     <label>Mockup color<select name="color">${["cobalt", "coral", "yellow", "mint", "ink"].map(c => `<option ${p.color === c ? "selected" : ""}>${c}</option>`).join("")}</select></label>
     <label>Primary product image <small class="input-help">JPG, PNG or WebP up to 8 MB. Existing single-image products remain supported.</small><input type="file" name="product_image" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"></label>
